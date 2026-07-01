@@ -1,0 +1,38 @@
+{
+  "name": "@kiro2claude/plugin-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plugin contract for kiro2claude — types, hook bus interface, capability registry interface. Zero runtime dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist .tsbuildinfo *.tsbuildinfo"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "fastify": "^5.8.5",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "kiro2claude",
+    "plugin-api",
+    "contract"
+  ],
+  "license": "MIT"
+}

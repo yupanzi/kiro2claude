@@ -1,0 +1,6 @@
+packages:
+  - 'packages/*'
+  - 'packages/examples/*'
+  - 'enterprise/*'
+
+# 收紧 onlyBuiltDependencies 在 root package.json 配置，这里不重复
