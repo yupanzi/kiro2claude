@@ -1,0 +1,41 @@
+# 依赖与构建产物
+node_modules
+dist
+coverage
+
+# 本地配置和敏感数据
+.env
+.env.*
+!.env.example
+config.json
+config.test.json
+credentials.json
+*.sqlite3
+*.db
+kiro_stats.json
+
+# 测试相关
+test
+vitest.config.ts
+
+# Git 与 IDE
+.git
+.gitignore
+.vscode
+.idea
+*.log
+
+# 文档
+README.md
+*.md
+
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 临时文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

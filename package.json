@@ -1,0 +1,56 @@
+{
+  "name": "kiro2claude-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yupanzi/kiro2claude.git"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./packages/* --filter=!./packages/examples/* run build",
+    "build:all": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write .",
+    "lint:md": "markdownlint-cli2",
+    "lint:md:fix": "markdownlint-cli2 --fix",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
+    "ci": "biome ci . && pnpm -r run typecheck && pnpm -r run test",
+    "dev": "pnpm --filter @kiro2claude/core run dev",
+    "docker:build": "./scripts/docker-build.sh",
+    "docker:run": "./scripts/docker-run.sh",
+    "smoke:plugins": "node scripts/smoke-plugin-loader.mjs",
+    "release": "semantic-release",
+    "release:dry": "semantic-release --dry-run --no-ci",
+    "prepare": "husky || true"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.12",
+    "@commitlint/cli": "^21.0.2",
+    "@commitlint/config-conventional": "^21.0.2",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
+    "@semantic-release/github": "^11.0.1",
+    "husky": "^9.1.7",
+    "markdownlint-cli2": "^0.22.1",
+    "semantic-release": "^24.2.0",
+    "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

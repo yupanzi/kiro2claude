@@ -1,0 +1,6 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_BASE_URL": ""
+  }
+}

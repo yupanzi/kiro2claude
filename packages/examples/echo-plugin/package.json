@@ -1,0 +1,34 @@
+{
+  "name": "@kiro2claude/echo-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal example plugin — registers GET /echo and a usage-finish hook that adds an `echo` extension field. Read this when writing your own plugin.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist .tsbuildinfo *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@kiro2claude/plugin-api": "workspace:*"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "fastify": "^5.8.5",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "kiro2claude-plugin",
+    "example"
+  ],
+  "license": "MIT"
+}

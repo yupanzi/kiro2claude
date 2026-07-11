@@ -1,0 +1,104 @@
+# ============================================================
+# release.yml — conventional-commits 驱动的自动发布(单 workflow)
+# ============================================================
+# 每次 push 到 master:先跑 lint + typecheck + build + test 门禁,再由
+# semantic-release 分析 conventional commits 决定版本号,自动完成:
+#   - 写回 packages/core/package.json.version(镜像 tag 真相源)
+#   - 生成 / 更新 CHANGELOG.md
+#   - git tag + GitHub Release(release commit 带 [skip ci] 防死循环)
+#   - 在 semantic-release 的 publishCmd 里直接 docker build & push 到
+#     ghcr.io/<owner>/kiro2claude:<version> 与 :latest
+#
+# 为什么合并成一条 workflow:GitHub 默认 GITHUB_TOKEN 打的 tag 不会触发
+# 其它 workflow(防递归),所以"打 tag → 另一个 workflow 建镜像"这条链
+# 默认是断的。把 docker build 内联进 semantic-release 的 publish 生命
+# 周期,既规避了该限制,又不需要额外的 PAT secret。
+#
+# Auth:内置 GITHUB_TOKEN 的 packages:write 推 ghcr、contents:write 推
+# commit/tag/release。公开仓因此可自发布,无需外部 registry secret。
+#
+# 一次性手动步骤:首次发布后到 GitHub package 设置里把可见性设为
+# Public,任何部署环境(和任何人)才能免鉴权 docker pull。
+#
+# npm 发布刻意禁用:所有 workspace 包 "private": true,分发 = ghcr 镜像 +
+# GitHub 源。semantic-release 不启用 @semantic-release/npm。
+# ============================================================
+
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+# 防并发发布:同分支多次 push 串行等待(绝不 cancel-in-progress——发布
+# 中途被抢占会留下"tag 已打、镜像未建"的半成品状态)。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push release commit + tag + GitHub Release
+  packages: write # push ghcr 镜像
+  issues: write # semantic-release/github 在关联 issue 上评论 released
+  pull-requests: write # 同上,评论关联 PR
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 —— semantic-release 需要全量 git history 分析 commits
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # buildx + ghcr login 必须在 semantic-release 之前就绪:publishCmd
+      # 里的 docker build & push 依赖它们
+      - uses: docker/setup-buildx-action@v3
+      # package 已建好并关联本 repo(Manage Actions access = Write),内置
+      # GITHUB_TOKEN 的 packages:write 足以推送,无需额外 PAT。
+      # 背景:个人账户下 GITHUB_TOKEN 无权「首次创建」一个尚未关联的 ghcr
+      # package(写权限锚定已关联本 repo 的 package,新壳无从关联)。当初用
+      # 个人 PAT 破冰创建并手动关联;关联后 GITHUB_TOKEN 即可接管。
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 发布门禁:与 ci.yml 同一套检查,确保不发布坏版本。
+      # 先 build plugin-api,dependents 的 typecheck 才能拿到它的 .d.ts。
+      - run: pnpm run check
+      - run: pnpm --filter @kiro2claude/plugin-api run build
+      - run: pnpm -r run typecheck
+      - run: pnpm -r --filter '!@kiro2claude/plugin-api' run build
+      - run: pnpm -r run test
+
+      # semantic-release:分析 → bump core/package.json → CHANGELOG → tag →
+      # GitHub Release → docker build & push(publishCmd)。仅在有可发布
+      # commit 时才真正发版。
+      - run: pnpm exec semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # release commit 的作者/提交者:semantic-release 默认塞
+          # semantic-release-bot <semantic-release-bot@martynus.net>,这里覆盖成
+          # 仓库主,让发布 commit 归属清晰、git 历史只出现真实贡献者。
+          GIT_AUTHOR_NAME: yupanzi
+          GIT_AUTHOR_EMAIL: me@yupanzi.com
+          GIT_COMMITTER_NAME: yupanzi
+          GIT_COMMITTER_EMAIL: me@yupanzi.com
+          # @semantic-release/git 用普通 git commit 提交发布产物(CHANGELOG +
+          # core/package.json),会触发 husky pre-commit。CI 已在前面显式跑过
+          # check/typecheck/test 门禁,pre-commit 在此纯冗余,且其 markdownlint
+          # 会误伤 semantic-release 机器生成的 CHANGELOG.md(MD001/MD012)。
+          # HUSKY=0 让 husky v9 跳过所有本地钩子(仅作用于 CI 这一步)。
+          HUSKY: 0

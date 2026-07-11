@@ -1,0 +1,25 @@
+{
+  // Markdown 样式规范(配合 pnpm lint:md / lint:md:fix)。
+  // 中文技术文档:关闭与中文写作、技术占位符冲突的风格规则,
+  // 保留可自动修复的结构规则(标题/列表/代码块周围空行、缩进、硬 tab 等)。
+  "config": {
+    "default": true,
+    "MD013": false, // 行长:中文散文与宽表格天然超长
+    "MD033": false, // 内联 HTML:技术文档大量用 <placeholder> 尖括号占位
+    "MD040": false, // 代码块语言:含 ascii 架构图等无语言块
+    "MD014": false, // 命令块允许只列命令、不附输出
+    "MD060": false, // 表格列对齐风格:不强制
+    "MD028": false, // 密集中文技术文档用多段相邻独立 blockquote 注记
+    "MD024": { "siblings_only": true } // 允许不同章节下重复的同名子标题
+  },
+  "globs": ["**/*.md"],
+  "ignores": [
+    "**/node_modules/**",
+    "**/dist/**",
+    ".claude/**",
+    ".playwright-mcp/**",
+    // semantic-release 机器生成:格式(# 版本 → ### 分类、段间空行)天然
+    // 违反 MD001/MD012,由发布流程维护,不受人工 markdown 样式规范约束。
+    "CHANGELOG.md"
+  ]
+}

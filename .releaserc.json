@@ -1,0 +1,23 @@
+{
+  "branches": ["master"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/changelog", { "changelogFile": "CHANGELOG.md" }],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "node scripts/bump-core-version.mjs ${nextRelease.version} && pnpm biome format --write packages/core/package.json",
+        "publishCmd": "docker buildx build --platform linux/amd64 -f docker/Dockerfile --build-arg KIRO2CLAUDE_CLI_VERSION=\"$(jq -r .kiroCliVersion fixtures/kiro-cli-profile.json)\" --build-arg KIRO2CLAUDE_IMAGE_SOURCE=\"https://github.com/$GITHUB_REPOSITORY\" -t \"ghcr.io/$GITHUB_REPOSITORY_OWNER/kiro2claude:${nextRelease.version}\" -t \"ghcr.io/$GITHUB_REPOSITORY_OWNER/kiro2claude:latest\" --push ."
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "packages/core/package.json"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}

@@ -1,0 +1,47 @@
+# ============================================================
+# kiro2claude CI — workspace-wide lint + typecheck + test
+# ============================================================
+# PR + push: biome check + typecheck + test across all workspace packages.
+# Image release lives in release.yml.
+# ============================================================
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run check
+      # Build plugin-api first so dependents can pick up its .d.ts during typecheck.
+      # tsc resolves @kiro2claude/plugin-api via node_modules symlink → packages/plugin-api/,
+      # but the `types` field points at dist/index.d.ts which doesn't exist until we build.
+      - run: pnpm --filter @kiro2claude/plugin-api run build
+      - run: pnpm -r run typecheck
+      - run: pnpm -r --filter '!@kiro2claude/plugin-api' run build
+      - run: pnpm -r run test
+
+      # 插件发现门禁:build 后启动真实 plugin-host(loader + HookBus +
+      # UsageFinishEvent),验证插件发现与 usage-finish hook 端到端不回归。
+      - run: node scripts/smoke-plugin-loader.mjs

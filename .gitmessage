@@ -1,0 +1,17 @@
+# <type>(<scope>): <主题——祈使句、简洁、句末不加句号>
+#
+# 正文(可选,与标题空一行):解释「为什么」而非「怎么做」。
+#
+# 脚注(可选):BREAKING CHANGE: 说明不兼容变更 / Closes #123
+#
+# ── type ────────────────────────────────────────────
+# feat     新功能              fix      修复 bug
+# docs     仅文档              style    格式/排版(不改逻辑)
+# refactor 重构(非新功能非修复) perf     性能优化
+# test     测试               build    构建系统/依赖
+# ci       CI 配置            chore    杂项/工具
+# revert   回滚某次提交
+# ── 常用 scope(自由,非强制) ─────────────────────────
+# core plugin-api plugin-metering examples kiro claude
+# routes plugin-host shared model token docker scripts docs deps
+# ─────────────────────────────────────────────────────

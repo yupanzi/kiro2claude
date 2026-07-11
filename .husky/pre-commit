@@ -1,0 +1,11 @@
+echo "[pre-commit] biome check ..."
+pnpm run --silent check
+
+echo "[pre-commit] pnpm -r typecheck ..."
+pnpm -r --silent run typecheck
+
+echo "[pre-commit] pnpm -r test ..."
+pnpm -r --silent run test
+
+echo "[pre-commit] markdownlint ..."
+pnpm run --silent lint:md

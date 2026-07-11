@@ -1,0 +1,62 @@
+{
+  "name": "@kiro2claude/core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "kiro2claude gateway core — wraps the Kiro upstream as a Claude API-compatible proxy. Plugin host (HookBus + capability registry) for first-party and third-party extensions.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "kiro2claude": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./plugin-api": {
+      "types": "./node_modules/@kiro2claude/plugin-api/dist/index.d.ts",
+      "import": "./node_modules/@kiro2claude/plugin-api/dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch --clear-screen=false --env-file-if-exists=../../.env src/index.ts",
+    "test": "vitest run",
+    "test:e2e": "node --env-file-if-exists=../../.env node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist .tsbuildinfo *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@kiro2claude/plugin-api": "workspace:*",
+    "@kiro2claude/plugin-derived": "workspace:*",
+    "@kiro2claude/plugin-metering": "workspace:*",
+    "axios": "^1.15.0",
+    "better-sqlite3": "^11.10.0",
+    "crc-32": "^1.2.2",
+    "decimal.js": "^10.6.0",
+    "fastify": "^5.8.5",
+    "pino": "^9.14.0",
+    "pino-pretty": "^11.3.0",
+    "uuid": "^11.1.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.19.17",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
