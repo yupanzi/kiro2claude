@@ -90,7 +90,7 @@ flowchart LR
 | `KIRO2CLAUDE_*` 环境变量(core 自用)| `model/schemas/config-schema.ts`(envSchema)+ `.env.example` |
 | Plugin 契约类型 | `packages/plugin-api/src/types.ts` |
 | 怎么写 plugin | [`docs/PLUGIN-DEVELOPMENT.md`](./docs/PLUGIN-DEVELOPMENT.md) + `packages/examples/echo-plugin/` |
-| 支持哪些模型 / 名字映射 | `claude/models-catalog.ts` + `mapModel()`(GPT-5.6 五处同改:mapModel / MODELS_WITH_NATIVE_REASONING / getContextWindowSize / claude+openai catalog)|
+| 支持哪些模型 / 名字映射 | `claude/models-catalog.ts` + `mapModel()`(GPT-5.6 六处同改:mapModel / MODELS_WITH_NATIVE_REASONING / getContextWindowSize / claude+openai catalog / plugin-derived `isGptModel` 跨包复制变体 token sol·terra·luna·codex)|
 | 哪些模型走原生 reasoning | `MODELS_WITH_NATIVE_REASONING` in `converter.ts`(含 GPT-5.6,但其 reasoning 加密不 surface)|
 | context window 大小 | `getContextWindowSize()` in `converter.ts`(GPT-5.6 = 272K)|
 | effort 阈值映射 | `mapThinkingToEffort()`;OpenAI `reasoning_effort` 见 `openai/converter.ts`(minimal→low,其余透传)|
@@ -102,6 +102,7 @@ flowchart LR
 | 上游 status → 下游 status | `claude/error-mapper.ts` + `shared/upstream-status.ts` |
 | kiro-cli 伪装 wire 字段 / 期望版本 | `fixtures/kiro-cli-profile.json` + `kiro/client-profile.ts` FALLBACK_PROFILE |
 | `usage` 字段如何被 plugin 注入 | plugin 用 `event.addExtension(...)` / `event.overrideStandardField(...)`;core 不输出特定 plugin 字段 |
+| GPT 反演为何 credit 锚定(不做 token 分解)| `plugin-derived/src/derive.ts` `gptCreditAnchoredBreakdown` + 踩坑 #18 |
 | `/api/*` 怎么剥 plugin 扩展 | `index.ts` 的 `/api/*` register 处 + `buildClaudeUsagePayload`(`claude/stream.ts`)|
 | 空流重试 / 判空 / 抓包 | 踩坑 #13:`stream-handler.ts` + `stream.ts`(`sawCompletedToolUse`)+ `empty-capture.ts` 头注释 |
 | 泄漏工具调用救援红线 | `claude/tool-call-text.ts` 头注释(踩坑 #14)|
@@ -177,6 +178,7 @@ flowchart LR
 15. **GPT-5.6 与 Claude 走完全相同的上游**:请求体逐字段相同,唯一差异是 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,**无需**新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload 是 `{redactedContent}`(加密、无 text/signature),`stream.ts` `processReasoningContent` 顶部 `if(!text&&!signature)return[]` 整块丢弃(否则开空 thinking 块);`metadataEvent{stopReason}` 故意落 `Unknown`、由网关自行推断(工具调用时 `tool_use` 比上游 `END_TURN` 准),**保持现状**
 16. **OpenAI `prompt_tokens` ≠ Claude `input_tokens`**:`buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage **必须**直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、**绕过** `buildClaudeUsagePayload`;计费 hook 仍照跑,首版只出标准三字段、不含 `kiro_*` 扩展
 17. **Codex 只说 Responses + 只对识别的模型名发工具**:① `wire_api=chat` 在 Codex 0.122+ 被移除,Codex 必须走 `/openai/v1/responses`(Responses 与 Chat 是两套东西:请求 `input` items + 扁平 tools,响应是严格语义事件序列)。② Codex 只对内部识别的模型名下发工具,故 `mapModel` 把 `gpt-*-codex` **别名**到 `gpt-5.6-sol`,Codex config 用 `gpt-5-codex` 才有工具调用。编码器红线全在 `openai/responses/response-stream.ts` 头注释(`content_part.added` 必须先于 `output_text.delta`、done 回填全文、纯工具调用不产空 message、Claude thinking → reasoning summary item 惰性开),**改编码器前先跑一遍真实 Codex**(harness `tools/codex/`)
+18. **GPT 反演走 credit 锚定,不做 token 级分解**:本地 kiro-cli 实测 —— ① GPT 无 prompt-cache 经济学 —— 多档对照实测(固定大前缀重发 10k/50k/100k tokens):Claude 稳定降 ~47%、GPT 全系列(sol/terra/luna)降 0%(sol credits 逐字节相同);缺口在 Kiro 计费层不传导 GPT 缓存折扣、非模型能力(官方 GPT-5.6 有 caching)→ `cache_read`/`cache_creation` 恒 0、input 全量计入;② output 含加密 reasoning(计费但不进可见 `output_tokens`,见踩坑 #15),量因任务而异且不可观测——零-reasoning 复制任务 output 侧 ≈10 credit/USD,而高-reasoning 任务同等可见 token 下 credits 高 ~47%,`(input,visibleOut,credits)` 欠定 → 无法反解「公开价等效成本」。故 GPT 成本锚定唯一可靠真值 `credits×0.04`(× multiplier),走 `deriveKiroUsage` 顶部 `isGptModel` 专属分支(status `gpt_credit_anchored`)。**绝不要给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`**:偏高的 credits 会被标准反演误推成虚高 `tEffIn` → step3 把 input 误拆成 `cache_creation`(分流必须在价格表查询**前**)。红线在 `gptCreditAnchoredBreakdown` 头注释
 
 ## 测试
 

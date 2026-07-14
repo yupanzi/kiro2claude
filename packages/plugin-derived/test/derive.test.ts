@@ -289,7 +289,7 @@ describe('deriveKiroUsage — cache threshold gating', () => {
 
 describe('deriveKiroUsage — unknown / thinking variants', () => {
   it('unknown model → status="unknown_model", input_tokens preserved', () => {
-    const out = deriveKiroUsage('gpt-4', 5000, 100, 0.01);
+    const out = deriveKiroUsage('mistral-large', 5000, 100, 0.01);
     expect(out.derived.derivedStatus).toBe('unknown_model');
     expect(out.inputTokens).toBe(5000);
     expect(out.cacheCreationInputTokens).toBe(0);
@@ -317,6 +317,109 @@ describe('deriveKiroUsage — unknown / thinking variants', () => {
     expect(opus47.cacheReadInputTokens).toBe(opus46.cacheReadInputTokens);
     expect(opus47.derived.derivedStatus).toBe(opus46.derived.derivedStatus);
     expect(opus47.derived.claudeEquivalentCostUsd).toBe(opus46.derived.claudeEquivalentCostUsd);
+  });
+});
+
+// ============================================================================
+// GPT-5.6 credit-anchored branch (measured against local kiro-cli, 2026-07)
+// ============================================================================
+// 实测证明 GPT 无缓存经济学(同 prompt 重发 credits 逐字节不变)+ output 含不可观测
+// 的加密 reasoning(可见 output_tokens 严重偏小、credits 含它)→ credit 无法 token
+// 级分解。成本锚定 credits×0.04(唯一可靠真值)。锚点取自本地 kiro-cli 真实标定探针。
+
+describe('deriveKiroUsage — GPT credit-anchored branch', () => {
+  // [label, model, tIn, tOut(可见), credits] —— 真实标定探针
+  const anchors: Array<[string, string, number, number, number]> = [
+    ['sol baseline', 'gpt-5.6-sol', 1590, 1, 0.013311834825870646],
+    ['sol large-in', 'gpt-5.6-sol', 3596, 1, 0.02873918],
+    ['terra', 'gpt-5.6-terra', 1599, 1, 0.0081067],
+    ['luna', 'gpt-5.6-luna', 1599, 1, 0.00405335],
+  ];
+
+  for (const [label, model, tIn, tOut, credits] of anchors) {
+    it(`${label}: input=full, cache=0, cost anchored to credits×0.04`, () => {
+      const out = deriveKiroUsage(model, tIn, tOut, credits);
+      expect(out.derived.derivedStatus).toBe('gpt_credit_anchored');
+      // 三个 component 断言已蕴含协议恒等式 input+cc+cr===tIn
+      expect(out.inputTokens).toBe(tIn);
+      expect(out.cacheCreationInputTokens).toBe(0);
+      expect(out.cacheReadInputTokens).toBe(0);
+      // 成本锚定 credits×0.04
+      expect(out.derived.claudeEquivalentCostUsd).toBeCloseTo(credits * KIRO_OVERAGE_RATE, 12);
+      expect(out.derived.finalCostUsd).toBeCloseTo(credits * KIRO_OVERAGE_RATE, 12);
+      expect(out.derived.estimatedCacheHitRatio).toBe(0);
+      expect(out.derived.floorApplied).toBe(false);
+      expect(out.derived.inputTokensTotal).toBe(tIn);
+    });
+  }
+
+  it('Codex alias (gpt-5-codex) is credit-anchored without any price-table entry', () => {
+    const out = deriveKiroUsage('gpt-5-codex', 2000, 50, 0.02);
+    expect(out.derived.derivedStatus).toBe('gpt_credit_anchored');
+    expect(out.inputTokens).toBe(2000);
+    expect(out.cacheCreationInputTokens).toBe(0);
+    expect(out.cacheReadInputTokens).toBe(0);
+  });
+
+  it('case-insensitive: GPT-5.6-Sol still hits the GPT branch', () => {
+    const out = deriveKiroUsage('GPT-5.6-Sol', 2000, 50, 0.02);
+    expect(out.derived.derivedStatus).toBe('gpt_credit_anchored');
+  });
+
+  it('matches mapModel discipline: provider-prefix / whitespace hit, gpt-opus does not', () => {
+    // provider 前缀(OpenRouter/LiteLLM 风格)+ 前后空格:mapModel 用 includes 会映射到
+    // GPT 上游、按 GPT 真实计费,反演必须也认它,否则 markup(μ>1)下少收费。
+    expect(deriveKiroUsage('openai/gpt-5.6-sol', 2000, 50, 0.02).derived.derivedStatus).toBe(
+      'gpt_credit_anchored',
+    );
+    expect(deriveKiroUsage(' gpt-5.6-sol ', 2000, 50, 0.02).derived.derivedStatus).toBe(
+      'gpt_credit_anchored',
+    );
+    // gpt-opus 被 mapModel 路由到 Claude Opus,不含 sol/terra/luna/codex → 不该 credit 锚定。
+    expect(deriveKiroUsage('gpt-opus', 2000, 50, 0.02).derived.derivedStatus).not.toBe(
+      'gpt_credit_anchored',
+    );
+  });
+
+  it('multiplier scales finalCostUsd; μ=0 zeroes it (claudeEquiv keeps the anchor)', () => {
+    const args: [string, number, number, number] = ['gpt-5.6-sol', 3596, 1, 0.02873918];
+    const anchor = 0.02873918 * KIRO_OVERAGE_RATE;
+    initCreditDerive(2.5);
+    const scaled = deriveKiroUsage(...args);
+    expect(scaled.derived.costMultiplier).toBe(2.5);
+    expect(scaled.derived.finalCostUsd).toBeCloseTo(anchor * 2.5, 12);
+    resetCreditDerive();
+    initCreditDerive(0);
+    const free = deriveKiroUsage(...args);
+    expect(free.derived.finalCostUsd).toBe(0);
+    expect(free.derived.claudeEquivalentCostUsd).toBeCloseTo(anchor, 12);
+  });
+
+  it('μ<1 floors finalCostUsd at the credit anchor (no undershoot, matches Claude)', () => {
+    // 复用 applyFloor:μ<1 时 anchor×μ 跌破上游成本地板,floor 兜住到 anchor(运营商不亏)。
+    const credits = 0.02873918;
+    const anchor = credits * KIRO_OVERAGE_RATE;
+    initCreditDerive(0.5);
+    const out = deriveKiroUsage('gpt-5.6-sol', 3596, 1, credits);
+    expect(out.derived.finalCostUsd).toBeCloseTo(anchor, 12);
+    expect(out.derived.floorApplied).toBe(true);
+  });
+
+  it('DEFENSE: GPT never enters the Claude cache-split path even at huge credits', () => {
+    // 防御回归:GPT 高 credits(含隐藏 reasoning)绝不能被反推成虚高 tEffIn 再拆成
+    // cache_creation(那是 Claude 流程的假设)。isGptModel 在价格表查询前分流。
+    const out = deriveKiroUsage('gpt-5.6-sol', 5000, 1, 5.0);
+    expect(out.derived.derivedStatus).toBe('gpt_credit_anchored');
+    expect(out.cacheCreationInputTokens).toBe(0);
+    expect(out.cacheReadInputTokens).toBe(0);
+    expect(out.inputTokens).toBe(5000);
+  });
+
+  it('input_tokens=0 → zeroed but still credit-anchored', () => {
+    const out = deriveKiroUsage('gpt-5.6-sol', 0, 1, 0.01);
+    expect(out.inputTokens).toBe(0);
+    expect(out.derived.derivedStatus).toBe('gpt_credit_anchored');
+    expect(out.derived.claudeEquivalentCostUsd).toBeCloseTo(0.01 * KIRO_OVERAGE_RATE, 12);
   });
 });
 
@@ -480,7 +583,7 @@ describe('deriveKiroUsage — upstream cost floor', () => {
   it('unknown_model + multiplier=1 still hits floor (claudeUsd=0)', () => {
     // unknown model → claudeUsd=0, even with multiplier=1 the algo USD is 0,
     // so floor `credits × 0.04` always wins
-    const out = deriveKiroUsage('gpt-4', 5000, 100, 0.01);
+    const out = deriveKiroUsage('mistral-large', 5000, 100, 0.01);
     expect(out.derived.claudeEquivalentCostUsd).toBe(0);
     expect(out.derived.floorApplied).toBe(true);
     expect(out.derived.finalCostUsd).toBeCloseTo(0.01 * KIRO_OVERAGE_RATE, 10);
@@ -506,7 +609,8 @@ describe('deriveKiroUsage — Anthropic protocol identity', () => {
     ['ok_derived Opus', 'claude-opus-4-5-20251101', 5000, 100, 0.05],
     ['ok_derived Sonnet', 'claude-sonnet-4-5-20250929', 5907, 108, 0.033963],
     ['below_threshold', 'claude-opus-4-5-20251101', 100, 5, 0.001],
-    ['unknown_model', 'gpt-4', 5000, 100, 0.05],
+    ['unknown_model', 'mistral-large', 5000, 100, 0.05],
+    ['gpt_credit_anchored', 'gpt-5.6-sol', 3596, 1, 0.02873918],
   ];
 
   for (const [label, model, tIn, tOut, credits] of fixtures) {

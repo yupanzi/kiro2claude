@@ -177,7 +177,12 @@ const CLAUDE_CODE_INPUT_TAIL_TOKENS = 10;
 // Public types
 // ============================================================================
 
-export type DerivedStatus = 'unknown_model' | 'below_threshold' | 'ok_derived';
+export type DerivedStatus =
+  | 'unknown_model'
+  | 'below_threshold'
+  | 'ok_derived'
+  // GPT-5.6 credit 锚定分支(sol/terra/luna 及 Codex 别名);详见 `gptCreditAnchoredBreakdown` 头注释。
+  | 'gpt_credit_anchored';
 
 /** Metadata sub-object attached as `usage.kiro_derived` on responses. */
 export interface KiroDerivedMetadata {
@@ -285,6 +290,26 @@ function normalizeModelId(model: string): string {
   return noThinking.replace(/-20\d{6}$/, '');
 }
 
+/**
+ * GPT 判别 —— 与 core `mapModel` 的 GPT 分支**同规则**(`includes('gpt')` + 变体
+ * token sol/terra/luna/codex),而非宽泛的 `startsWith('gpt')`。理由:`mapModel` 用
+ * `includes` 路由,故 provider 前缀(`openai/gpt-5.6-sol`)、前后空格也会被映射到 GPT
+ * 上游、按 GPT 真实计费;若这里用 `startsWith` 会漏判它们 → 误落 Claude 价格表 →
+ * `unknown_model`,在 markup(μ>1)下少收费。反之 `gpt-opus`(被 `mapModel` 路由到
+ * Claude Opus)不含变体 token → 不误命中。plugin 不能 import core,故复制判定 token
+ * ——新增 GPT 变体时需与 `converter.ts` 的 `mapModel` 同步。大小写由 `toLowerCase` 兜。
+ */
+function isGptModel(model: string): boolean {
+  const lower = model.toLowerCase();
+  return (
+    lower.includes('gpt') &&
+    (lower.includes('sol') ||
+      lower.includes('terra') ||
+      lower.includes('luna') ||
+      lower.includes('codex'))
+  );
+}
+
 function clamp(n: number, lo: number, hi: number): number {
   if (n < lo) return lo;
   if (n > hi) return hi;
@@ -339,6 +364,55 @@ function passthroughBreakdown(
   };
 }
 
+/**
+ * GPT-5.6 系列专属:credit 锚定成本,不做 token 级反演。
+ *
+ * 依据(本地 kiro-cli 多档对照实测,2026-07):
+ * - **无缓存经济学**:固定大前缀重发(10k/50k/100k tokens)——Claude 稳定降 ~47%
+ *   (缓存红利),GPT 全系列(sol/terra/luna)降 0%(sol 三次 credits 逐字节完全相同)。
+ *   → `cache_read` / `cache_creation` 恒 0,input 全量计入 `input_tokens`。缺口在
+ *   Kiro 计费层不传导 GPT 缓存折扣,非模型能力(OpenAI 官方 GPT-5.6 有 prompt caching)。
+ * - **output 含加密 reasoning,不可辨识**:GPT reasoning 计费但不进 visible
+ *   `output_tokens`(踩坑 #15,redacted)。零-reasoning 的逐字复制任务 output 侧
+ *   ≈10 credit/USD,而 counting 等高-reasoning 任务在同等可见 token 下 credits 高
+ *   ~47% → 隐藏 reasoning 量因任务而异且不可观测,`(input, visibleOut, credits)`
+ *   欠定,无法唯一反解"公开价等效成本"。故 **credits 是唯一可靠成本真值**。
+ *
+ * 因此:input=全量、cache=0;`claudeEquivalentCostUsd` 锚定 `credits × KIRO_OVERAGE_RATE`,
+ * `finalCostUsd` 走与 Claude 相同的 `applyFloor`(× multiplier;μ<1 时不跌破该地板,运营商不亏)。
+ * 这与 Claude 路径反演 input 缓存结构互为镜像——GPT 的信息缺口在 output 侧,input 侧无可反的缓存结构。
+ *
+ * ⚠ 绝不要给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`:若填了,GPT 偏高的 credits(含隐藏
+ * reasoning)会被标准 `deriveKiroUsage` 反推成虚高 `tEffIn` → step3 误把 input 拆成
+ * `cache_creation`。`isGptModel` 在价格表查询前分流正是这道防线。
+ */
+function gptCreditAnchoredBreakdown(
+  inputTokensTotal: number,
+  credits: number,
+): DerivedUsageBreakdown {
+  // Math.max 对齐 Claude 路径对 input<=0 的归零(GPT 分流在 <=0 早返回之前)。
+  const inTokens = Math.max(0, inputTokensTotal);
+  const anchoredUsd = credits * KIRO_OVERAGE_RATE;
+  // 复用 applyFloor,与 Claude 路径同一套 floor 语义:μ=0 free-tier 归零;μ<1 时
+  // anchoredUsd×μ 会跌破上游成本地板 credits×0.04,floor 兜住(运营商不亏)。GPT 的
+  // anchoredUsd 恰等于该地板,故 μ≥1 时 floor 从不触发、floorApplied=false。
+  const { finalUsd, floorApplied } = applyFloor(anchoredUsd, credits);
+  return {
+    inputTokens: inTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    derived: {
+      inputTokensTotal: inTokens,
+      estimatedCacheHitRatio: 0,
+      claudeEquivalentCostUsd: anchoredUsd,
+      finalCostUsd: finalUsd,
+      costMultiplier: _multiplier,
+      derivedStatus: 'gpt_credit_anchored',
+      floorApplied,
+    },
+  };
+}
+
 // ============================================================================
 // Main reverse-engineering function
 // ============================================================================
@@ -350,6 +424,15 @@ export function deriveKiroUsage(
   credits: number,
 ): DerivedUsageBreakdown {
   const normalizedModel = normalizeModelId(model);
+
+  // GPT-5.6 系列:credit 锚定专属分支。必须在价格表查询**之前**分流——既因 GPT
+  // 成本不靠单价(见 `gptCreditAnchoredBreakdown`),也为拦住"误填 GPT 价格表"
+  // 导致的 `cache_creation` 误拆。判别用**原始** model(与 mapModel 对齐,兼容
+  // provider 前缀 / 空格);normalizeModelId 只服务下面的价格表 key。
+  if (isGptModel(model)) {
+    return gptCreditAnchoredBreakdown(inputTokensTotal, credits);
+  }
+
   const cp = CLAUDE_PRICE_USD_PER_TOK[normalizedModel];
 
   if (cp == null) {
