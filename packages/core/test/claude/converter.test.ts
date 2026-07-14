@@ -92,6 +92,33 @@ describe('mapModel', () => {
     expect(mapModel('GLM-5')).toBeUndefined();
     expect(mapModel('glm')).toBeUndefined();
   });
+
+  it('test_map_model_gpt_5_6', () => {
+    expect(mapModel('gpt-5.6-sol')).toBe('gpt-5.6-sol');
+    expect(mapModel('gpt-5.6-terra')).toBe('gpt-5.6-terra');
+    expect(mapModel('gpt-5.6-luna')).toBe('gpt-5.6-luna');
+    // 大小写 / 分隔符变体都靠 sol/terra/luna 判别子命中
+    expect(mapModel('GPT-5.6-Sol')).toBe('gpt-5.6-sol');
+    expect(mapModel('gpt-5-6-terra')).toBe('gpt-5.6-terra');
+    // -thinking 后缀
+    expect(mapModel('gpt-5.6-luna-thinking')).toBe('gpt-5.6-luna');
+  });
+
+  it('test_map_model_gpt_unknown_variant_undefined', () => {
+    // 有 gpt 无 sol/terra/luna/codex 判别子 → undefined(400),不静默转发不存在的模型
+    expect(mapModel('gpt-4')).toBeUndefined();
+    expect(mapModel('gpt-5')).toBeUndefined();
+    expect(mapModel('gpt-5.6')).toBeUndefined();
+  });
+
+  it('test_map_model_codex_alias', () => {
+    // Codex CLI 只对它识别的名字发工具集,故网关把 gpt-*-codex 别名到 gpt-5.6-sol
+    expect(mapModel('gpt-5-codex')).toBe('gpt-5.6-sol');
+    expect(mapModel('gpt-5.1-codex')).toBe('gpt-5.6-sol');
+    expect(mapModel('gpt-5-codex-mini')).toBe('gpt-5.6-sol');
+    // sol/terra/luna 判别子优先于 codex
+    expect(mapModel('gpt-5.6-terra')).toBe('gpt-5.6-terra');
+  });
 });
 
 describe('convertRequest - chat trigger type', () => {

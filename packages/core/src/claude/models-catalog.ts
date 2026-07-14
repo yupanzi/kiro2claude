@@ -153,6 +153,36 @@ export const MODELS: Model[] = [
     type: 'chat',
     max_tokens: 64000,
   },
+  // GPT-5.6 系列（OpenAI，kiro-cli 2.12.1 起）。走与 Claude 完全相同的上游
+  // conversationState wire，故经 `/claude/v1` 也可用（mapModel 处理）；同时是
+  // `/openai/v1` 的一等公民。created = 2026-07-13 发布日。
+  {
+    id: 'gpt-5.6-sol',
+    object: 'model',
+    created: 1783900800,
+    owned_by: 'openai',
+    display_name: 'GPT-5.6 Sol',
+    type: 'chat',
+    max_tokens: 64000,
+  },
+  {
+    id: 'gpt-5.6-terra',
+    object: 'model',
+    created: 1783900800,
+    owned_by: 'openai',
+    display_name: 'GPT-5.6 Terra',
+    type: 'chat',
+    max_tokens: 64000,
+  },
+  {
+    id: 'gpt-5.6-luna',
+    object: 'model',
+    created: 1783900800,
+    owned_by: 'openai',
+    display_name: 'GPT-5.6 Luna',
+    type: 'chat',
+    max_tokens: 64000,
+  },
 ];
 
 /** Shape the catalog as the `list`-typed response expected by clients. */

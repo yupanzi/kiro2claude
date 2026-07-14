@@ -38,7 +38,13 @@ export function overrideThinkingFromModelName(payload: MessagesRequest): void {
       modelLower.includes('4-8') ||
       modelLower.includes('4.8'));
 
-  const thinkingType = isAdaptiveOpus ? 'adaptive' : 'enabled';
+  // GPT-5.6 系列走原生 reasoning.effort(在 MODELS_WITH_NATIVE_REASONING 内),
+  // adaptive 通道让 `gpt-5.6-sol-thinking` 别名的 effort 经 output_config 传递,
+  // 与 opus-4.7/4.8 一致。(OpenAI 端点直接用 reasoning_effort,不走这条。)
+  const isAdaptiveGpt = modelLower.includes('gpt');
+
+  const isAdaptive = isAdaptiveOpus || isAdaptiveGpt;
+  const thinkingType = isAdaptive ? 'adaptive' : 'enabled';
 
   getLogger().info({
     msg: 'thinking override from model name',
@@ -51,7 +57,7 @@ export function overrideThinkingFromModelName(payload: MessagesRequest): void {
     budget_tokens: 20000,
   };
 
-  if (isAdaptiveOpus) {
+  if (isAdaptive) {
     payload.output_config = { effort: 'high' };
   }
 }

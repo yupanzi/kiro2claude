@@ -111,6 +111,19 @@ export function buildReasoningContentFrame(text: string, signature?: string): Bu
 }
 
 /**
+ * Build a GPT-5.6 redacted reasoning frame: same `reasoningContentEvent`
+ * event-type but the payload is `{ redactedContent }` only (no text/signature) —
+ * an encrypted hidden chain-of-thought with nothing surfaceable. Used to assert
+ * the stream/non-stream paths drop it instead of opening an empty thinking block.
+ */
+export function buildRedactedReasoningFrame(redactedContent = 'LktUUn5+ZW5j'): Buffer {
+  return encodeEventStreamFrame(
+    { ':message-type': 'event', ':event-type': 'reasoningContentEvent' },
+    Buffer.from(JSON.stringify({ redactedContent }), 'utf-8'),
+  );
+}
+
+/**
  * Build a ContextUsage frame. `percentage >= 100` makes the handler resolve a
  * window-exceeded terminal (stop_reason `model_context_window_exceeded`); see
  * `resolveContextUsage` in converter.ts. A ContextUsage frame carries NO content,

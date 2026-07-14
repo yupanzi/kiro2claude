@@ -68,7 +68,7 @@ export function buildClaudeUsagePayload(args: {
     cache_read_input_tokens: overrides.get('cache_read_input_tokens') ?? 0,
   };
 
-  // 「去泄漏」镜像端点 `/api/v1` 的请求级标记（经 AsyncLocalStorage 传入，无需给
+  // 「去泄漏」镜像端点 `/api/claude/v1` 的请求级标记（经 AsyncLocalStorage 传入，无需给
   // build 链路加参数）：跳过 plugin 注入的扩展命名空间（`kiro_metering` 等），只留
   // 标准 Anthropic 字段。metering 的 usage-finish hook 仍照常运行（累计计数器照进），
   // 只是其扩展输出不落到 `/api` 的 wire 上。标准字段 override 保留——它们改的是标准
@@ -81,6 +81,37 @@ export function buildClaudeUsagePayload(args: {
   }
 
   return payload;
+}
+
+/**
+ * 组装 usage-finish hook 事件——`kiro.*` 计费 meta 形状的唯一真相源。
+ * 流式(StreamContext.generateFinalEvents)+ 两端非流式 handler 共 5 处构造点
+ * 复用此函数,杜绝 kiro.* 键漂移与 claude/openai 计费分叉。
+ *
+ * `inputTokensFromUpstream`:上游 ContextUsage 是否还原出了 input_tokens
+ * (决定 inputTokensSource: upstream-reported / client-estimate)。
+ */
+export function buildKiroUsageFinishEvent(args: {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  inputTokensFromUpstream: boolean;
+  kiroMetering: KiroMeteringData | undefined;
+  logger: ReturnType<typeof getLogger>;
+}): UsageFinishEventImpl {
+  return new UsageFinishEventImpl({
+    model: args.model,
+    source: 'http-direct',
+    inputTokensSource: args.inputTokensFromUpstream ? 'upstream-reported' : 'client-estimate',
+    meta: {
+      'kiro.inputTokens': args.inputTokens,
+      'kiro.outputTokens': args.outputTokens,
+      'kiro.creditsUsed': args.kiroMetering?.usage,
+      'kiro.pricedModel': args.model,
+      'kiro.upstreamRaw': args.kiroMetering,
+    },
+    logger: args.logger,
+  });
 }
 
 // ============================================================================
@@ -775,6 +806,13 @@ export class StreamContext {
    * `processContentWithThinking` 入口会跳过 `<thinking>` 标签扫描，避免双重处理。
    */
   private processReasoningContent(text: string, signature: string | undefined): SseEvent[] {
+    // GPT-5.6 的 reasoningContentEvent 只带 redactedContent(加密隐藏思维链,无
+    // text/signature)——无内容可 surface。直接丢弃,不开 thinking 块(否则会产一个
+    // 空 thinking content block,且 sawReasoningContent 误置为 true)。顺带修掉
+    // 「上游偶发空 reasoning 帧开空块」的既有 bug。对 Claude 明文 reasoning 零影响:
+    // 其首帧带 text、尾帧带 signature,守卫都不触发。
+    if (!text && !signature) return [];
+
     const events: SseEvent[] = [];
 
     if (!this.sawReasoningContent) {
@@ -1240,18 +1278,12 @@ export class StreamContext {
     const finalInputTokens = this.contextInputTokens ?? this.inputTokens;
 
     // Build the hook event surface for plugins
-    const hookEvent = new UsageFinishEventImpl({
+    const hookEvent = buildKiroUsageFinishEvent({
       model: this.model,
-      source: 'http-direct',
-      inputTokensSource:
-        this.contextInputTokens !== undefined ? 'upstream-reported' : 'client-estimate',
-      meta: {
-        'kiro.inputTokens': finalInputTokens,
-        'kiro.outputTokens': this.outputTokens,
-        'kiro.creditsUsed': this.kiroMeteringRaw?.usage,
-        'kiro.pricedModel': this.model,
-        'kiro.upstreamRaw': this.kiroMeteringRaw,
-      },
+      inputTokens: finalInputTokens,
+      outputTokens: this.outputTokens,
+      inputTokensFromUpstream: this.contextInputTokens !== undefined,
+      kiroMetering: this.kiroMeteringRaw,
       logger: getLogger(),
     });
     await this.hookBus.runUsageFinish(hookEvent);

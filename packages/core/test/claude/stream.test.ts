@@ -595,7 +595,7 @@ describe('SseStateManager.generateFinalEvents (hook bus shape)', () => {
   });
 
   it('strips plugin extensions when request context flags stripPluginUsage (/api mirror)', () => {
-    // 「去泄漏」镜像端点 /api/v1：请求级标记置位时，plugin 注入的扩展命名空间
+    // 「去泄漏」镜像端点 /api/claude/v1：请求级标记置位时，plugin 注入的扩展命名空间
     // 被过滤掉，只留标准 Anthropic 字段。标准字段 override 仍生效（它们不是泄漏）。
     const manager = new SseStateManager();
     manager.handleMessageStart({ type: 'message_start' });

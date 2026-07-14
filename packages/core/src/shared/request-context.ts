@@ -19,7 +19,7 @@ export interface RequestContext {
    * 置 true 时，`buildClaudeUsagePayload` 跳过 plugin 注入的 usage 扩展字段
    * （如 `kiro_metering` / `kiro_derived`），产出纯标准 Anthropic usage。
    *
-   * 由「去泄漏」镜像端点 `/api/v1` 作用域的 preHandler 设置——避免把开关一路
+   * 由「去泄漏」镜像端点 `/api/claude/v1` 作用域的 preHandler 设置——避免把开关一路
    * 穿进 stream/non-stream 的 build 链路。默认 undefined（= 完整 wire，含扩展），
    * 所以 `/claude/v1` 与启动代码 / 单测的行为完全不变。
    */

@@ -70,7 +70,7 @@ export const UNSUPPORTED_DOCUMENT_PLACEHOLDER =
 // ============================================================================
 
 /**
- * Map Claude model name to Kiro model ID.
+ * Map Claude / OpenAI model name to Kiro model ID.
  *
  * - sonnet 5/sonnet-5 -> claude-sonnet-5
  * - sonnet 4.6/4-6 -> claude-sonnet-4.6
@@ -80,6 +80,13 @@ export const UNSUPPORTED_DOCUMENT_PLACEHOLDER =
  * - opus 4.8/4-8 -> claude-opus-4.8
  * - other opus -> claude-opus-4.6 (fallback)
  * - all haiku -> claude-haiku-4.5
+ * - gpt … sol/terra/luna -> gpt-5.6-{sol,terra,luna}
+ *
+ * GPT-5.6（OpenAI，kiro-cli 2.12.1 起）走与 Claude **完全相同**的上游
+ * conversationState wire，唯一差异就是这里映射出的 modelId。判别子用唯一
+ * token（sol/terra/luna）而非完整串，兼容 `gpt-5.6-sol` / `gpt-5-6-sol` /
+ * 任意大小写 / OpenAI 端点回显的原始 model 名。未知 gpt 变体返回 undefined
+ * → 400 UnsupportedModel（不把不存在的模型静默转发上游）。
  */
 export function mapModel(model: string): string | undefined {
   const lower = model.toLowerCase();
@@ -109,6 +116,18 @@ export function mapModel(model: string): string | undefined {
   if (lower.includes('haiku')) {
     return 'claude-haiku-4.5';
   }
+  if (lower.includes('gpt')) {
+    if (lower.includes('sol')) return 'gpt-5.6-sol';
+    if (lower.includes('terra')) return 'gpt-5.6-terra';
+    if (lower.includes('luna')) return 'gpt-5.6-luna';
+    // Codex CLI 别名:Codex 只对它**内部识别**的模型名下发工具集(实测
+    // gpt-5.6-sol→0 工具 / gpt-5-codex→10 工具)。所以走 Codex 且要工具调用时,
+    // config.toml 必须用 `gpt-5-codex` 这类名字;网关把它们别名到 GPT-5.6 旗舰
+    // (sol),让 Codex 工具调用端到端可用。想换档在 Codex 端改不了(会丢工具),
+    // 只能改这里的别名目标。
+    if (lower.includes('codex')) return 'gpt-5.6-sol';
+    return undefined;
+  }
   return undefined;
 }
 
@@ -124,10 +143,20 @@ export function mapModel(model: string): string | undefined {
  * 实测：4.7 完全响应 effort（max → low reasoning chunk 数 3.4× 变化）；
  * 4.8 effort 暂不分档但 reasoning 默认开启；
  * 4.6 / sonnet / haiku / 4.5 完全不支持（加 reasoning 字段被静默忽略）。
+ *
+ * GPT-5.6 系列同样走原生 `reasoning.effort`（kiro-cli settings 的
+ * `chat.modelDefaults` 为 gpt-5.6-sol 存了 reasoning.effort，真实请求确认生效）。
+ * 但 GPT 的 reasoning 内容是**加密的**：上游用同名 `reasoningContentEvent` 回
+ * `{redactedContent}`（无 text/signature），无内容可 surface——见 stream.ts
+ * `processReasoningContent` 的 redacted 守卫。放进本集合只为触发请求侧 effort
+ * 注入 + 跳过 `<thinking>` prompt 前缀，与响应侧是否有可用 thinking 无关。
  */
 export const MODELS_WITH_NATIVE_REASONING: ReadonlySet<string> = new Set([
   'claude-opus-4.7',
   'claude-opus-4.8',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
 ]);
 
 /**
@@ -173,11 +202,31 @@ export function usesNativeReasoning(mappedModelId: string): boolean {
 }
 
 /**
+ * 客户端模型名(**未映射**)是否走**加密 reasoning** 原生路径(GPT-5.6 系列:
+ * reasoning 内容 redacted,上游不给明文/signature)。先 mapModel 再判。
+ *
+ * handler 侧据此在计算 `extractThinking` 时关掉 legacy `<thinking>` 扫描:GPT 的
+ * reasoningContentEvent 被 `processReasoningContent` 的 `if(!text&&!signature)` 守卫
+ * 丢弃,**不会**置 `sawReasoningContent`,故运行时信号无法关闭扫描——必须靠此静态
+ * 判定关掉,否则 GPT 可见输出里的字面 `<thinking>` 会被误当思维链剥离。
+ *
+ * ⚠ **仅限 GPT**:Claude 原生 reasoning(4.7/4.8)是**明文**,靠运行时
+ * `sawReasoningContent` 关闭扫描,且**必须** `thinkingEnabled=true` 才能维持
+ * thinking→text 的 content block 顺序(`generateInitialEvents` 在 thinkingEnabled=false
+ * 时会提前开 text block,把 thinking block 挤到其后——实测 e2e 流式顺序断言失败)。
+ * 所以绝不能把 Claude 原生模型纳入此判定。未知模型 → false(convertRequest 已先拒)。
+ */
+export function clientModelHasEncryptedReasoning(clientModel: string): boolean {
+  return mapModel(clientModel)?.startsWith('gpt') ?? false;
+}
+
+/**
  * Get context window size for a model.
  *
  * Kiro upgraded Opus 4.6 and Sonnet 4.6 to 1M context on 2026-03-24.
  * Opus 4.7 and 4.8 also ship with the 1M window (上游 list-models 实测确认).
  * Sonnet 5 同为 1M context (Anthropic 官方规格,与前代 Sonnet 4.6 一致).
+ * GPT-5.6 系列为 272K context (上游 `--list-models` 实测: context_window_tokens 272000).
  */
 export function getContextWindowSize(model: string): number {
   const mapped = mapModel(model);
@@ -189,6 +238,9 @@ export function getContextWindowSize(model: string): number {
     mapped === 'claude-opus-4.8'
   ) {
     return 1_000_000;
+  }
+  if (mapped === 'gpt-5.6-sol' || mapped === 'gpt-5.6-terra' || mapped === 'gpt-5.6-luna') {
+    return 272_000;
   }
   return 200_000;
 }

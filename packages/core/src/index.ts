@@ -29,6 +29,7 @@ import { CapabilityRegistry, discoverPlugins, HookBus } from './plugin-host/inde
 import { registerClaudeRoutes } from './routes/claude.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerKiroRoutes } from './routes/kiro.js';
+import { registerOpenAiRoutes } from './routes/openai.js';
 import { getLogger, logger } from './shared/logger.js';
 import {
   generateReqId,
@@ -298,7 +299,7 @@ async function main(): Promise<void> {
   // 「去泄漏」镜像端点：同一套 handler，但作用域 preHandler 打上请求级标记
   // `stripPluginUsage`，让 `buildClaudeUsagePayload` 跳过 plugin 注入的 usage 扩展
   // ——产出纯标准 Anthropic usage（无 `kiro_metering` 等 `kiro_*` 字段）。metering
-  // 计量仍照常累计，只是不上 wire。Claude SDK client 把 base URL 指到 `.../api`
+  // 计量仍照常累计，只是不上 wire。Claude SDK client 把 base URL 指到 `.../api/claude`
   // 即可（SDK 自动补 `/v1/messages`）。
   await app.register(
     async (instance) => {
@@ -309,7 +310,30 @@ async function main(): Promise<void> {
       });
       await registerClaudeRoutes(instance, claudeRouteDeps);
     },
-    { prefix: '/api/v1' },
+    { prefix: '/api/claude/v1' },
+  );
+
+  // OpenAI Chat Completions 兼容端点。与 `/claude/v1` + `/api/claude/v1` 同构:
+  // `/openai/v1` = 完整 usage,`/api/openai/v1` = 去泄漏镜像(同一 stripPluginUsage
+  // 标记)。deps 复用 claudeRouteDeps(与 Claude 完全同集)。OpenAI SDK 把 base_url
+  // 指到 `.../openai/v1` 即自动补 `/chat/completions`。
+  await app.register(
+    async (instance) => {
+      await registerOpenAiRoutes(instance, claudeRouteDeps);
+    },
+    { prefix: '/openai/v1' },
+  );
+
+  await app.register(
+    async (instance) => {
+      instance.addHook('preHandler', (_request, _reply, done) => {
+        const ctx = getRequestContext();
+        if (ctx) ctx.stripPluginUsage = true;
+        done();
+      });
+      await registerOpenAiRoutes(instance, claudeRouteDeps);
+    },
+    { prefix: '/api/openai/v1' },
   );
 
   await app.register(

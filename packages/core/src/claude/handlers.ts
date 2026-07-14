@@ -18,7 +18,12 @@ import type { HookBus } from '../plugin-host/index.js';
 import { getLogger } from '../shared/logger.js';
 import { getRequestContext } from '../shared/request-context.js';
 import { countAllTokens } from '../token.js';
-import { ConversionError, type ConversionResult, convertRequest } from './converter.js';
+import {
+  ConversionError,
+  type ConversionResult,
+  clientModelHasEncryptedReasoning,
+  convertRequest,
+} from './converter.js';
 import { captureEmptyRequest, type MessageHandlerResult } from './empty-capture.js';
 import { mapConversionError } from './error-mapper.js';
 import { getModelsResponse } from './models-catalog.js';
@@ -165,7 +170,13 @@ export function createPostMessages(deps: PostMessagesDeps) {
       payload.tools,
     );
 
-    const extractThinking = deps.extractThinking && isThinkingEnabled(payload.thinking);
+    // 仅 GPT(加密 reasoning)关掉 legacy `<thinking>` 扫描:其 redacted reasoning 不置
+    // sawReasoningContent → 运行时无法关闭扫描,靠静态判定兜底。Claude 原生 reasoning
+    // (明文)不纳入——靠运行时信号关闭,且需 thinkingEnabled=true 维持 thinking→text 块顺序。
+    const extractThinking =
+      deps.extractThinking &&
+      isThinkingEnabled(payload.thinking) &&
+      !clientModelHasEncryptedReasoning(payload.model);
     const toolNameMap = conversionResult.toolNameMap;
 
     let result: MessageHandlerResult;

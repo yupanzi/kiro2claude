@@ -90,14 +90,23 @@ function parseEvent(frame: Frame): Event {
       };
     }
     case 'ReasoningContent': {
-      // kiro-cli 2.6.0+ 原生 reasoning event。payload schema 实测：
-      //   { "text": "fragment", "signature"?: "<最后一个 chunk 带的 base64 签名>" }
-      // 与 Anthropic Extended Thinking 的 thinking_delta / signature_delta 1:1 对应。
-      const payload = frame.payloadAsJson<{ text?: string; signature?: string }>();
+      // kiro-cli 2.6.0+ 原生 reasoning event。payload schema 实测两种形态：
+      //   - Claude 4.7/4.8: { "text": "fragment", "signature"?: "<base64 签名>" }
+      //     与 Anthropic Extended Thinking 的 thinking_delta / signature_delta 1:1 对应。
+      //   - GPT-5.6: { "redactedContent": "<base64 加密 blob>" }（无 text/signature）——
+      //     隐藏思维链,内容加密不可读。显式建模 redactedContent 而非落进 text ?? ''
+      //     的空串黑洞,让它可观测；下游 stream.ts 的守卫据「无 text 无 signature」丢弃。
+      const payload = frame.payloadAsJson<{
+        text?: string;
+        signature?: string;
+        redactedContent?: string;
+      }>();
       return {
         kind: 'ReasoningContent',
         text: payload.text ?? '',
         signature: typeof payload.signature === 'string' ? payload.signature : undefined,
+        redactedContent:
+          typeof payload.redactedContent === 'string' ? payload.redactedContent : undefined,
       };
     }
     case 'Unknown':
@@ -141,7 +150,13 @@ export type Event =
   | { kind: 'ToolUse'; name: string; toolUseId: string; input: string; isComplete: boolean }
   | ({ kind: 'Metering' } & KiroMeteringData)
   | { kind: 'ContextUsage'; contextUsagePercentage: number }
-  | { kind: 'ReasoningContent'; text: string; signature: string | undefined }
+  | {
+      kind: 'ReasoningContent';
+      text: string;
+      signature: string | undefined;
+      /** GPT-5.6 加密隐藏思维链(base64)；Claude 明文 reasoning 时不带此字段。 */
+      redactedContent?: string;
+    }
   | { kind: 'Unknown'; eventType: string; payload: Buffer }
   | { kind: 'Error'; errorCode: string; errorMessage: string }
   | { kind: 'Exception'; exceptionType: string; message: string };

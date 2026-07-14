@@ -14,7 +14,9 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  clientModelHasEncryptedReasoning,
   convertRequest,
+  getContextWindowSize,
   MODELS_WITH_NATIVE_REASONING,
   mapModel,
   mapThinkingToEffort,
@@ -28,6 +30,7 @@ import { HookBus } from '../../src/plugin-host/index.js';
 import {
   buildAssistantResponseFrame,
   buildReasoningContentFrame,
+  buildRedactedReasoningFrame,
 } from '../helpers/event-stream.js';
 
 // ============================================================================
@@ -125,6 +128,51 @@ describe('parser: reasoningContentEvent', () => {
     expect(ev.kind).toBe('ReasoningContent');
     if (ev.kind === 'ReasoningContent') expect(ev.text).toBe('');
   });
+
+  it('GPT redacted reasoning: 解析出 redactedContent + text 空串', () => {
+    const ev = decodeFrame(buildRedactedReasoningFrame('.KTR~~eyJlbmM='));
+    expect(ev.kind).toBe('ReasoningContent');
+    if (ev.kind !== 'ReasoningContent') throw new Error('unreachable');
+    expect(ev.text).toBe('');
+    expect(ev.signature).toBeUndefined();
+    expect(ev.redactedContent).toBe('.KTR~~eyJlbmM=');
+  });
+});
+
+// ============================================================================
+// stream: GPT redacted reasoning 整块丢弃(不开空 thinking 块)
+// ============================================================================
+
+describe('stream: GPT redacted reasoning', () => {
+  it('redacted-only reasoning 帧不产任何 SSE 事件、不开 thinking 块', () => {
+    const ctx = makeContext(true);
+    const events = ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame()));
+    expect(events).toEqual([]);
+    // 没有 thinking content_block_start
+    expect(blockStarts(events).some((b) => b.type === 'thinking')).toBe(false);
+  });
+
+  it('redacted reasoning 后接正常文本 → 只有 text 块,无 thinking 块', () => {
+    // thinkingEnabled=false 直接走 text_delta,避开 <thinking> 扫描的缓冲(那需
+    // generateFinalEvents 才 flush,与本用例意图无关)。守卫对两种模式都生效。
+    const ctx = makeContext(false);
+    const all: SseEvent[] = [];
+    all.push(...ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame())));
+    all.push(...ctx.processKiroEvent(decodeFrame(buildAssistantResponseFrame('pong'))));
+    expect(textDeltas(all)).toBe('pong');
+    expect(thinkingDeltas(all)).toEqual([]);
+    expect(blockStarts(all).some((b) => b.type === 'thinking')).toBe(false);
+  });
+
+  it('Claude 明文 reasoning 不受守卫影响(回归)', () => {
+    const ctx = makeContext(true);
+    const all: SseEvent[] = [];
+    all.push(...ctx.processKiroEvent(decodeFrame(buildReasoningContentFrame('thinking...'))));
+    all.push(...ctx.processKiroEvent(decodeFrame(buildReasoningContentFrame(' more', 'sig123'))));
+    expect(thinkingDeltas(all).join('')).toContain('thinking...');
+    expect(signatureDeltas(all)).toContain('sig123');
+    expect(blockStarts(all).some((b) => b.type === 'thinking')).toBe(true);
+  });
 });
 
 // ============================================================================
@@ -189,8 +237,44 @@ describe('usesNativeReasoning: 模型能力探测', () => {
 
   it('MODELS_WITH_NATIVE_REASONING 是 exhaustive list', () => {
     expect([...MODELS_WITH_NATIVE_REASONING].sort()).toEqual(
-      ['claude-opus-4.7', 'claude-opus-4.8'].sort(),
+      [
+        'claude-opus-4.7',
+        'claude-opus-4.8',
+        // GPT-5.6 系列同走原生 reasoning.effort（reasoning 内容加密不可 surface）
+        'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+      ].sort(),
     );
+  });
+
+  it('GPT-5.6 走原生 reasoning + 272K context', () => {
+    for (const m of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      expect(usesNativeReasoning(m)).toBe(true);
+      expect(getContextWindowSize(m)).toBe(272_000);
+    }
+  });
+});
+
+describe('clientModelHasEncryptedReasoning: 仅 GPT(加密 reasoning)命中', () => {
+  it('GPT 客户端名(含 Codex 别名 gpt-*-codex)→ true', () => {
+    // handler 侧据此关掉 legacy <thinking> 扫描:GPT redacted reasoning 不置
+    // sawReasoningContent,运行时无法关闭扫描,必须靠静态判定,否则字面 <thinking> 被误剥离。
+    expect(clientModelHasEncryptedReasoning('gpt-5.6-sol')).toBe(true);
+    // Codex 用 gpt-5-codex,mapModel 别名到 gpt-5.6-sol —— 未映射名也须命中
+    expect(clientModelHasEncryptedReasoning('gpt-5-codex')).toBe(true);
+  });
+
+  it('Claude 原生 reasoning(明文,4.7/4.8)→ false —— 绝不能关其扫描/破坏块顺序', () => {
+    // 回归护栏:Claude 原生 reasoning 是明文,靠运行时 sawReasoningContent 关闭扫描,
+    // 且需 thinkingEnabled=true 维持 thinking→text 块顺序(否则 e2e 流式顺序断言失败)。
+    expect(clientModelHasEncryptedReasoning('claude-opus-4.7')).toBe(false);
+    expect(clientModelHasEncryptedReasoning('claude-opus-4.8')).toBe(false);
+  });
+
+  it('非原生 / 未知模型 → false', () => {
+    expect(clientModelHasEncryptedReasoning('claude-opus-4.6')).toBe(false);
+    expect(clientModelHasEncryptedReasoning('totally-unknown-model')).toBe(false);
   });
 });
 

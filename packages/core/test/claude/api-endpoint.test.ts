@@ -1,8 +1,8 @@
 /**
- * `/api/v1` 「去泄漏」镜像端点的集成测试。
+ * `/api/claude/v1` 「去泄漏」镜像端点的集成测试。
  *
  * 忠实镜像 index.ts 的装配（onRequest 建 AsyncLocalStorage 上下文 + `/claude/v1`
- * 与 `/api/v1` 两组独立 scope，后者作用域 preHandler 打 `stripPluginUsage` 标记），
+ * 与 `/api/claude/v1` 两组独立 scope，后者作用域 preHandler 打 `stripPluginUsage` 标记），
  * 用 stub KiroProvider 回一段「带 Metering 帧的非空响应」+ 一个模拟 metering 插件的
  * usage-finish hook（读 `kiro.creditsUsed` → addExtension('kiro_metering')）。
  *
@@ -109,7 +109,7 @@ async function buildApp(): Promise<FastifyInstance> {
       });
       await registerClaudeRoutes(instance, deps);
     },
-    { prefix: '/api/v1' },
+    { prefix: '/api/claude/v1' },
   );
 
   await app.ready();
@@ -142,7 +142,7 @@ function streamUsage(payload: string): Record<string, unknown> {
   return (delta.data as { usage: Record<string, unknown> }).usage;
 }
 
-describe('/api/v1 leak-stripped mirror endpoint', () => {
+describe('/api/claude/v1 leak-stripped mirror endpoint', () => {
   let app: FastifyInstance | undefined;
   afterEach(async () => {
     await app?.close();
@@ -158,7 +158,7 @@ describe('/api/v1 leak-stripped mirror endpoint', () => {
     expect(claudeUsage.kiro_metering).toBeDefined();
     expect(claudeUsage.kiro_metering.usage).toBe(0.005);
 
-    const api = await post(app, '/api/v1/messages', false);
+    const api = await post(app, '/api/claude/v1/messages', false);
     expect(api.statusCode).toBe(200);
     const apiUsage = api.json().usage;
     expect('kiro_metering' in apiUsage).toBe(false);
@@ -175,7 +175,7 @@ describe('/api/v1 leak-stripped mirror endpoint', () => {
     const claudeUsage = streamUsage(claude.payload);
     expect(claudeUsage.kiro_metering).toBeDefined();
 
-    const api = await post(app, '/api/v1/messages', true);
+    const api = await post(app, '/api/claude/v1/messages', true);
     expect(api.statusCode).toBe(200);
     const apiUsage = streamUsage(api.payload);
     expect('kiro_metering' in apiUsage).toBe(false);
