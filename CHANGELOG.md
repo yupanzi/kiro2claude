@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/yupanzi/kiro2claude/compare/v1.0.0...v1.1.0) (2026-07-14)
+
+
+### Features
+
+* 新增 OpenAI 双协议兼容层(Chat Completions + Responses) ([04156df](https://github.com/yupanzi/kiro2claude/commit/04156dfa563453a27fcd5da7fee10879123f6ded))
+
 # 1.0.0 (2026-07-12)
 
 
