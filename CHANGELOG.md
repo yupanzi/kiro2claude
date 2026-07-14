@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/yupanzi/kiro2claude/compare/v1.1.0...v1.2.0) (2026-07-14)
+
+
+### Features
+
+* GPT-5.6 credit 锚定反演 ([7ec15ed](https://github.com/yupanzi/kiro2claude/commit/7ec15ede302b77886dabf17e02bd968e06e12231))
+
 # [1.1.0](https://github.com/yupanzi/kiro2claude/compare/v1.0.0...v1.1.0) (2026-07-14)
 
 
