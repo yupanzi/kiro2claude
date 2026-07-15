@@ -11,7 +11,6 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { type ReducedAttempt, reducedReasoning } from '../claude/non-stream-reduce.js';
-import { mergeUsageExtensions, type PluginUsageExtensions } from '../claude/stream.js';
 import { mapFinishReason } from './response-stream.js';
 import type {
   ChatCompletion,

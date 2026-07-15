@@ -63,7 +63,7 @@ function makeStreamResponse(body: AsyncIterable<Buffer> = emptyStream()): AxiosR
 
 interface StubProviderBehavior {
   callApi?: (body: string) => Promise<AxiosResponse>;
-  callApiStream?: (body: string) => Promise<AxiosResponse>;
+  callApiStream?: (body: string, signal?: AbortSignal) => Promise<AxiosResponse>;
   callMcp?: (body: string) => Promise<AxiosResponse>;
 }
 
@@ -314,6 +314,21 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
     return { bus, state };
   }
 
+  /** A one-shot gate around a stream's tail: `reached` resolves once the first
+   *  frame is consumed; the generator awaits `wait` before yielding the tail,
+   *  letting a test interleave a client disconnect between head and tail. */
+  function makeGate() {
+    let reach!: () => void;
+    let release!: () => void;
+    const reached = new Promise<void>((r) => {
+      reach = r;
+    });
+    const wait = new Promise<void>((r) => {
+      release = r;
+    });
+    return { reach, reached, release, wait };
+  }
+
   const MODEL = 'claude-sonnet-4-5-20250929';
 
   it('client disconnects before metering frame: drains to it, runs hook once with credit, stops writing', async () => {
@@ -357,6 +372,104 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
     expect(state.credits).toBe(0.0048);
     // Nothing is written to the dead socket after disconnect (no final events).
     expect(writes.join('')).not.toContain('event: message_stop');
+  });
+
+  it('aborts the upstream and skips the metering tail on disconnect when abortUpstreamOnDisconnect=true', async () => {
+    // 与上一个 drain 测试对照:开关开启时断连主动 abort 上游。真实 axios 因 signal abort
+    // 销毁 socket → 读流抛错;stub 如实模拟(abort 后抛错而非续吐尾帧)。断言 abort 的
+    // 真实后果:hook 仍恰好一次(用 abort 前的部分数据),但尾帧 metering 未被捕获
+    // (credits=undefined,对照 drain 测试的 0.0048)——#20「省 credit、记账偏低」的证据。
+    const [assistantFrame, meteringFrame] = framesWithMetering({
+      unit: 'credit',
+      unitPlural: 'credits',
+      usage: 0.0048,
+    });
+    const gate = makeGate();
+
+    let capturedSignal: AbortSignal | undefined;
+    const provider = makeStubProvider({
+      callApiStream: async (_body, signal) => {
+        capturedSignal = signal;
+        async function* signalAwareStream(): AsyncIterable<Buffer> {
+          yield assistantFrame;
+          gate.reach();
+          await gate.wait;
+          // abort 已触发 → 模拟 axios 销毁 socket 使读流中断,而非像 drain 那样续吐尾帧。
+          if (signal?.aborted) throw new Error('simulated upstream socket teardown on abort');
+          yield meteringFrame;
+        }
+        return makeStreamResponse(signalAwareStream());
+      },
+    });
+    const { reply, writes, disconnect } = makeReplyStub();
+    const { bus, state } = makeCountingHookBus();
+
+    // 末位参数 abortUpstreamOnDisconnect = true
+    const done = handleStreamRequest(
+      provider,
+      '{}',
+      MODEL,
+      10,
+      false,
+      new Map(),
+      bus,
+      reply,
+      0,
+      undefined,
+      true,
+    );
+
+    await gate.reached;
+    expect(capturedSignal?.aborted).toBe(false); // 断连前 signal 未 abort
+    disconnect(); // client gone + 开关开 → upstreamAbort.abort() 同步触发
+    expect(capturedSignal?.aborted).toBe(true); // ★ 断连触发上游 abort
+    gate.release();
+    await done;
+
+    // hook 恰好一次(abort 前的部分数据),但尾帧 metering 未被捕获(省了 credit),
+    // 且不向已断的 socket 写终结事件。
+    expect(state.runs).toBe(1);
+    expect(state.credits).toBeUndefined();
+    expect(writes.join('')).not.toContain('event: message_stop');
+  });
+
+  it('does NOT abort the upstream signal on disconnect by default (drains the tail for billing)', async () => {
+    // 对照:默认(abortUpstreamOnDisconnect=false)时断连走 drain,signal 不 abort,
+    // 尾帧 metering 仍被捕获(credits=0.0048,对照上面 abort 测试的 undefined)。
+    const [assistantFrame, meteringFrame] = framesWithMetering({
+      unit: 'credit',
+      unitPlural: 'credits',
+      usage: 0.0048,
+    });
+    const gate = makeGate();
+
+    let capturedSignal: AbortSignal | undefined;
+    const provider = makeStubProvider({
+      callApiStream: async (_body, signal) => {
+        capturedSignal = signal;
+        async function* gatedStream(): AsyncIterable<Buffer> {
+          yield assistantFrame;
+          gate.reach();
+          await gate.wait;
+          yield meteringFrame;
+        }
+        return makeStreamResponse(gatedStream());
+      },
+    });
+    const { reply, disconnect } = makeReplyStub();
+    const { bus, state } = makeCountingHookBus();
+
+    const done = handleStreamRequest(provider, '{}', MODEL, 10, false, new Map(), bus, reply); // 默认 false
+
+    await gate.reached;
+    disconnect();
+    expect(capturedSignal?.aborted).toBe(false); // 默认不 abort,走 drain 计费
+    gate.release();
+    await done;
+
+    // drain 捕获了断连后到达的尾帧 metering(与 abort 分支相反)。
+    expect(state.runs).toBe(1);
+    expect(state.credits).toBe(0.0048);
   });
 
   it('regression: connected client still gets message_stop and exactly one hook run', async () => {

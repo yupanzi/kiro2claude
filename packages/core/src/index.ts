@@ -282,6 +282,8 @@ async function main(): Promise<void> {
     extractThinking: config.extractThinking,
     identityOverride: config.identityOverride,
     rejectUnsupportedDocuments: config.rejectUnsupportedDocuments,
+    toolDescriptionMaxLen: config.toolDescriptionMaxLen,
+    abortUpstreamOnDisconnect: config.abortUpstreamOnDisconnect,
     emptyStreamRetries: config.emptyStreamRetries,
     captureEmptyDir: config.captureEmptyDir,
     toolCallTextRescue: config.toolCallTextRescue,

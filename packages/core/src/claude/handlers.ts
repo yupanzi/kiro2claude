@@ -60,6 +60,10 @@ export interface PostMessagesDeps {
   identityOverride: boolean;
   /** 详见 `Config.rejectUnsupportedDocuments`。 */
   rejectUnsupportedDocuments: boolean;
+  /** 详见 `Config.toolDescriptionMaxLen`。tool description 截断上限(code points)。 */
+  toolDescriptionMaxLen: number;
+  /** 详见 `Config.abortUpstreamOnDisconnect`。断连时主动 abort 上游(省 credit)。 */
+  abortUpstreamOnDisconnect: boolean;
   /** 详见 `Config.emptyStreamRetries`。空流有界重试次数。 */
   emptyStreamRetries: number;
   /** 详见 `Config.captureEmptyDir`。诊断用空流抓包目录,留空则不抓。 */
@@ -130,6 +134,7 @@ export function createPostMessages(deps: PostMessagesDeps) {
       conversionResult = convertRequest(payload, {
         identityOverride: deps.identityOverride,
         rejectUnsupportedDocuments: deps.rejectUnsupportedDocuments,
+        toolDescriptionMaxLen: deps.toolDescriptionMaxLen,
         toolTextRegistry: rescueRegistry,
       });
     } catch (e) {
@@ -192,6 +197,7 @@ export function createPostMessages(deps: PostMessagesDeps) {
         reply,
         deps.emptyStreamRetries,
         rescueRegistry,
+        deps.abortUpstreamOnDisconnect,
       );
     } else {
       result = await handleNonStreamRequest(

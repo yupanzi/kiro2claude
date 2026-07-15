@@ -48,6 +48,21 @@ export interface Config {
    */
   rejectUnsupportedDocuments: boolean;
   /**
+   * Tool `description` 的最大长度(code points),超出则截断并 warn。默认 32768(32K)。
+   * **不是**单 description 的 Kiro 上限——单个即便极大上游仍照收;真限制是 context
+   * window(多 tool + history + system 总量撑爆窗口报 400 "Context window is full")。
+   * 32K 覆盖已知最大的合法工具(Workflow)且留有充足余量,兜住畸形超大 description 独吞 context。
+   * 由 `KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN` 配置。
+   */
+  toolDescriptionMaxLen: number;
+  /**
+   * 客户端断连时是否主动 abort 上游请求(而非 drain 到 EOF 如实计费)。默认 false。
+   * 实测 Kiro 对客户端 TCP 断会停止生成计费;网关默认 drain 到 EOF 使断连仍全额
+   * 计费。开启省 credit,代价是拿不到尾帧 Metering、per-request 计费记账偏低。
+   * 由 `KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT` 配置。仅 Claude 端 stream 生效。
+   */
+  abortUpstreamOnDisconnect: boolean;
+  /**
    * 泄漏工具调用文本救援（默认 `true`）。上游偶发把模型的工具调用当**纯文本**
    * 从 assistantResponseEvent 发下来（而非结构化 toolUseEvent），下游看到的
    * 就是一段 `<invoke name="Edit">...` 标记文本，工具调用等于丢失；且泄漏文本

@@ -282,6 +282,13 @@ export interface ConvertRequestOptions {
    */
   rejectUnsupportedDocuments?: boolean;
   /**
+   * Tool `description` 的最大长度(code points),超出则截断并 warn。默认
+   * `DEFAULT_TOOL_DESCRIPTION_MAX_LEN`(32K)。生产路径由 handler 从
+   * `Config.toolDescriptionMaxLen` 传入;为何是 32K(context-window 而非单 description
+   * 上限)见该常量头注释与 `Config.toolDescriptionMaxLen`。
+   */
+  toolDescriptionMaxLen?: number;
+  /**
    * 泄漏工具调用文本的注册表（本次请求注册的工具 → 参数类型）。**存在即启用**
    * 请求侧历史去污染：assistant 历史文本里泄漏的工具调用标记块（见
    * tool-call-text.ts 文件头）在上送前被剥掉——阻断「模型模仿历史里的坏格式
@@ -417,7 +424,24 @@ function isToolSearchTool(tool: Tool): boolean {
   return tool.type !== undefined && TOOL_SEARCH_TOOL_TYPES.has(tool.type);
 }
 
-function convertTools(tools: Tool[] | undefined, toolNameMap: Map<string, string>): KiroTool[] {
+/**
+ * Default cap for tool `description` length (code points) = 32K (32768). NOT a
+ * per-description Kiro limit — a SINGLE tool description can be arbitrarily large
+ * (far beyond anything a real tool needs) and upstream still accepts it (200 OK);
+ * the real constraint is the shared CONTEXT WINDOW: many tools + long history +
+ * system together overflowing that window return HTTP 400 "Context window is full"
+ * (reproducible once enough oversized tools are stacked together). 32K comfortably
+ * covers the largest known legitimate tool (Workflow) with headroom to spare while
+ * stopping one pathological description from eating the window. Override via
+ * KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN.
+ */
+const DEFAULT_TOOL_DESCRIPTION_MAX_LEN = 32_768;
+
+function convertTools(
+  tools: Tool[] | undefined,
+  toolNameMap: Map<string, string>,
+  maxDescriptionLen: number,
+): KiroTool[] {
   if (!tools) return [];
 
   const result: KiroTool[] = [];
@@ -433,23 +457,22 @@ function convertTools(tools: Tool[] | undefined, toolNameMap: Map<string, string
 
     let description = t.description ?? '';
 
-    // Limit description to 10000 characters (safe UTF-8 truncation) — defensive
-    // guard against an upstream length cap on toolSpecification.description
-    // (presumed 400 ValidationException; the 10000 is a conservative margin, not a
-    // traced upstream value). UTF-16 .length is always >= the code-point count, so
-    // the cheap check skips the common case without materializing a code-point
-    // array for every tool on every request. Warn so the truncation is observable
-    // rather than silent (the tail is dropped irreversibly).
-    if (description.length > 10000) {
+    // Cap tool description length so one pathological description can't eat the
+    // shared context window (why 32K, and why this is NOT a per-description Kiro
+    // limit: see the DEFAULT_TOOL_DESCRIPTION_MAX_LEN header).
+    // UTF-16 .length is always >= the code-point count, so the cheap check skips
+    // the common case without materializing a code-point array for every tool.
+    // Warn so the truncation stays observable rather than silent.
+    if (description.length > maxDescriptionLen) {
       const chars = [...description];
-      if (chars.length > 10000) {
+      if (chars.length > maxDescriptionLen) {
         getLogger().warn({
-          msg: 'tool description truncated to upstream cap',
+          msg: 'tool description truncated to configured cap',
           tool_name: t.name,
           original_len: chars.length,
-          cap: 10000,
+          cap: maxDescriptionLen,
         });
-        description = chars.slice(0, 10000).join('');
+        description = chars.slice(0, maxDescriptionLen).join('');
       }
     }
 
@@ -1315,6 +1338,16 @@ export function convertRequest(
 ): ConversionResult {
   const identityOverride = options.identityOverride ?? true;
   const rejectUnsupportedDocuments = options.rejectUnsupportedDocuments ?? false;
+  // `??` only substitutes on nullish, so an explicit 0 / negative / non-integer
+  // from a direct library caller (the env path is schema-guarded to 1..1_000_000)
+  // would reach convertTools and corrupt every description (0 → all truncated to
+  // '', -n → last n code points dropped). Fall back to the default for any value
+  // that isn't a positive integer.
+  const rawMaxLen = options.toolDescriptionMaxLen;
+  const toolDescriptionMaxLen =
+    rawMaxLen !== undefined && Number.isInteger(rawMaxLen) && rawMaxLen > 0
+      ? rawMaxLen
+      : DEFAULT_TOOL_DESCRIPTION_MAX_LEN;
 
   // 1. Map model
   const modelId = mapModel(req.model);
@@ -1391,7 +1424,7 @@ export function convertRequest(
 
   // 6. Convert tool definitions
   const toolNameMap = new Map<string, string>();
-  const tools = convertTools(req.tools, toolNameMap);
+  const tools = convertTools(req.tools, toolNameMap, toolDescriptionMaxLen);
 
   // 7. Build history (need to build first to collect history tool names)
   const history = buildHistory(

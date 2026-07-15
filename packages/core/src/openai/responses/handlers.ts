@@ -66,6 +66,7 @@ export function createPostResponses(deps: PostMessagesDeps) {
       conversionResult = convertRequest(payload, {
         identityOverride: deps.identityOverride,
         rejectUnsupportedDocuments: deps.rejectUnsupportedDocuments,
+        toolDescriptionMaxLen: deps.toolDescriptionMaxLen,
         toolTextRegistry: rescueRegistry,
       });
     } catch (e) {

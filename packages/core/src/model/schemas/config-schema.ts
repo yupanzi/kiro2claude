@@ -198,6 +198,21 @@ export const envSchema = z.object({
   KIRO2CLAUDE_EXTRACT_THINKING: boolField(true),
   KIRO2CLAUDE_IDENTITY_OVERRIDE: boolField(true),
   KIRO2CLAUDE_REJECT_UNSUPPORTED_DOCUMENTS: boolField(true),
+  // Tool `description` 最大长度(code points),超出则截断并 warn。**不是**单
+  // description 的 Kiro 上限——单个 description 即便极大上游仍照收(200 OK);真限制
+  // 是 context window(多 tool + history + system 总量撑爆窗口 → 400 "Context
+  // window is full")。默认 32768(32K):覆盖已知最大的合法工具(Workflow)且留有充足
+  // 余量,兜住畸形超大 description 独吞 context。设更小更省 token,设更大放宽。
+  KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN: intField('KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN', 32_768, {
+    min: 1,
+    max: 1_000_000,
+  }),
+  // 客户端断连时是否主动 abort 上游请求(而非 drain 到 EOF 如实计费)。默认 false。
+  // 实测:Kiro 对客户端 TCP 断会停止生成计费,但网关默认 drain 到 EOF、维持上游
+  // 连接,导致断连仍全额计费(断连常发生在生成中途,drain 会把断连点之后未生成的
+  // 部分也一并计上)。开启后断连即 abort 上游 socket,省下断连点之后的 credit;
+  // 代价:拿不到尾帧 Metering,per-request 计费记账会偏低。高危,默认关。
+  KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT: boolField(false),
   // 泄漏工具调用文本救援:上游偶发把模型的工具调用当纯文本发下来。开启后
   // 响应侧把泄漏块解析回真 tool_use、请求侧剥掉历史里的泄漏块(去污染)。
   // 详见 Config.toolCallTextRescue 与 claude/tool-call-text.ts。
@@ -244,6 +259,8 @@ export function envToConfig(env: ParsedEnv): Config {
     extractThinking: env.KIRO2CLAUDE_EXTRACT_THINKING,
     identityOverride: env.KIRO2CLAUDE_IDENTITY_OVERRIDE,
     rejectUnsupportedDocuments: env.KIRO2CLAUDE_REJECT_UNSUPPORTED_DOCUMENTS,
+    toolDescriptionMaxLen: env.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN,
+    abortUpstreamOnDisconnect: env.KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT,
     toolCallTextRescue: env.KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE,
     autoCaptureProfile: env.KIRO2CLAUDE_AUTO_CAPTURE_PROFILE,
     kiroCliBin: env.KIRO2CLAUDE_CLI_BIN,

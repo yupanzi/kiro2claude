@@ -105,9 +105,13 @@ export class KiroProvider {
     return this.executor.execute(this.buildMainApiRequest(requestBody, false));
   }
 
-  /** 发送流式 API 请求（响应体是 AsyncIterable<Buffer>）。 */
-  async callApiStream(requestBody: string): Promise<AxiosResponse> {
-    return this.executor.execute(this.buildMainApiRequest(requestBody, true));
+  /**
+   * 发送流式 API 请求（响应体是 AsyncIterable<Buffer>）。`signal` 用于客户端断连时
+   * 主动取消 in-flight 请求，让 Kiro 停止生成、停止计费（见
+   * `Config.abortUpstreamOnDisconnect`）。默认 undefined = 不可取消（现有行为）。
+   */
+  async callApiStream(requestBody: string, signal?: AbortSignal): Promise<AxiosResponse> {
+    return this.executor.execute(this.buildMainApiRequest(requestBody, true, signal));
   }
 
   /** 发送 MCP API 请求（WebSearch 等工具走这条路径）。 */
@@ -120,7 +124,11 @@ export class KiroProvider {
   // ========================================================================
 
   /** 主 API（generateAssistantResponse）的 RetryableRequest */
-  private buildMainApiRequest(requestBody: string, isStream: boolean): RetryableRequest {
+  private buildMainApiRequest(
+    requestBody: string,
+    isStream: boolean,
+    signal?: AbortSignal,
+  ): RetryableRequest {
     return {
       label: isStream ? 'Stream' : 'Non-stream',
       body: requestBody,
@@ -131,6 +139,10 @@ export class KiroProvider {
         KiroProvider.injectProfileArn(body, credentials.profileArn),
       axiosConfig: {
         responseType: isStream ? 'stream' : 'arraybuffer',
+        // 客户端断连时主动取消 in-flight 请求（经 retry-executor 的 `...axiosConfig`
+        // 透传给 `client.post`）。`undefined` 被 axios 视为「无 signal」= 不可取消（现有
+        // 行为），故直接透传无需条件包裹。省 credit，见 Config.abortUpstreamOnDisconnect。
+        signal,
       },
       readErrorBody: isStream ? drainStreamBody : drainBufferBody,
     };

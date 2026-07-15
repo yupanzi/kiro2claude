@@ -127,6 +127,7 @@ export async function handleStreamRequest(
   reply: FastifyReply,
   emptyStreamRetries = 0,
   rescueRegistry?: ToolTextRegistry,
+  abortUpstreamOnDisconnect = false,
 ): Promise<MessageHandlerResult> {
   const log = getLogger();
   const apiStart = Date.now();
@@ -137,6 +138,10 @@ export async function handleStreamRequest(
   // 'close' fires when the underlying TCP socket is torn down (Ctrl-C on the
   // client, proxy timeout, etc).
   const aborted = { value: false };
+  // 客户端断连时,若 abortUpstreamOnDisconnect 开启,用它主动取消 in-flight 的上游
+  // axios 请求(经 provider.callApiStream 的 signal 透传),让 Kiro 停止生成、停止
+  // 计费。默认 false 时不触发,保持现有 drain-to-EOF 如实计费行为。
+  const upstreamAbort = new AbortController();
   let pingInterval: ReturnType<typeof setInterval> | undefined;
   let commitTimer: ReturnType<typeof setTimeout> | undefined;
   let drainGraceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -172,9 +177,16 @@ export async function handleStreamRequest(
     aborted.value = true;
     if (pingInterval) clearInterval(pingInterval);
     if (commitTimer) clearTimeout(commitTimer);
-    // Client gone: bound the remaining upstream drain instead of holding the
-    // socket open until the 720s axios timeout.
-    armDrainGrace();
+    if (abortUpstreamOnDisconnect) {
+      // 主动取消上游:客户端已走,立即 abort in-flight 请求让 Kiro 停止生成、停止
+      // 计费(实测断连即止,省下断连点之后的 credit)。代价:拿不到尾帧 Metering,
+      // per-request 计费记账偏低。见 Config.abortUpstreamOnDisconnect。
+      upstreamAbort.abort();
+    } else {
+      // 默认:bound the remaining upstream drain instead of holding the socket
+      // open until the 720s axios timeout —— drain 到 EOF 拿 Metering 如实计费。
+      armDrainGrace();
+    }
   });
 
   // SSE headers (inject x-request-id for streaming responses). Computed once.
@@ -260,8 +272,14 @@ export async function handleStreamRequest(
 
     let response: AxiosResponse;
     try {
-      response = await provider.callApiStream(requestBody);
+      response = await provider.callApiStream(requestBody, upstreamAbort.signal);
     } catch (e) {
+      if (aborted.value && abortUpstreamOnDisconnect) {
+        // 主动 abort 上游导致的取消:客户端已断开,这是预期内的取消而非 upstream
+        // failure。不写已断的 reply、不当错误上报。见 Config.abortUpstreamOnDisconnect。
+        log.info({ msg: 'upstream stream call aborted on client disconnect', attempt });
+        return { emptyResponse: false, emptyAttempts };
+      }
       // A THROW is a real upstream failure (4xx/5xx/network) classified by
       // retry-executor — forward it verbatim per the zero-retry-forwarding
       // contract (honours Retry-After, doesn't burn credit on non-recoverable
@@ -367,7 +385,12 @@ export async function handleStreamRequest(
         }
       }
     } catch (e) {
-      log.error({ msg: 'error reading response stream', error: String(e) });
+      if (aborted.value && abortUpstreamOnDisconnect) {
+        // 主动 abort 上游:客户端已走,读流被取消是预期内的,不是错误(省了 credit)。
+        log.info({ msg: 'upstream stream aborted on client disconnect (credit saved)' });
+      } else {
+        log.error({ msg: 'error reading response stream', error: String(e) });
+      }
     } finally {
       draining = false;
     }
@@ -433,6 +456,11 @@ export async function handleStreamRequest(
     kiro_metering: ctx.kiroMeteringRaw,
     committed,
     aborted: aborted.value,
+    // 断连成本观测:客户端已断开(aborted)但网关仍 drain 到上游 EOF、拿到了计费
+    // (output_tokens>0)。实测(kiro-cli, 2026-07)Kiro 对客户端 TCP 断开会停止生成
+    // 计费,但网关当前 drain 维持了上游连接,使这部分仍被全额计费——此字段量化
+    // 「断连后仍付费」的成本,便于 grep 统计。开启 abortUpstreamOnDisconnect 可消除。
+    drained_after_disconnect: aborted.value && !abortUpstreamOnDisconnect && ctx.outputTokens > 0,
     empty_attempts: emptyAttempts,
     // 空流诊断:事件计数区分「纯零帧」与「宣告了 tool_use 却没吐完整帧的截断流」;
     // 工具名把这类截断空流的范围缩小到具体调用点(完整的空参数 tool_use 已不再落空)。

@@ -181,6 +181,57 @@ describe('convertRequest - kiro-cli body shape', () => {
   });
 });
 
+describe('convertRequest - tool description cap', () => {
+  const descOf = (result: ReturnType<typeof convertRequest>): string =>
+    result.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0]
+      .toolSpecification.description;
+
+  const reqWithDesc = (description: string): MessagesRequest =>
+    baseRequest({
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [
+        {
+          name: 'big',
+          description,
+          input_schema: { type: 'object', properties: {} },
+        } as ClaudeTool,
+      ],
+    });
+
+  it('does not truncate a description within the default 32768 cap', () => {
+    // 20000 > 旧的 10000 硬上限,但小于新默认 32768(32K) —— Workflow(18780)这类合法
+    // 大工具描述不再被截。实测 Kiro 接受 >=1,000,000 字符,10000 曾是过度保守。
+    const tools = descOf(convertRequest(reqWithDesc('x'.repeat(20000))));
+    expect(tools.length).toBe(20000);
+  });
+
+  it('truncates to the configured toolDescriptionMaxLen when exceeded', () => {
+    const tools = descOf(
+      convertRequest(reqWithDesc('x'.repeat(20000)), { toolDescriptionMaxLen: 5000 }),
+    );
+    expect(tools.length).toBe(5000);
+  });
+
+  it('truncates by code points, not UTF-16 units (multi-byte safe)', () => {
+    // 每个 emoji 占 2 个 UTF-16 code unit 但算 1 个 code point;cap=10 应保留 10 个 emoji。
+    const truncated = descOf(
+      convertRequest(reqWithDesc('😀'.repeat(50)), { toolDescriptionMaxLen: 10 }),
+    );
+    expect([...truncated].length).toBe(10);
+  });
+
+  it('falls back to the default cap when maxLen is not a positive integer (0/negative)', () => {
+    // 直接库调用可绕过 env schema(min:1)。guard 必须回退默认,绝不把 0 当上限截空、
+    // 也不把负数交给 slice(0, -n) 丢尾字符。20000 < 默认 32768 → 应完全不截。
+    for (const bad of [0, -5, 3.5, Number.NaN]) {
+      const desc = descOf(
+        convertRequest(reqWithDesc('x'.repeat(20000)), { toolDescriptionMaxLen: bad }),
+      );
+      expect(desc.length).toBe(20000);
+    }
+  });
+});
+
 describe('convertRequest - tool name mapping', () => {
   it('test_tool_name_mapping_in_convert_request', () => {
     const longToolName = 'mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63';

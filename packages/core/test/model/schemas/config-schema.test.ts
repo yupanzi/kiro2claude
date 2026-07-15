@@ -93,6 +93,68 @@ describe('envSchema - KIRO2CLAUDE_EMPTY_STREAM_RETRIES', () => {
   });
 });
 
+describe('envSchema - KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN', () => {
+  it('defaults to 32768 (32K) and maps to config.toolDescriptionMaxLen', () => {
+    const result = envSchema.safeParse(MINIMAL_ENV);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN).toBe(32_768);
+      expect(envToConfig(result.data).toolDescriptionMaxLen).toBe(32_768);
+    }
+  });
+
+  it('accepts the lower bound 1', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN: '1',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN).toBe(1);
+  });
+
+  it('accepts the upper bound 1000000', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN: '1000000',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN).toBe(1_000_000);
+  });
+
+  it('rejects out-of-range values (0)', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN: '0',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(formatEnvError(result.error)).toMatch(
+        /KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN out of range/,
+      );
+    }
+  });
+});
+
+describe('envSchema - KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT', () => {
+  it('defaults to false and maps to config.abortUpstreamOnDisconnect', () => {
+    const result = envSchema.safeParse(MINIMAL_ENV);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT).toBe(false);
+      expect(envToConfig(result.data).abortUpstreamOnDisconnect).toBe(false);
+    }
+  });
+
+  it('accepts true', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT: 'true',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT).toBe(true);
+  });
+});
+
 describe('envSchema - KIRO2CLAUDE_CAPTURE_EMPTY_DIR', () => {
   it('defaults to undefined (capture off)', () => {
     const result = envSchema.safeParse(MINIMAL_ENV);
