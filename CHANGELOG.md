@@ -1,3 +1,11 @@
+# [1.3.0](https://github.com/yupanzi/kiro2claude/compare/v1.2.0...v1.3.0) (2026-07-15)
+
+
+### Features
+
+* OpenAI 协议回包注入 plugin usage 扩展 ([7e3021f](https://github.com/yupanzi/kiro2claude/commit/7e3021f7122cf488b6ce658c949faca5e0c6c8e4))
+* 工具描述长度上限与断连主动 abort 上游 ([09bfacb](https://github.com/yupanzi/kiro2claude/commit/09bfacb5cecb6b8141988290d6cf8fc6d0ec857c))
+
 # [1.2.0](https://github.com/yupanzi/kiro2claude/compare/v1.1.0...v1.2.0) (2026-07-14)
 
 

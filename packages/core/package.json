@@ -1,6 +1,6 @@
 {
   "name": "@kiro2claude/core",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "kiro2claude gateway core — wraps the Kiro upstream as a Claude API-compatible proxy. Plugin host (HookBus + capability registry) for first-party and third-party extensions.",
   "type": "module",
