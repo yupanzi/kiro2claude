@@ -16,6 +16,8 @@ import {
 } from '../claude/non-stream-reduce.js';
 import {
   buildKiroUsageFinishEvent,
+  type PluginUsageExtensions,
+  resolvePluginUsageExtensions,
   selectEmptyUpstreamMessage,
   upstreamErrorWire,
 } from '../claude/stream.js';
@@ -53,6 +55,7 @@ export async function runOpenAiNonStream(
     reduced: ReducedAttempt,
     promptTokens: number,
     completionTokens: number,
+    extensions: PluginUsageExtensions | undefined,
   ) => unknown,
 ): Promise<MessageHandlerResult> {
   const log = getLogger();
@@ -147,7 +150,12 @@ export async function runOpenAiNonStream(
     });
     await hookBus.runUsageFinish(hookEvent);
 
-    const body = buildResponse(reduced, finalInputTokens, outputTokens);
+    const body = buildResponse(
+      reduced,
+      finalInputTokens,
+      outputTokens,
+      resolvePluginUsageExtensions(hookEvent),
+    );
 
     log.info({
       msg: 'openai non-stream completed',

@@ -30,6 +30,24 @@ describe('buildOpenAiUsage', () => {
       total_tokens: 13,
     });
   });
+
+  it('extensions 内嵌进 usage,标准三字段不变', () => {
+    const ext = new Map<string, unknown>([['kiro_metering', { unit: 'credit', usage: 5 }]]);
+    expect(buildOpenAiUsage(10, 3, ext)).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 3,
+      total_tokens: 13,
+      kiro_metering: { unit: 'credit', usage: 5 },
+    });
+  });
+
+  it('extensions=undefined → 只标准三字段(镜像端点剥离态)', () => {
+    expect(buildOpenAiUsage(10, 3, undefined)).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 3,
+      total_tokens: 13,
+    });
+  });
 });
 
 describe('buildChatCompletion', () => {
@@ -99,5 +117,26 @@ describe('buildChatCompletion', () => {
       completionTokens: 1,
     });
     expect(c.choices[0].finish_reason).toBe('length');
+  });
+
+  it('extensions → usage.kiro_* 内嵌;prompt_tokens 保持原始值(守 #16,不套 override)', () => {
+    const ext = new Map<string, unknown>([
+      ['kiro_metering', { unit: 'credit', usage: 5 }],
+      ['kiro_derived', { totalCostUsd: 0.2 }],
+    ]);
+    const c = buildChatCompletion({
+      reduced: reduced({ textContent: 'pong' }),
+      model: 'gpt-5.6-sol',
+      promptTokens: 100,
+      completionTokens: 10,
+      extensions: ext,
+    });
+    expect(c.usage).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 10,
+      total_tokens: 110,
+      kiro_metering: { unit: 'credit', usage: 5 },
+      kiro_derived: { totalCostUsd: 0.2 },
+    });
   });
 });

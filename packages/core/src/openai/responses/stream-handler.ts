@@ -8,6 +8,7 @@
 
 import type { FastifyReply } from 'fastify';
 import type { MessageHandlerResult } from '../../claude/empty-capture.js';
+import { resolvePluginUsageExtensions } from '../../claude/stream.js';
 import type { ToolTextRegistry } from '../../claude/tool-call-text.js';
 import type { KiroProvider } from '../../kiro/provider.js';
 import type { HookBus } from '../../plugin-host/index.js';
@@ -31,7 +32,11 @@ export async function handleResponsesStreamRequest(
     makeEncoder: (m) => new ResponsesEventEncoder(m),
     finalTerminal: (encoder, ctx) =>
       encoder.finalize(
-        buildResponsesUsage(ctx.contextInputTokens ?? ctx.inputTokens, ctx.outputTokens),
+        buildResponsesUsage(
+          ctx.contextInputTokens ?? ctx.inputTokens,
+          ctx.outputTokens,
+          resolvePluginUsageExtensions(ctx.usageFinishEvent),
+        ),
       ),
     inbandError: (encoder, message, type) => [encoder.errorLine(message, type)],
   };

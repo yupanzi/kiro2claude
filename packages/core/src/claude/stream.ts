@@ -49,6 +49,42 @@ export interface ClaudeUsagePayload {
 }
 
 /**
+ * 解析本次请求应上 wire 的 plugin usage 扩展（`addExtension` 注入的命名空间字段，
+ * 如 `kiro_metering` / `kiro_derived`）。
+ *
+ * 「去泄漏」镜像端点（`/api/claude/v1`、`/api/openai/v1`）的请求级标记
+ * `stripPluginUsage`（经 AsyncLocalStorage 传入）置位时返回 `undefined`——只留标准
+ * 字段、剥掉泄漏后端身份的 `kiro_*` 键。plugin 的 usage-finish hook 仍照常运行
+ * （累计计数器照进），只是扩展输出不落到 `/api` 的 wire 上。默认（无标记）= 完整扩展。
+ *
+ * **单一真相源**：Claude（`buildClaudeUsagePayload`）与 OpenAI 两协议共用此函数，
+ * strip 语义不再各写一份。注意此处只解析 `addExtension` 扩展；`overrideStandardField`
+ * 的标准字段覆写不经此路（OpenAI 侧刻意不套用 override，守踩坑 #16）。
+ */
+/** plugin 注入的命名空间 usage 扩展（`addExtension` 通道）——`resolvePluginUsageExtensions` 的产物类型。 */
+export type PluginUsageExtensions = ReadonlyMap<string, unknown>;
+
+export function resolvePluginUsageExtensions(
+  hookEvent: UsageFinishEventImpl | undefined,
+): PluginUsageExtensions | undefined {
+  if (!hookEvent || getRequestContext()?.stripPluginUsage) return undefined;
+  return hookEvent.getExtensions();
+}
+
+/**
+ * 把 plugin 扩展命名空间字段并入 usage 对象。Claude（`buildClaudeUsagePayload`）与
+ * OpenAI 两协议的 usage builder 共用此单一实现，杜绝「spread extensions onto usage」
+ * 逻辑三份漂移。`undefined`（镜像端点剥离态）= 空操作。
+ */
+export function mergeUsageExtensions(
+  target: Record<string, unknown>,
+  extensions: PluginUsageExtensions | undefined,
+): void {
+  if (!extensions) return;
+  for (const [namespace, value] of extensions) target[namespace] = value;
+}
+
+/**
  * Build the wire payload. Core writes the standard Anthropic fields based on
  * the metering raw data (if any) and the host's own counts, then merges
  * plugin-injected extensions and standard-field overrides on top.
@@ -68,17 +104,9 @@ export function buildClaudeUsagePayload(args: {
     cache_read_input_tokens: overrides.get('cache_read_input_tokens') ?? 0,
   };
 
-  // 「去泄漏」镜像端点 `/api/claude/v1` 的请求级标记（经 AsyncLocalStorage 传入，无需给
-  // build 链路加参数）：跳过 plugin 注入的扩展命名空间（`kiro_metering` 等），只留
-  // 标准 Anthropic 字段。metering 的 usage-finish hook 仍照常运行（累计计数器照进），
-  // 只是其扩展输出不落到 `/api` 的 wire 上。标准字段 override 保留——它们改的是标准
-  // 字段值、不新增泄漏后端身份的 `kiro_*` 键。默认（无标记）= 完整 wire，`/claude/v1`
-  // 行为不变。
-  if (!getRequestContext()?.stripPluginUsage) {
-    for (const [namespace, value] of hookEvent.getExtensions()) {
-      payload[namespace] = value;
-    }
-  }
+  // 标准字段 override 保留——改的是标准字段值、不新增泄漏后端身份的 `kiro_*` 键。
+  // 扩展合并 + stripPluginUsage 剥离裁决见 resolvePluginUsageExtensions / mergeUsageExtensions。
+  mergeUsageExtensions(payload, resolvePluginUsageExtensions(hookEvent));
 
   return payload;
 }
@@ -568,6 +596,13 @@ export class StreamContext {
   /** Plugin hook bus — invoked on finalization to let plugins shape wire usage. */
   readonly hookBus: HookBus;
   /**
+   * 最后一次 usage-finish hook 事件（`generateFinalEvents` 内构造并 run 后存下）。
+   * 供 OpenAI 流式 `finalTerminal` 经 `resolvePluginUsageExtensions` 取 plugin 扩展——
+   * 因为 hookEvent 在 `generateFinalEvents` 内部创建，transport 外部拿不到。Claude 侧
+   * 不读它（直接用 `generateFinalEvents` 内的局部 hookEvent）。
+   */
+  usageFinishEvent: UsageFinishEventImpl | undefined;
+  /**
    * 泄漏工具调用文本救援（tool-call-text.ts）。上游偶发把模型的工具调用当
    * 纯文本从 assistantResponseEvent 发下来；检测器把文本通道里格式完整的
    * 泄漏块就地解析回真正的 tool_use block。undefined = 关闭（纯透传）。
@@ -625,6 +660,7 @@ export class StreamContext {
     this.kiroMeteringRaw = undefined;
     this.pendingUpstreamError = undefined;
     this.hookBus = hookBus;
+    this.usageFinishEvent = undefined;
     this.toolCallDetector = rescueRegistry ? new ToolCallTextDetector(rescueRegistry) : undefined;
   }
 
@@ -1287,6 +1323,8 @@ export class StreamContext {
       logger: getLogger(),
     });
     await this.hookBus.runUsageFinish(hookEvent);
+    // 存下供 OpenAI 流式 finalTerminal 取 plugin 扩展（见字段注释）。Claude 侧不读。
+    this.usageFinishEvent = hookEvent;
 
     events.push(
       ...(emitMessageTerminal

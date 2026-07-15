@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { ReducedAttempt } from '../../../src/claude/non-stream-reduce.js';
-import { buildResponsesObject } from '../../../src/openai/responses/response-nonstream.js';
+import {
+  buildResponsesObject,
+  buildResponsesUsage,
+} from '../../../src/openai/responses/response-nonstream.js';
 
 function reduced(overrides: Partial<ReducedAttempt> = {}): ReducedAttempt {
   return {
@@ -123,5 +126,43 @@ describe('buildResponsesObject', () => {
       createdAt: 1,
     });
     expect(r.output.map((o) => o.type)).toEqual(['message']);
+  });
+
+  it('extensions → usage.kiro_* 内嵌;input_tokens 保持原始值(守 #16,不套 override)', () => {
+    const ext = new Map<string, unknown>([['kiro_derived', { totalCostUsd: 0.3 }]]);
+    const r = buildResponsesObject({
+      reduced: reduced({ textContent: 'pong' }),
+      model: 'gpt-5.6-sol',
+      inputTokens: 50,
+      outputTokens: 2,
+      createdAt: 1,
+      extensions: ext,
+    });
+    expect(r.usage).toEqual({
+      input_tokens: 50,
+      output_tokens: 2,
+      total_tokens: 52,
+      kiro_derived: { totalCostUsd: 0.3 },
+    });
+  });
+});
+
+describe('buildResponsesUsage', () => {
+  it('extensions 内嵌,标准三字段不变', () => {
+    const ext = new Map<string, unknown>([['kiro_metering', { unit: 'credit', usage: 7 }]]);
+    expect(buildResponsesUsage(20, 4, ext)).toEqual({
+      input_tokens: 20,
+      output_tokens: 4,
+      total_tokens: 24,
+      kiro_metering: { unit: 'credit', usage: 7 },
+    });
+  });
+
+  it('extensions=undefined → 只标准三字段(镜像端点剥离态)', () => {
+    expect(buildResponsesUsage(20, 4, undefined)).toEqual({
+      input_tokens: 20,
+      output_tokens: 4,
+      total_tokens: 24,
+    });
   });
 });

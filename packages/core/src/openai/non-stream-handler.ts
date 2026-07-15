@@ -36,7 +36,7 @@ export async function handleOpenAiNonStreamRequest(
     reply,
     emptyStreamRetries,
     rescueRegistry,
-    (reduced, promptTokens, completionTokens) =>
-      buildChatCompletion({ reduced, model, promptTokens, completionTokens }),
+    (reduced, promptTokens, completionTokens, extensions) =>
+      buildChatCompletion({ reduced, model, promptTokens, completionTokens, extensions }),
   );
 }

@@ -76,6 +76,10 @@ export interface OpenAiUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // plugin 注入的命名空间扩展字段（`kiro_metering` / `kiro_derived`）。标准三字段
+  // 恒为 number（显式声明优先）；索引签名只为 `addExtension` 的扩展开门。core 从不
+  // 按名引用这些键。OpenAI 客户端忽略 usage 内未知字段，安全。
+  [key: string]: unknown;
 }
 
 // ============================================================================

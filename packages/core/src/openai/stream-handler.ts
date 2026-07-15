@@ -7,6 +7,7 @@
 
 import type { FastifyReply } from 'fastify';
 import type { MessageHandlerResult } from '../claude/empty-capture.js';
+import { resolvePluginUsageExtensions } from '../claude/stream.js';
 import type { ToolTextRegistry } from '../claude/tool-call-text.js';
 import type { KiroProvider } from '../kiro/provider.js';
 import type { HookBus } from '../plugin-host/index.js';
@@ -35,7 +36,11 @@ export async function handleOpenAiStreamRequest(
       if (includeUsage) {
         out.push(
           encoder.usageChunkLine(
-            buildOpenAiUsage(ctx.contextInputTokens ?? ctx.inputTokens, ctx.outputTokens),
+            buildOpenAiUsage(
+              ctx.contextInputTokens ?? ctx.inputTokens,
+              ctx.outputTokens,
+              resolvePluginUsageExtensions(ctx.usageFinishEvent),
+            ),
           ),
         );
       }

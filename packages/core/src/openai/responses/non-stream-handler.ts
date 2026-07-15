@@ -36,13 +36,14 @@ export async function handleResponsesNonStreamRequest(
     reply,
     emptyStreamRetries,
     rescueRegistry,
-    (reduced, inputTok, outputTok) =>
+    (reduced, inputTok, outputTok, extensions) =>
       buildResponsesObject({
         reduced,
         model,
         inputTokens: inputTok,
         outputTokens: outputTok,
         createdAt,
+        extensions,
       }),
   );
 }

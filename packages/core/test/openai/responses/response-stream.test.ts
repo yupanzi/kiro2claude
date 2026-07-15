@@ -75,6 +75,24 @@ describe('ResponsesEventEncoder: 文本流', () => {
     const seqs = parse(all).map((e) => e.sequence_number as number);
     for (let i = 1; i < seqs.length; i++) expect(seqs[i]).toBeGreaterThan(seqs[i - 1]);
   });
+
+  it('finalize:response.completed 的 usage 携带 plugin 扩展字段', () => {
+    const enc = new ResponsesEventEncoder('m');
+    const all = [
+      ...enc.push(START),
+      ...enc.push(textDelta(0, 'x')),
+      ...enc.finalize({
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        kiro_metering: { unit: 'credit', usage: 5 },
+      }),
+    ];
+    const completed = parse(all).find((e) => e.type === 'response.completed')?.response as {
+      usage: Record<string, unknown>;
+    };
+    expect(completed.usage).toMatchObject({ kiro_metering: { unit: 'credit', usage: 5 } });
+  });
 });
 
 describe('ResponsesEventEncoder: 工具调用', () => {

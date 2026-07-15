@@ -178,6 +178,19 @@ describe('OpenAiChunkEncoder', () => {
     expect(enc.doneLine()).toBe('data: [DONE]\n\n');
   });
 
+  it('usageChunkLine 携带 plugin 扩展字段(索引签名 + 序列化通路)', () => {
+    const enc = new OpenAiChunkEncoder('m');
+    const u = parse(
+      enc.usageChunkLine({
+        prompt_tokens: 10,
+        completion_tokens: 3,
+        total_tokens: 13,
+        kiro_metering: { unit: 'credit', usage: 5 },
+      }),
+    );
+    expect(u.usage).toMatchObject({ kiro_metering: { unit: 'credit', usage: 5 } });
+  });
+
   it('整流 id 稳定', () => {
     const enc = new OpenAiChunkEncoder('m');
     const id1 = parse(enc.push(ev('message_start', {}))[0]).id;

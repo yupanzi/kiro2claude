@@ -84,6 +84,10 @@ export interface ResponsesUsage {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  // plugin 注入的命名空间扩展字段（`kiro_metering` / `kiro_derived`）。标准三字段
+  // 恒为 number（显式声明优先）；索引签名只为 `addExtension` 的扩展开门。Codex serde
+  // 忽略未知字段，安全。
+  [key: string]: unknown;
 }
 
 export interface ResponsesOutputTextPart {
