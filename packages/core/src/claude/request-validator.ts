@@ -12,7 +12,7 @@ import type { MessagesRequest } from './types.js';
 /**
  * Check model name for a "thinking" suffix and override the thinking config.
  *
- * - Opus 4.6 / 4.7 / 4.8: adaptive type
+ * - Opus 4.6 / 4.7 / 4.8 / 5: adaptive type
  * - Other models: enabled type
  * - budget_tokens fixed at 20000 (schema later clamps to 24576 ceiling)
  *
@@ -31,7 +31,8 @@ export function overrideThinkingFromModelName(payload: MessagesRequest): void {
   // 两份版本清单必须随新增 Opus 版本一起更新,否则 thinking 路由会与 effort 处理脱节。
   const isAdaptiveOpus =
     modelLower.includes('opus') &&
-    (modelLower.includes('4-6') ||
+    (modelLower.includes('opus-5') ||
+      modelLower.includes('4-6') ||
       modelLower.includes('4.6') ||
       modelLower.includes('4-7') ||
       modelLower.includes('4.7') ||

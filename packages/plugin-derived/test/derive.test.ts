@@ -281,6 +281,17 @@ describe('deriveKiroUsage — cache threshold gating', () => {
     const out = deriveKiroUsage('claude-opus-4-7', 4096, 1, 0.001);
     expect(out.derived.derivedStatus).toMatch(/^ok_/);
   });
+
+  it('Opus 5 + T_in=4095 → below_threshold (同 4.5/4.6/4.7/4.8)', () => {
+    const out = deriveKiroUsage('claude-opus-5', 4095, 1, 0.05);
+    expect(out.derived.derivedStatus).toBe('below_threshold');
+    expect(out.inputTokens).toBe(4095);
+  });
+
+  it('Opus 5 + T_in=4096 → enters reverse-engineering', () => {
+    const out = deriveKiroUsage('claude-opus-5', 4096, 1, 0.001);
+    expect(out.derived.derivedStatus).toMatch(/^ok_/);
+  });
 });
 
 // ============================================================================
@@ -317,6 +328,20 @@ describe('deriveKiroUsage — unknown / thinking variants', () => {
     expect(opus47.cacheReadInputTokens).toBe(opus46.cacheReadInputTokens);
     expect(opus47.derived.derivedStatus).toBe(opus46.derived.derivedStatus);
     expect(opus47.derived.claudeEquivalentCostUsd).toBe(opus46.derived.claudeEquivalentCostUsd);
+  });
+
+  it('Opus 5 produces identical breakdown as Opus 4.8 (single price parity)', () => {
+    // opus-5 单价与 opus-4.8 逐项相同,反演结果必须逐字段一致(整对象深比)。
+    const args = [10000, 200, 0.08] as const;
+    const opus48 = deriveKiroUsage('claude-opus-4-8', ...args);
+    const opus5 = deriveKiroUsage('claude-opus-5', ...args);
+    expect(opus5).toEqual(opus48);
+  });
+
+  it('Opus 5 -thinking 归一到同一价格表 key', () => {
+    const base = deriveKiroUsage('claude-opus-5', 5000, 100, 0.05);
+    const thinking = deriveKiroUsage('claude-opus-5-thinking', 5000, 100, 0.05);
+    expect(thinking).toEqual(base);
   });
 });
 

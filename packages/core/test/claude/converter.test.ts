@@ -2,9 +2,11 @@ import fs from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   convertRequest,
+  getContextWindowSize,
   IDENTITY_OVERRIDE_DIRECTIVE,
   mapModel,
   UNSUPPORTED_DOCUMENT_PLACEHOLDER,
+  usesNativeReasoning,
 } from '../../src/claude/converter.js';
 import type { Tool as ClaudeTool, MessagesRequest, Metadata } from '../../src/claude/types.js';
 import { preprocessSystem } from '../../src/claude/types.js';
@@ -71,6 +73,24 @@ describe('mapModel', () => {
     expect(mapModel('claude-opus-4-8-thinking')).toBe('claude-opus-4.8');
   });
 
+  it('test_map_model_opus_5', () => {
+    // opus-5 上游 modelId **无小数点**(claude-opus-5)
+    expect(mapModel('claude-opus-5')).toBe('claude-opus-5');
+    expect(mapModel('claude-opus-5-thinking')).toBe('claude-opus-5');
+    expect(mapModel('anthropic.claude-opus-5')).toBe('claude-opus-5');
+    // 大小写 / dated 变体都靠单个 dash-form opus-5 判别子命中（与 sonnet-5 一致）
+    expect(mapModel('Claude-Opus-5')).toBe('claude-opus-5');
+    expect(mapModel('claude-opus-5-20260720')).toBe('claude-opus-5');
+  });
+
+  it('test_map_model_opus_5_not_confused_with_4_5', () => {
+    // 边界: opus-5 判别子避开 '4',不误伤 opus 4.5(子串 opus-4-5 / opus-4.5，
+    // 不含 opus-5)。回归 bug: 无此隔离时 claude-opus-5 会 fallthrough 到 4.6 兜底。
+    expect(mapModel('claude-opus-4-5')).toBe('claude-opus-4.5');
+    expect(mapModel('claude-opus-4.5')).toBe('claude-opus-4.5');
+    expect(mapModel('claude-opus-4-5-20251101-thinking')).toBe('claude-opus-4.5');
+  });
+
   it('test_map_model_thinking_suffix_haiku', () => {
     expect(mapModel('claude-haiku-4-5-20251001-thinking')).toBe('claude-haiku-4.5');
   });
@@ -118,6 +138,22 @@ describe('mapModel', () => {
     expect(mapModel('gpt-5-codex-mini')).toBe('gpt-5.6-sol');
     // sol/terra/luna 判别子优先于 codex
     expect(mapModel('gpt-5.6-terra')).toBe('gpt-5.6-terra');
+  });
+});
+
+describe('getContextWindowSize / usesNativeReasoning — opus-5', () => {
+  it('opus-5 context window 为 1M', () => {
+    expect(getContextWindowSize('claude-opus-5')).toBe(1_000_000);
+    expect(getContextWindowSize('claude-opus-5-thinking')).toBe(1_000_000);
+  });
+
+  it('opus-5 走原生 reasoning(比照 4.7/4.8)', () => {
+    expect(usesNativeReasoning('claude-opus-5')).toBe(true);
+  });
+
+  it('opus 4.5 边界: 非 1M、非原生(不被 opus-5 改动误伤)', () => {
+    expect(getContextWindowSize('claude-opus-4-5')).toBe(200_000);
+    expect(usesNativeReasoning('claude-opus-4.5')).toBe(false);
   });
 });
 

@@ -222,9 +222,10 @@ describe('mapThinkingToEffort: 双通道映射', () => {
 });
 
 describe('usesNativeReasoning: 模型能力探测', () => {
-  it('4.7 / 4.8 走原生', () => {
+  it('4.7 / 4.8 / 5 走原生', () => {
     expect(usesNativeReasoning('claude-opus-4.7')).toBe(true);
     expect(usesNativeReasoning('claude-opus-4.8')).toBe(true);
+    expect(usesNativeReasoning('claude-opus-5')).toBe(true);
   });
 
   it('4.6 / sonnet / haiku / 4.5 走 fallback prompt 路径', () => {
@@ -240,6 +241,8 @@ describe('usesNativeReasoning: 模型能力探测', () => {
       [
         'claude-opus-4.7',
         'claude-opus-4.8',
+        // Opus 5 比照 4.7/4.8 走原生 reasoning.effort（上游 modelId claude-opus-5，明文 thinking）
+        'claude-opus-5',
         // GPT-5.6 系列同走原生 reasoning.effort（reasoning 内容加密不可 surface）
         'gpt-5.6-sol',
         'gpt-5.6-terra',
@@ -316,6 +319,19 @@ describe('convertRequest: reasoning.effort 注入', () => {
     expect(result.conversationState.currentMessage.userInputMessage.reasoning).toEqual({
       effort: 'high',
     });
+  });
+
+  it('5 + adaptive → reasoning.effort 注入（上游 claude-opus-5，无小数点）', () => {
+    const req = baseMessagesRequest({
+      model: 'claude-opus-5',
+      thinking: { type: 'adaptive', budget_tokens: 20000 },
+      output_config: { effort: 'high' },
+    });
+    const result = convertRequest(req);
+    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toEqual({
+      effort: 'high',
+    });
+    expect(mapModel(req.model)).toBe('claude-opus-5');
   });
 
   it('4.6 + thinking → 不注入 reasoning 字段（走旧 prompt 注入路径）', () => {

@@ -146,6 +146,15 @@ const CLAUDE_PRICE_USD_PER_TOK: Record<string, ClaudePrice> = {
     cacheRead: 0.5e-6,
     cacheCreation: 6.25e-6,
   },
+  // Opus 5 单价与 Opus 4.8 逐项相同（platform.claude.com/pricing 实测）。key 用
+  // dash-form 'claude-opus-5'：上游 modelId 本就无小数点，normalizeModelId 对
+  // 'claude-opus-5' / 'claude-opus-5-thinking' 归一到此 key（-5 尾不被当日期）。
+  'claude-opus-5': {
+    in: 5e-6,
+    out: 25e-6,
+    cacheRead: 0.5e-6,
+    cacheCreation: 6.25e-6,
+  },
 };
 
 const MODEL_CACHE_THRESHOLD: Record<string, number> = {
@@ -157,6 +166,7 @@ const MODEL_CACHE_THRESHOLD: Record<string, number> = {
   'claude-opus-4-6': 4096,
   'claude-opus-4-7': 4096,
   'claude-opus-4-8': 4096,
+  'claude-opus-5': 4096,
 };
 
 /**

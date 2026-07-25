@@ -633,4 +633,87 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
     },
     LIVE_TIMEOUT_MS,
   );
+
+  // --------------------------------------------------------------------------
+  // L. 非流式 + Opus 5 + adaptive + effort=high
+  //    验证：opus-5（上游 modelId claude-opus-5，**无小数点**）比照 4.7/4.8 走
+  //    原生 reasoning 路径 —— 上游接受 reasoning.effort wire 字段、回明文 thinking
+  //    + signature。若上游不响应该字段（opus-5 非 native），因 opus-5 已在
+  //    MODELS_WITH_NATIVE_REASONING、`<thinking_mode>` prompt 被跳过 → 完全无
+  //    thinking，thinkingBlock 断言会失败 —— 即回退非-native 的信号。
+  // --------------------------------------------------------------------------
+  it(
+    'L. 5 + adaptive + effort=high → native path (thinking block + signature)',
+    async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/claude/v1/messages',
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
+        payload: {
+          model: 'claude-opus-5',
+          max_tokens: 1500,
+          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          output_config: { effort: 'high' },
+          messages: [{ role: 'user', content: REASONING_PROMPT }],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as NonStreamResponse;
+      const thinkingBlock = body.content.find((b) => b.type === 'thinking');
+      const textBlock = body.content.find((b) => b.type === 'text');
+      expect(thinkingBlock).toBeDefined();
+      expect(thinkingBlock?.thinking?.length).toBeGreaterThan(0);
+      expect(typeof thinkingBlock?.signature).toBe('string');
+      // 原生路径 thinking 明文，不残留 <thinking> 标签
+      expect(thinkingBlock?.thinking).not.toMatch(/<thinking>/);
+      expect(textBlock?.text).toMatch(/12:33|12:30|2.*hour|33/i);
+    },
+    LIVE_TIMEOUT_MS,
+  );
+
+  // --------------------------------------------------------------------------
+  // M. 流式 + Opus 5 + adaptive + effort=high
+  //    验证：opus-5 流式也走原生路径（thinking_delta + signature_delta，
+  //    thinking block 先于 text block）。与 L 互补覆盖非流式/流式两条状态机。
+  // --------------------------------------------------------------------------
+  it(
+    'M. 5 + adaptive + stream → SSE chain has thinking_delta + signature_delta',
+    async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/claude/v1/messages',
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
+        payload: {
+          model: 'claude-opus-5',
+          max_tokens: 2000,
+          stream: true,
+          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          output_config: { effort: 'high' },
+          messages: [{ role: 'user', content: REASONING_PROMPT }],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const events = parseSseEvents(res.body);
+
+      const eventTypes = new Set(events.map((e) => e.event));
+      expect(eventTypes.has('message_start')).toBe(true);
+      expect(eventTypes.has('message_stop')).toBe(true);
+
+      const thinkingChunks = thinkingDeltas(events);
+      expect(thinkingChunks.length).toBeGreaterThan(0);
+      const sigs = signatureDeltas(events);
+      expect(sigs.length).toBeGreaterThan(0);
+
+      const text = textDeltas(events);
+      expect(text).toMatch(/12:33|12:30|2.*hour|33/i);
+
+      // block 顺序: thinking 先于 text
+      const starts = blockStarts(events);
+      const thinkingStartIdx = starts.findIndex((s) => s.type === 'thinking');
+      const textStartIdx = starts.findIndex((s) => s.type === 'text');
+      expect(thinkingStartIdx).toBeGreaterThanOrEqual(0);
+      expect(thinkingStartIdx).toBeLessThan(textStartIdx);
+    },
+    LIVE_TIMEOUT_MS,
+  );
 });

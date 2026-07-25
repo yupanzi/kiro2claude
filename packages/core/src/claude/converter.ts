@@ -75,6 +75,7 @@ export const UNSUPPORTED_DOCUMENT_PLACEHOLDER =
  * - sonnet 5/sonnet-5 -> claude-sonnet-5
  * - sonnet 4.6/4-6 -> claude-sonnet-4.6
  * - other sonnet -> claude-sonnet-4.5
+ * - opus 5 -> claude-opus-5
  * - opus 4.5/4-5 -> claude-opus-4.5
  * - opus 4.7/4-7 -> claude-opus-4.7
  * - opus 4.8/4-8 -> claude-opus-4.8
@@ -102,6 +103,10 @@ export function mapModel(model: string): string | undefined {
     return 'claude-sonnet-4.5';
   }
   if (lower.includes('opus')) {
+    // 'opus-5' 边界匹配: 'claude-opus-4-5' 含 'opus-4-5' 而非 'opus-5',不会误伤(上游 id 无小数点,须先于 4-x 判定)
+    if (lower.includes('opus-5')) {
+      return 'claude-opus-5';
+    }
     if (lower.includes('4-5') || lower.includes('4.5')) {
       return 'claude-opus-4.5';
     }
@@ -152,6 +157,7 @@ export function mapModel(model: string): string | undefined {
  * 注入 + 跳过 `<thinking>` prompt 前缀，与响应侧是否有可用 thinking 无关。
  */
 export const MODELS_WITH_NATIVE_REASONING: ReadonlySet<string> = new Set([
+  'claude-opus-5',
   'claude-opus-4.7',
   'claude-opus-4.8',
   'gpt-5.6-sol',
@@ -225,6 +231,7 @@ export function clientModelHasEncryptedReasoning(clientModel: string): boolean {
  *
  * Kiro upgraded Opus 4.6 and Sonnet 4.6 to 1M context on 2026-03-24.
  * Opus 4.7 and 4.8 also ship with the 1M window (上游 list-models 实测确认).
+ * Opus 5 同为 1M context (上游 `--list-models` 实测: context_window_tokens 1000000).
  * Sonnet 5 同为 1M context (Anthropic 官方规格,与前代 Sonnet 4.6 一致).
  * GPT-5.6 系列为 272K context (上游 `--list-models` 实测: context_window_tokens 272000).
  */
@@ -235,7 +242,8 @@ export function getContextWindowSize(model: string): number {
     mapped === 'claude-sonnet-5' ||
     mapped === 'claude-opus-4.6' ||
     mapped === 'claude-opus-4.7' ||
-    mapped === 'claude-opus-4.8'
+    mapped === 'claude-opus-4.8' ||
+    mapped === 'claude-opus-5'
   ) {
     return 1_000_000;
   }

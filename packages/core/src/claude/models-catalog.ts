@@ -10,6 +10,24 @@ import type { Model, ModelsResponse } from './types.js';
 /** Full list of Claude model identifiers exposed by this proxy. */
 export const MODELS: Model[] = [
   {
+    id: 'claude-opus-5',
+    object: 'model',
+    created: 1784505600,
+    owned_by: 'anthropic',
+    display_name: 'Claude Opus 5',
+    type: 'chat',
+    max_tokens: 64000,
+  },
+  {
+    id: 'claude-opus-5-thinking',
+    object: 'model',
+    created: 1784505600,
+    owned_by: 'anthropic',
+    display_name: 'Claude Opus 5 (Thinking)',
+    type: 'chat',
+    max_tokens: 64000,
+  },
+  {
     id: 'claude-opus-4-8',
     object: 'model',
     created: 1779840000,
