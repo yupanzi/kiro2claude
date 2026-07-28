@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/yupanzi/kiro2claude/compare/v1.4.0...v1.4.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **core:** 修流式无声截断、空流重试判据与请求日志噪声 ([69b492a](https://github.com/yupanzi/kiro2claude/commit/69b492a45d7ed3c48fe6632a8f6551750b609bc4)), closes [#21](https://github.com/yupanzi/kiro2claude/issues/21) [#22](https://github.com/yupanzi/kiro2claude/issues/22)
+
 # [1.4.0](https://github.com/yupanzi/kiro2claude/compare/v1.3.0...v1.4.0) (2026-07-25)
 
 
