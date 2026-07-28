@@ -221,6 +221,31 @@ const RETRYABLE_UPSTREAM_ERROR_CODES = new Set([
   'InternalFailure',
 ]);
 
+/**
+ * 表示上游**已经开始生成**(因而很可能已经计费)的事件类型。`Metering` 是账单本身;
+ * 其余三类是产出。`ContextUsage` / `Unknown` 不算 —— 它们不代表生成工作。
+ */
+const BILLABLE_WORK_EVENT_KINDS = [
+  'AssistantResponse',
+  'ToolUse',
+  'ReasoningContent',
+  'Metering',
+] as const;
+
+/**
+ * 本次尝试里上游是否「开过工」—— 即是否有任何已经产生成本的迹象。用来判定一个上游
+ * Error/Exception 帧是**确定性终止**(已开工 → 重发只会再烧一遍)还是**瞬时拒绝**
+ * (零帧 → 重发几乎必然恢复,且无成本可烧)。
+ *
+ * ★ **不能**用 `hasContent()` 代替。GPT 的 reasoning 是加密的 `redactedContent`,
+ * `processReasoningContent` 会整块丢弃(踩坑 #15),于是一个已经烧掉数千帧 reasoning
+ * 的 GPT 流在 `hasContent()` 看来是「空」的 —— 按它决定要不要重试,正好会对最贵的
+ * 那类失败重发请求。判据必须落在**上游发过什么帧**上,而不是我们向下游产出了什么。
+ */
+export function sawBillableWork(eventCounts: Record<string, number>): boolean {
+  return BILLABLE_WORK_EVENT_KINDS.some((kind) => (eventCounts[kind] ?? 0) > 0);
+}
+
 /** A classified mid-stream upstream error awaiting downstream surfacing. */
 export interface PendingUpstreamError {
   code: string;
@@ -288,9 +313,13 @@ export function assertNever(x: never): never {
  * 选择空流文案。多次尝试仍空 = *确定性*空流(失败绑定在请求内容上,再重试
  * 只烧 credit)→ 提示压缩会话;单次尝试(retries=0)是瞬时空流 → 保留可重试
  * 文案。流式与非流式 handler 共用,阈值不再各写一份。
+ *
+ * `deterministic` 让调用方**直接断言**确定性,不靠 attempts 倒推:截断的 tool_use
+ * 帧一眼可判且不再消耗重试预算 → attempts 停在 1 → 只看次数会误退回「please
+ * retry」,把用户引向那条已知无效的路。
  */
-export function selectEmptyUpstreamMessage(emptyAttempts: number): string {
-  return emptyAttempts >= 2
+export function selectEmptyUpstreamMessage(emptyAttempts: number, deterministic = false): string {
+  return deterministic || emptyAttempts >= 2
     ? EMPTY_UPSTREAM_DETERMINISTIC_MESSAGE
     : EMPTY_UPSTREAM_RESPONSE_MESSAGE;
 }
@@ -308,18 +337,73 @@ export function sseEventToString(e: SseEvent): string {
  * handler's hot loop to crash the process over this — by the time we notice,
  * the client is gone and there's nothing to recover.
  *
- * Returns `true` if the write succeeded, `false` if the socket is gone.
+ * Returns `true` if the socket is still writable, `false` if it is gone.
  * Callers should use the return value to break out of their loops instead of
  * polling `aborted` state, so resource cleanup happens at the first sign of
  * trouble.
+ *
+ * ★ 红线:**绝不**把 `raw.write()` 的返回值当成上面那个 boolean 返回。它是 Node 的
+ * **背压**信号(内部缓冲超过 highWaterMark → 应等 `'drain'` 再写),此时 socket 完全
+ * 健康。历史实现直接 `return raw.write(chunk)`,于是所有调用点把「缓冲满」读成
+ * 「客户端断连」:读循环停止转发、终结段连 `message_stop` 都丢掉、上游仍 drain 到
+ * EOF 全额计费,日志还把责任记给客户端。而缓冲只会被**大量字节**填满,所以这个误判
+ * 精确地咬住最长最贵的那批响应 —— 生产实测被误判流的 `output_tokens` 中位数比真断连
+ * 高一个量级、无一例短于 2 分钟,而真断连中位数只有 3 秒(时间驱动 vs 字节量驱动,
+ * 这也是排除「用户 Ctrl-C」的判别子)。
+ * 存活判定只看两件事:socket 已 `destroyed`/`writableEnded`,或 write 抛错。背压由
+ * {@link awaitDrain} 单独处理。
  */
 export function safeWrite(raw: NodeJS.WritableStream, chunk: string): boolean {
+  const w = raw as NodeJS.WritableStream & { destroyed?: boolean; writableEnded?: boolean };
+  if (w.destroyed === true || w.writableEnded === true) return false;
   try {
-    return raw.write(chunk);
+    // 返回值是背压信号,故意丢弃 —— 见上方红线。
+    raw.write(chunk);
+    return true;
   } catch (e) {
     getLogger().debug({ msg: 'sse write failed (client likely disconnected)', error: String(e) });
     return false;
   }
+}
+
+/**
+ * SSE 背压等待上限。客户端读得慢时我们等它跟上(而不是把它当断连),但一个既不读也
+ * 不关闭的客户端不能无限期地把上游读循环卡住 —— 我们不消费,上游就会因为看不到
+ * 消费者而回收连接。超时后放弃等待、继续写,把缓冲交给 Node。
+ */
+const DRAIN_WAIT_TIMEOUT_MS = 30_000;
+
+/**
+ * 背压等待:socket 内部缓冲超过 highWaterMark 时,等它排空再继续写,避免无界内存
+ * 增长。`'drain'` / `'close'` / `'error'` 任一到达即解除,另有超时兜底,绝不挂死。
+ *
+ * 与 {@link safeWrite} 配套 —— safeWrite 只判存活,背压在这里等。只需在**热路径**
+ * (逐帧转发的读循环)调用;终结段那几笔写入量很小,不值得引入 await。
+ */
+export async function awaitDrain(raw: NodeJS.WritableStream): Promise<void> {
+  const w = raw as NodeJS.WritableStream & {
+    writableNeedDrain?: boolean;
+    destroyed?: boolean;
+  };
+  if (w.writableNeedDrain !== true || w.destroyed === true) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      raw.off('drain', done);
+      raw.off('close', done);
+      raw.off('error', done);
+      resolve();
+    };
+    timer = setTimeout(done, DRAIN_WAIT_TIMEOUT_MS);
+    timer.unref();
+    raw.once('drain', done);
+    raw.once('close', done);
+    raw.once('error', done);
+  });
 }
 
 /**

@@ -240,10 +240,16 @@ async function main(): Promise<void> {
   // 连接，同时让 active 请求自然完成。设 `true` 会强杀活动请求，导致长流
   // 响应被无故切断；留空（false）则 idle 连接也会被保留，SIGTERM 后 app.close
   // 可能被一个空闲连接卡住超时。`'idle'` 是两者之间的正解。
+  // `disableRequestLogging: true` —— 关掉 Fastify 内置的 `incoming request` +
+  // `request completed`。下面的 onResponse hook 记的是同一件事,且多带 reqId
+  // (串起整条请求链路)与 duration_ms。两者并存时每请求三行、其中两行都叫
+  // "request completed":不只是体积,按 incoming/completed 配对做的分析会稳定
+  // 算错。method/url 补进自定义那条 → 每请求一行,信息不减。
   const app = Fastify({
     loggerInstance: logger,
     bodyLimit: 50 * 1024 * 1024, // 50 MB
     forceCloseConnections: 'idle',
+    disableRequestLogging: true,
   });
 
   // 6.5. 请求级上下文 hook：生成 reqId、包裹 AsyncLocalStorage、记录请求完成日志
@@ -253,12 +259,16 @@ async function main(): Promise<void> {
     requestContextStorage.run({ reqId, startTime: Date.now() }, done);
   });
 
-  app.addHook('onResponse', (_request, reply, done) => {
+  app.addHook('onResponse', (request, reply, done) => {
     const ctx = getRequestContext();
     if (ctx) {
       const duration = Date.now() - ctx.startTime;
+      // method/url 原本只在 Fastify 内置的 `incoming request` 里出现;内置日志
+      // 已关闭(见上),故在这里补齐——否则请求路径在日志中不可见。
       getLogger().info({
         msg: 'request completed',
+        method: request.method,
+        url: request.url,
         statusCode: reply.statusCode,
         duration_ms: duration,
       });

@@ -23,6 +23,7 @@ import { reduceKiroResponse } from './non-stream-reduce.js';
 import {
   buildClaudeUsagePayload,
   buildKiroUsageFinishEvent,
+  sawBillableWork,
   selectEmptyUpstreamMessage,
   upstreamErrorWire,
 } from './stream.js';
@@ -131,6 +132,25 @@ export async function handleNonStreamRequest(
     // end), so discarding partial content and sending an error is always safe.
     // retryable → 503/overloaded_error (SDK retries); fatal → 502/api_error.
     if (upstreamError) {
+      // 上游零帧拒绝(event_counts 里没有任何已计费迹象)= 瞬时故障,重发几乎必然
+      // 恢复且无成本可烧 → 走与空响应相同的有界重试。上游**已开工**才是确定性终止,
+      // 那时重发只会再烧一遍。与流式路径 deterministicUpstreamError 对称;判据用
+      // sawBillableWork 而非「有无 toolUses/文本」(GPT 加密 reasoning 不可见但计费)。
+      if (
+        !sawBillableWork(Object.fromEntries(eventCounts)) &&
+        attempt < maxAttempts &&
+        !aborted.value
+      ) {
+        emptyAttempts++;
+        log.warn({
+          msg: 'upstream rejected with zero frames (non-stream), retrying',
+          attempt,
+          remaining: maxAttempts - attempt,
+          upstream_error: upstreamError,
+          input_tokens: contextInputTokens ?? inputTokens,
+        });
+        continue;
+      }
       // Bill any credit already consumed before the error (a Metering frame may
       // have preceded it): the old code reached the usage-finish hook on this
       // input, so the early error return must not silently drop that credit from
@@ -163,9 +183,13 @@ export async function handleNonStreamRequest(
 
     if (silentFailure) {
       emptyAttempts++;
+      // silentFailure 已要求 toolUses 为空,故 stopReason==='tool_use' 等价于
+      // 「宣告了 tool_use 却无一帧 isComplete」= 截断 tool 帧 = 内容绑定的确定性
+      // 失败(重发必然再次截断)。与流式路径 truncatedToolUse 对称,不烧重试预算。
+      const truncatedToolUse = stopReason === 'tool_use';
       // 还有重试额度、且客户端仍在 → 重发同一请求吸收瞬时空流。客户端已断开则
       // 不再重试(避免为没人读的响应继续烧上游 credit)。
-      if (attempt < maxAttempts && !aborted.value) {
+      if (attempt < maxAttempts && !aborted.value && !truncatedToolUse) {
         log.warn({
           msg: 'upstream returned empty non-stream response, retrying',
           attempt,
@@ -176,6 +200,15 @@ export async function handleNonStreamRequest(
           tool_use_names: [...announcedToolNames],
         });
         continue;
+      }
+      if (truncatedToolUse) {
+        log.warn({
+          msg: 'upstream announced tool_use but never completed the frame (non-stream) — deterministic empty, not retrying',
+          attempt,
+          stop_reason: stopReason,
+          event_counts: Object.fromEntries(eventCounts),
+          tool_use_names: [...announcedToolNames],
+        });
       }
       // 重试耗尽仍空 → 503 overloaded_error。多次尝试全空 = 确定性空流,
       // 失败绑定在请求内容上,文案改为提示压缩/裁剪会话(与流式路径一致)。
@@ -188,7 +221,9 @@ export async function handleNonStreamRequest(
         tool_use_names: [...announcedToolNames],
         total_duration_ms: Date.now() - apiStart,
       });
-      const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts);
+      // 首次尝试即定案 → emptyAttempts 停在 1,单看次数会误退回「please retry」,
+      // 显式传标志走「压缩会话」文案。
+      const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts, truncatedToolUse);
       reply.status(503).send(createErrorResponse('overloaded_error', emptyMessage));
       return { emptyResponse: true, emptyAttempts };
     }

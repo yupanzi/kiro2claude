@@ -249,10 +249,16 @@ describe('empty-stream retry: streaming path (app.inject)', () => {
     expect(provider.callApiStream).toHaveBeenCalledTimes(1);
   });
 
-  it('TRUNCATED toolUse frame (isComplete=false, no input) counts as empty → deterministic 503', async () => {
+  it('TRUNCATED toolUse frame (isComplete=false, no input) → deterministic 503 WITHOUT burning retries', async () => {
     // 截断帧:上游宣告 tool_use 但完整帧从未到达(stop=false)。非流式也 gate 在
-    // isComplete、同样不会 push 它,故两路一致判空 → 重试耗尽 → 503 + 压缩提示。
+    // isComplete、同样不会 push 它,故两路一致判空。
     // 区别于「完整的空参数 tool_use」(stop=true,合法调用),见下一条测试。
+    //
+    // ★ 这是**确定性**空流:失败绑定在请求内容上,重发同一请求上游会同样地再次
+    // 截断(生产实测重试全部复现同一事件指纹,恢复率 0,每次白烧 credit)。故与
+    // max_tokens / context-window-exceeded 同列:单次尝试即定案,**不消耗重试
+    // 预算**。文案仍是确定性的「压缩会话」而非「please retry」——后者会把用户
+    // 引向那条已知无效的路。
     const provider = queueProvider({
       stream: [
         () =>
@@ -274,8 +280,11 @@ describe('empty-stream retry: streaming path (app.inject)', () => {
     expect(res.statusCode).toBe(503);
     const err = res.json() as { error: { type: string; message: string } };
     expect(err.error.type).toBe('overloaded_error');
+    // 未重试也必须给确定性文案(不能因 emptyAttempts===1 退回 "please retry")
     expect(err.error.message).toContain('compact or trim');
-    expect(provider.callApiStream).toHaveBeenCalledTimes(3);
+    expect(err.error.message).not.toContain('please retry');
+    // 预算 2 次重试全部保留 —— 只调用上游一次。
+    expect(provider.callApiStream).toHaveBeenCalledTimes(1);
   });
 
   it('COMPLETE empty-input toolUse (isComplete, no args) surfaces as tool_use → 200, not retried', async () => {
@@ -514,6 +523,35 @@ describe('empty-stream retry: non-streaming path', () => {
     expect(tu?.name).toContain('browser_snapshot');
     expect(tu?.input).toEqual({});
     expect(body.stop_reason).toBe('tool_use');
+    expect(provider.callApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('TRUNCATED toolUse frame → deterministic 503 WITHOUT burning retries', async () => {
+    // 与流式路径对称(见 streaming describe 的同名用例)。silentFailure 已要求
+    // toolUses 为空,故 stopReason==='tool_use' 精确等价于「上游宣告了 tool_use
+    // 但无一帧 isComplete」= 截断帧 = 内容绑定的确定性失败。单次定案,不烧预算。
+    const provider = queueProvider({
+      buffer: [
+        () =>
+          makeBufferResponse([
+            buildToolUseFrame('mcp__playwright__browser_click', 'tool-shell-1'),
+            buildMeteringFrame({ unit: 'credit', unitPlural: 'credits', usage: 0.349 }),
+          ]),
+      ],
+    });
+    app = await buildApp(provider, 2);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: NON_STREAM_BODY,
+    });
+    expect(res.statusCode).toBe(503);
+    const err = res.json() as { error: { type: string; message: string } };
+    expect(err.error.type).toBe('overloaded_error');
+    // 未重试也必须给确定性文案(不能因 emptyAttempts===1 退回 "please retry")
+    expect(err.error.message).toContain('compact or trim');
+    expect(err.error.message).not.toContain('please retry');
     expect(provider.callApi).toHaveBeenCalledTimes(1);
   });
 

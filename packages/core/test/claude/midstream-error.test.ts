@@ -29,6 +29,7 @@ import {
   buildErrorFrame,
   buildExceptionFrame,
   buildMeteringFrame,
+  buildRedactedReasoningFrame,
   parseSseEvents,
 } from '../helpers/event-stream.js';
 
@@ -147,7 +148,17 @@ describe('mid-stream error surfacing: non-stream (app.inject)', () => {
     app = undefined;
   });
 
-  it('fatal exception, no content → 502 api_error, neutral, one upstream call (no retry)', async () => {
+  /**
+   * 零帧拒绝 = 上游没开工 → 走有界重试。
+   *
+   * 原契约是「上游发来显式 Error/Exception 帧一律不重试」,理由是重试白烧 credit。
+   * 但那个理由只在上游**已经开工**时成立:生产上另有一类 1ms 内零帧拒绝
+   * (`event_counts` 只有 `Exception:1`),没有任何 credit 可烧,重发几乎必然恢复。
+   * 判据是 `sawBillableWork`,与错误码的 retryable 分类**无关** —— 那个集合被实测
+   * 证明不完整(真实世界最常见的是泛化 `code:"error"`,不在集合里)。代价是一个真·
+   * 确定性的零帧拒绝会多打两次上游,但每次都在毫秒级被拒、零成本,下游结果不变。
+   */
+  it('fatal exception, zero frames → 502 api_error, neutral, retried (no credit to burn)', async () => {
     const provider = queueProvider({
       buffer: [
         () => makeBufferResponse([buildExceptionFrame(FATAL_CODE, 'kiro validation blew up')]),
@@ -155,14 +166,15 @@ describe('mid-stream error surfacing: non-stream (app.inject)', () => {
     });
     app = await buildApp(provider, 2);
     const res = await inject(app, NON_STREAM_BODY);
+    // 下游 wire 结果与旧契约完全一致 —— 变的只是尝试次数。
     expect(res.statusCode).toBe(502);
     const err = res.json() as { error: { type: string; message: string } };
     expect(err.error.type).toBe('api_error');
     expect(err.error.message).not.toMatch(LEAK_RE);
-    expect(provider.callApi).toHaveBeenCalledTimes(1);
+    expect(provider.callApi).toHaveBeenCalledTimes(3);
   });
 
-  it('transient exception, no content → 503 overloaded_error (retryable), neutral, no server retry', async () => {
+  it('transient exception, zero frames → 503 overloaded_error, retried', async () => {
     const provider = queueProvider({
       buffer: [() => makeBufferResponse([buildExceptionFrame(RETRYABLE_CODE, 'aws throttled')])],
     });
@@ -172,8 +184,22 @@ describe('mid-stream error surfacing: non-stream (app.inject)', () => {
     const err = res.json() as { error: { type: string; message: string } };
     expect(err.error.type).toBe('overloaded_error');
     expect(err.error.message).not.toMatch(LEAK_RE);
-    // Surfaced as retryable to the client, but the gateway itself does not retry.
-    expect(provider.callApi).toHaveBeenCalledTimes(1);
+    expect(provider.callApi).toHaveBeenCalledTimes(3);
+  });
+
+  it('★ zero-frame reject recovers transparently when a retry succeeds', async () => {
+    // 这才是这条改动的收益:客户端根本看不到那次失败。
+    const provider = queueProvider({
+      buffer: [
+        () => makeBufferResponse([buildExceptionFrame(FATAL_CODE, 'kiro transient reject')]),
+        () => makeBufferResponse([buildAssistantResponseFrame('recovered')]),
+      ],
+    });
+    app = await buildApp(provider, 2);
+    const res = await inject(app, NON_STREAM_BODY);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('recovered');
+    expect(provider.callApi).toHaveBeenCalledTimes(2);
   });
 
   it('transient error frame (kind Error) → 503 overloaded_error', async () => {
@@ -289,7 +315,8 @@ describe('mid-stream error surfacing: streaming (app.inject)', () => {
     expect((errEvent?.data as { error: { type: string } }).error.type).toBe('overloaded_error');
   });
 
-  it('fatal error BEFORE any content (uncommitted) → 502 status, neutral, not retried', async () => {
+  it('fatal error, zero frames (uncommitted) → 502 status, neutral, retried', async () => {
+    // 与非流式对称,理由见那边的块注释。下游结果不变,变的只是尝试次数。
     const provider = queueProvider({
       stream: [() => makeStreamResponse(bufferStream([buildErrorFrame(FATAL_CODE, 'kiro boom')]))],
     });
@@ -299,10 +326,10 @@ describe('mid-stream error surfacing: streaming (app.inject)', () => {
     const err = res.json() as { error: { type: string; message: string } };
     expect(err.error.type).toBe('api_error');
     expect(err.error.message).not.toMatch(LEAK_RE);
-    expect(provider.callApiStream).toHaveBeenCalledTimes(1);
+    expect(provider.callApiStream).toHaveBeenCalledTimes(3);
   });
 
-  it('transient error BEFORE any content (uncommitted) → 503 status (retryable)', async () => {
+  it('transient error, zero frames (uncommitted) → 503 status (retryable), retried', async () => {
     const provider = queueProvider({
       stream: [() => makeStreamResponse(bufferStream([buildExceptionFrame(RETRYABLE_CODE)]))],
     });
@@ -310,6 +337,47 @@ describe('mid-stream error surfacing: streaming (app.inject)', () => {
     const res = await inject(app, STREAM_BODY);
     expect(res.statusCode).toBe(503);
     expect((res.json() as { error: { type: string } }).error.type).toBe('overloaded_error');
+    expect(provider.callApiStream).toHaveBeenCalledTimes(3);
+  });
+
+  it('★ zero-frame reject recovers transparently when a retry succeeds', async () => {
+    const provider = queueProvider({
+      stream: [
+        () => makeStreamResponse(bufferStream([buildErrorFrame(FATAL_CODE, 'kiro boom')])),
+        () => makeStreamResponse(bufferStream([buildAssistantResponseFrame('recovered')])),
+      ],
+    });
+    app = await buildApp(provider, 2);
+    const res = await inject(app, STREAM_BODY);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('recovered');
+    // 客户端不该看到任何 error 事件 —— 那次失败被透明吸收了。
+    expect(parseSseEvents(res.body).some((e) => e.event === 'error')).toBe(false);
+    expect(provider.callApiStream).toHaveBeenCalledTimes(2);
+  });
+
+  it('★ 反向守卫:上游已开工(GPT 加密 reasoning)后报错 → 绝不重试', async () => {
+    // 这是这条改动最危险的失误模式。GPT 的 reasoning 是加密的 redactedContent,
+    // processReasoningContent 整块丢弃(踩坑 #15)→ 既没有 output_tokens 也没有
+    // thinking,`hasContent()` 谎报为「空」。若拿 hasContent() 当重试判据,一个已经
+    // 烧掉数千帧 reasoning 的流会被重发,正好在最贵的失败上白烧 credit。
+    // 判据必须是 sawBillableWork(看上游发过什么帧),这里钉死它。
+    const provider = queueProvider({
+      stream: [
+        () =>
+          makeStreamResponse(
+            bufferStream([
+              buildRedactedReasoningFrame(),
+              buildRedactedReasoningFrame(),
+              buildErrorFrame(RETRYABLE_CODE_2, 'kiro internal boom'),
+            ]),
+          ),
+      ],
+    });
+    app = await buildApp(provider, 2);
+    const res = await inject(app, STREAM_BODY);
+    expect(res.statusCode).toBe(503);
+    // 上游已开工 = 确定性终止,单次定案。
     expect(provider.callApiStream).toHaveBeenCalledTimes(1);
   });
 });

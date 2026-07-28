@@ -14,6 +14,7 @@ import type { AxiosResponse } from 'axios';
 import type { FastifyReply } from 'fastify';
 import type { MessageHandlerResult } from '../claude/empty-capture.js';
 import {
+  awaitDrain,
   type SseEvent,
   StreamContext,
   safeEnd,
@@ -81,6 +82,11 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   let committed = false;
   let upstreamData: { destroy?: (err?: Error) => void } | undefined;
   let draining = false;
+  // 见 claude/stream-handler.ts 同名标志:drain grace 到期时我们自己 destroy
+  // socket,读流随之抛 ERR_STREAM_PREMATURE_CLOSE 是预期结果而非上游故障。
+  let graceDestroyed = false;
+  // 见 claude/stream-handler.ts 同名变量:区分「客户端真的走了」与「写失败」。
+  let disconnectSource: 'client_close' | 'write_failed' | undefined;
 
   const armDrainGrace = (): void => {
     if (!draining || !upstreamData) return;
@@ -89,6 +95,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
       log.warn({
         msg: 'openai sse upstream drain grace expired after disconnect — destroying socket',
       });
+      graceDestroyed = true;
       try {
         upstreamData?.destroy?.();
       } catch {
@@ -100,6 +107,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
 
   reply.raw.on('close', () => {
     if (!aborted.value && committed) log.info({ msg: 'openai sse client disconnected' });
+    disconnectSource ??= 'client_close';
     aborted.value = true;
     if (pingInterval) clearInterval(pingInterval);
     if (commitTimer) clearTimeout(commitTimer);
@@ -139,6 +147,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     reply.raw.writeHead(200, sseHeaders);
     for (const line of buffered) {
       if (!safeWrite(reply.raw, line)) {
+        disconnectSource ??= 'write_failed';
         aborted.value = true;
         break;
       }
@@ -147,6 +156,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     pingInterval = setInterval(() => {
       if (!safeWrite(reply.raw, keepalive())) {
         if (pingInterval) clearInterval(pingInterval);
+        disconnectSource ??= 'write_failed';
         aborted.value = true;
       }
     }, PING_INTERVAL_MS);
@@ -156,7 +166,10 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     for (const ev of events) {
       for (const line of encoder.push(ev)) {
         if (committed) {
-          if (!aborted.value && !safeWrite(reply.raw, line)) aborted.value = true;
+          if (!aborted.value && !safeWrite(reply.raw, line)) {
+            disconnectSource ??= 'write_failed';
+            aborted.value = true;
+          }
         } else {
           buffered.push(line);
         }
@@ -234,10 +247,19 @@ export async function runOpenAiStream<E extends StreamEncoder>(
           }
           emit(sseEvents);
           if (!committed && !aborted.value && hasContent()) commit();
+          // 见 claude/stream-handler.ts 同位置:读得慢就等,别把背压当断连。
+          if (committed && !aborted.value) await awaitDrain(reply.raw);
         }
       }
     } catch (e) {
-      log.error({ msg: 'error reading response stream (openai)', error: String(e) });
+      if (graceDestroyed) {
+        log.info({
+          msg: 'openai upstream stream closed after drain grace expired',
+          error: String(e),
+        });
+      } else {
+        log.error({ msg: 'error reading response stream (openai)', error: String(e) });
+      }
     } finally {
       draining = false;
     }
@@ -272,11 +294,13 @@ export async function runOpenAiStream<E extends StreamEncoder>(
 
   const silentFailure = !hasContent();
   const logFields = {
+    model,
     output_tokens: ctx.outputTokens,
     input_tokens: ctx.contextInputTokens ?? ctx.inputTokens,
     stop_reason: ctx.stateManager.getStopReason(),
     committed,
     aborted: aborted.value,
+    disconnect_source: disconnectSource,
     empty_attempts: emptyAttempts,
     total_duration_ms: Date.now() - apiStart,
     stream_duration_ms: Date.now() - streamStart,

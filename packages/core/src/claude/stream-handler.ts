@@ -54,11 +54,13 @@ import { getRequestContext } from '../shared/request-context.js';
 import type { MessageHandlerResult } from './empty-capture.js';
 import { mapProviderError } from './error-mapper.js';
 import {
+  awaitDrain,
   createSseErrorEvent,
   type SseEvent,
   StreamContext,
   safeEnd,
   safeWrite,
+  sawBillableWork,
   selectEmptyUpstreamMessage,
   sseEventToString,
   upstreamErrorWire,
@@ -151,6 +153,14 @@ export async function handleStreamRequest(
   // for the full 720s axios timeout (which would exhaust the connection pool).
   let upstreamData: { destroy?: (err?: Error) => void } | undefined;
   let draining = false;
+  // Set when *we* destroyed the upstream socket because the drain grace expired.
+  // The read loop then throws ERR_STREAM_PREMATURE_CLOSE as a direct consequence
+  // of that call — an expected outcome, not an upstream fault. Without this flag
+  // the catch below reports it at error level: one bogus error per expiry.
+  let graceDestroyed = false;
+  // `aborted` 一旦置位就分不清是「客户端真的走了」还是「写失败」。两者的运维含义
+  // 完全不同(前者是客户端行为,后者是网关侧故障),故记下首次置位的来源。
+  let disconnectSource: 'client_close' | 'write_failed' | undefined;
 
   // Arm (or re-arm) the idle deadline for the post-disconnect drain. While the
   // upstream keeps producing chunks we extend it (so an actively-finishing
@@ -161,6 +171,7 @@ export async function handleStreamRequest(
     if (drainGraceTimer) clearTimeout(drainGraceTimer);
     drainGraceTimer = setTimeout(() => {
       log.warn({ msg: 'sse upstream drain grace expired after disconnect — destroying socket' });
+      graceDestroyed = true;
       try {
         upstreamData?.destroy?.();
       } catch {
@@ -174,6 +185,7 @@ export async function handleStreamRequest(
     if (!aborted.value && committed) {
       log.info({ msg: 'sse client disconnected' });
     }
+    disconnectSource ??= 'client_close';
     aborted.value = true;
     if (pingInterval) clearInterval(pingInterval);
     if (commitTimer) clearTimeout(commitTimer);
@@ -246,6 +258,7 @@ export async function handleStreamRequest(
     reply.raw.writeHead(200, sseHeaders);
     for (const event of buffered) {
       if (!safeWrite(reply.raw, sseEventToString(event))) {
+        disconnectSource ??= 'write_failed';
         aborted.value = true;
         break;
       }
@@ -255,6 +268,7 @@ export async function handleStreamRequest(
       if (!safeWrite(reply.raw, createPingSse())) {
         // Socket already gone: stop pinging and mark aborted so the loop exits
         if (pingInterval) clearInterval(pingInterval);
+        disconnectSource ??= 'write_failed';
         aborted.value = true;
       }
     }, PING_INTERVAL_MS);
@@ -262,6 +276,9 @@ export async function handleStreamRequest(
 
   const maxAttempts = 1 + Math.max(0, emptyStreamRetries);
   let emptyAttempts = 0;
+  // 本次空流已判定为**确定性**(截断 tool_use)。这类空流不再消耗重试预算,
+  // emptyAttempts 停在 1,单看次数会误选可重试文案 —— 故显式记标志。
+  let deterministicEmpty = false;
 
   // Pre-commit bounded retry loop. Each attempt is a fresh upstream call with a
   // fresh StreamContext/decoder/buffer. We only loop again when this attempt was
@@ -370,12 +387,18 @@ export async function handleStreamRequest(
               // Only forward while the client is still connected. After a
               // disconnect we keep draining (for Metering) but stop writing.
               if (!aborted.value && !safeWrite(reply.raw, sseEventToString(sseEvent))) {
+                disconnectSource ??= 'write_failed';
                 aborted.value = true;
               }
             } else {
               buffered.push(sseEvent);
             }
           }
+
+          // 客户端读得慢时等它跟上,**不要**把「缓冲满」当断连(见 safeWrite 红线)。
+          // 这里暂停读循环即对上游施加背压 —— 是正确行为(否则无界缓冲),awaitDrain
+          // 自带超时兜底,避免一个既不读也不关的客户端把上游连接拖到被回收。
+          if (committed && !aborted.value) await awaitDrain(reply.raw);
 
           // Commit on the first real content (text / tool_use / reasoning). The
           // buffered events (initial + this frame's) flush in order.
@@ -388,6 +411,10 @@ export async function handleStreamRequest(
       if (aborted.value && abortUpstreamOnDisconnect) {
         // 主动 abort 上游:客户端已走,读流被取消是预期内的,不是错误(省了 credit)。
         log.info({ msg: 'upstream stream aborted on client disconnect (credit saved)' });
+      } else if (graceDestroyed) {
+        // 是**我们自己**destroy 了 socket,读流抛错是该动作的必然结果而非上游故障;
+        // 与 grace 到期那条 warn 是同一事件的两半,不再单独记 error。
+        log.info({ msg: 'upstream stream closed after drain grace expired', error: String(e) });
       } else {
         log.error({ msg: 'error reading response stream', error: String(e) });
       }
@@ -402,19 +429,42 @@ export async function handleStreamRequest(
     }
 
     // Did this attempt produce billable content, OR a deterministic terminal
-    // (max_tokens / context-window-exceeded) that retrying cannot fix? Either
-    // way, stop — only transient empty streams are worth re-issuing. (Mirrors
-    // the non-stream silentFailure exclusions; without this a deterministic
-    // over-limit empty would burn `emptyStreamRetries` extra upstream calls.)
+    // (max_tokens / context-window-exceeded / 截断 tool_use) that retrying
+    // cannot fix? Either way, stop — only transient empty streams are worth
+    // re-issuing. (Mirrors the non-stream silentFailure exclusions; without
+    // this a deterministic empty would burn `emptyStreamRetries` extra calls.)
     const attemptStop = ctx.stateManager.getStopReason();
+    // 判空 + stop_reason==='tool_use' 等价于「上游宣告了 tool_use 却从未发出完整帧
+    // (isComplete=false)」= 截断 tool 帧。这是**内容绑定的确定性**失败:重发同一
+    // 请求,上游同样地再次截断(实测恢复率 0,每次重试白烧 credit)。与 max_tokens
+    // 同理,确定性终止不消耗重试预算。`!hasContent()` 是必要守卫 —— 有内容时同一
+    // stop_reason 是正常的工具调用,不能落进这个分支。
+    const truncatedToolUse = !hasContent() && attemptStop === 'tool_use';
+    // 上游显式 Error/Exception 帧。原先**一律**视为确定性终止、不重试,理由是「重试
+    // 白烧 credit」—— 但那个理由只在上游**已经开工**时成立。实测另有一类:上游 1ms
+    // 内零帧拒绝(event_counts 只有 `Exception:1`),没有任何 credit 可烧,重发几乎必然
+    // 恢复。故把排除条件收窄到「已开工」,判据用 sawBillableWork 而**不是**
+    // hasContent()(见其头注释:GPT 加密 reasoning 会让 hasContent() 谎报为空)。
+    const upstreamErrored = ctx.getPendingUpstreamError() !== undefined;
+    const deterministicUpstreamError = upstreamErrored && sawBillableWork(ctx.getEventCounts());
     if (
       hasContent() ||
       attemptStop === 'max_tokens' ||
       attemptStop === 'model_context_window_exceeded' ||
-      // 上游发来显式 Error/Exception 帧 = 确定性终止,不当空流重试(会白烧
-      // credit);由终结段的 getPendingUpstreamError() 明确报错。
-      ctx.getPendingUpstreamError() !== undefined
+      truncatedToolUse ||
+      deterministicUpstreamError
     ) {
+      if (truncatedToolUse) {
+        emptyAttempts++;
+        deterministicEmpty = true;
+        log.warn({
+          msg: 'upstream announced tool_use but never completed the frame — deterministic empty, not retrying',
+          attempt,
+          stop_reason: attemptStop,
+          event_counts: ctx.getEventCounts(),
+          tool_use_names: [...ctx.seenToolUseNames],
+        });
+      }
       break;
     }
 
@@ -427,6 +477,8 @@ export async function handleStreamRequest(
       msg: 'upstream returned empty stream, retrying',
       attempt,
       remaining: maxAttempts - attempt,
+      // 有值 = 这次重试是「上游零帧拒绝」而非纯空流,两者的上游成因不同,分开统计。
+      upstream_error: ctx.getPendingUpstreamError(),
       // 诊断线索:落到这里的「空」是 *截断* 的 tool 帧(宣告了 tool_use 但完整帧
       // 从未到达,isComplete=false)或纯零帧流——*完整* 的空参数 tool_use
       // (browser_snapshot 等)已算作内容、正常提交,不会到这。工具名便于定位。
@@ -449,6 +501,9 @@ export async function handleStreamRequest(
   const silentFailure = !hasContent();
 
   const logFields = {
+    // 事故排查经验:失败模式与 model 强相关(某些模型 0 事故、某些不是),但 model 只
+    // 出现在入口那条日志上,统计分布得跨行按 reqId join。放在这里让它一行可查。
+    model,
     output_tokens: ctx.outputTokens,
     input_tokens: ctx.contextInputTokens ?? ctx.inputTokens,
     stop_reason: ctx.stateManager.getStopReason(),
@@ -456,6 +511,9 @@ export async function handleStreamRequest(
     kiro_metering: ctx.kiroMeteringRaw,
     committed,
     aborted: aborted.value,
+    // 'client_close' = 客户端真的走了;'write_failed' = 写 socket 失败(存活判定见
+    // safeWrite)。别再只看 aborted 布尔 —— 两者的归因完全不同。
+    disconnect_source: disconnectSource,
     // 断连成本观测:客户端已断开(aborted)但网关仍 drain 到上游 EOF、拿到了计费
     // (output_tokens>0)。实测(kiro-cli, 2026-07)Kiro 对客户端 TCP 断开会停止生成
     // 计费,但网关当前 drain 维持了上游连接,使这部分仍被全额计费——此字段量化
@@ -524,7 +582,9 @@ export async function handleStreamRequest(
     // 重试预算耗尽仍每次都空 → 确定性空流:失败绑定在请求内容上,再让客户端
     // 「please retry」只会烧 credit(实测 33 次同请求全空)。文案改为提示
     // 压缩/裁剪会话——唯一有效的用户侧自救。单次尝试(retries=0)保留原文案。
-    const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts);
+    // deterministicEmpty:截断 tool_use 首次尝试即定案(不再重试),走同一套文案
+    // 而非退回「please retry」。
+    const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts, deterministicEmpty);
 
     // No billable content → no usage-finish hook (matches the historical empty
     // path). How we signal it depends on whether headers are already on the wire.

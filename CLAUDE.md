@@ -106,6 +106,8 @@ flowchart LR
 | `/api/*` 怎么剥 plugin 扩展 | `index.ts` 的 `/api/*` register 处 + `buildClaudeUsagePayload`(`claude/stream.ts`)|
 | 空流重试 / 判空 / 抓包 | 踩坑 #13:`stream-handler.ts` + `stream.ts`(`sawCompletedToolUse`)+ `empty-capture.ts` 头注释 |
 | 泄漏工具调用救援红线 | `claude/tool-call-text.ts` 头注释(踩坑 #14)|
+| SSE 写入为何不能看 `write()` 返回值 | 踩坑 #21 + `claude/stream.ts` 的 `safeWrite` / `awaitDrain` 头注释 |
+| 上游中途 Exception / mid-response 截断 | 踩坑 #22(判别子是 token/s,不是总时长)+ `logFields.disconnect_source` |
 | 怎么发版 / 版本号从哪来 | [CONTRIBUTING.md](./CONTRIBUTING.md)「版本与发布」+ `.releaserc.json`(semantic-release 全自动,唯一手动的是 plugin 契约版本)|
 
 ## 不可违反的规范
@@ -141,6 +143,14 @@ flowchart LR
 - 绝不把 `err.message` 或上游 body 拼进下游响应;只放进 `log.warn` 字段
 - 新增 mapper case **必须**加 leak-detection 断言
 
+### 日志(可观测性)
+
+部署形态是多容器同机 + 高频健康检查,日志既是排障依据也是磁盘成本。三条由 `test/static/` 静态守卫钉住:
+
+- **每请求只打一行**:`Fastify` 内置请求日志必须 `disableRequestLogging: true`,只留 `index.ts` 的 `onResponse` hook 那条(带 `reqId` / `method` / `url` / `duration_ms`)。两者并存会每请求三行、其中两行都叫 `request completed`——不只是体积,按 incoming/completed 配对做的分析会稳定算错。守卫 `request-log-single-line.test.ts`
+- **业务字段一律 snake_case**:框架自带的 `msg`/`err`/`level`/`time`/`reqId`/`statusCode` 除外。混用会逼运维为同一指标查两种拼写。守卫 `log-field-casing.test.ts`
+- **★ 网关自己造成的结果不记 `error`**:主动 `destroy()` socket、主动 abort 上游后读流抛错,都是那一行代码的必然结果而非上游故障。记成 error 会污染告警,且让人误判"上游在报错"(实测假 error 与自毁动作 1:1)。加标志位区分,降为 `info`;**真实**故障必须仍是 `error`——改这类豁免时**同时**写反向守卫用例
+
 ### 原生 reasoning 路径互斥
 
 - 走原生 reasoning 时**同时禁用**:请求侧 `<thinking_mode>` prompt 前缀注入、响应侧 `<thinking>` 标签扫描
@@ -173,7 +183,7 @@ flowchart LR
 10. **SIGTERM**:Docker 用 `tini` 作 PID 1,`forceCloseConnections: 'idle'` 是优雅关闭关键
 11. **core 不发 cachePoint**:`cache_control` / `cachePoint` 在 Kiro 被静默忽略,`convertTools` 只输出 `{toolSpecification}`;缓存红利由上游按相同 prefix / session 自动给,不靠请求侧 marker
 12. **convertTools 剥 tool-search marker**:client 的 tool-search 合成 marker 工具(无 `input_schema`)上送会 400;`isToolSearchTool()` 丢 marker、忽略 `defer_loading`,真实工具全量转发
-13. **空流有界重试**:上游偶发回「200 OK + 零内容帧」,客户端无法与真实过载区分,retry-executor 又看不到 2xx 的 event-stream body。**pre-commit**(未向客户端写任何字节)时对同一请求重发最多 `KIRO2CLAUDE_EMPTY_STREAM_RETRIES`(默认 2)次,已 commit 绝不重试。红线在 `stream-handler.ts`(重试循环)+ `stream.ts`(`sawCompletedToolUse` 判空两路对齐)+ `empty-capture.ts` 头注释;确定性空流用 `KIRO2CLAUDE_CAPTURE_EMPTY_DIR` 抓包定位,**别凭假设盲改 converter**
+13. **空流有界重试(只吸收*瞬时*空流)**:上游偶发回「200 OK + 零内容帧」,客户端无法与真实过载区分,retry-executor 又看不到 2xx 的 event-stream body。**pre-commit**(未向客户端写任何字节)时对同一请求重发最多 `KIRO2CLAUDE_EMPTY_STREAM_RETRIES`(默认 2)次,已 commit 绝不重试。★ **确定性空流一律单次定案、不消耗重试预算**——重发同一请求上游只会同样地再失败,每次白烧 credit。四类:`max_tokens` / `model_context_window_exceeded` / **截断 tool_use**(宣告了 tool_use 却无一帧 `isComplete`;实测重试恢复率 0)/ 上游显式 Error·Exception 帧**且上游已开工**。★ 最后一类的限定词是必须的:零帧拒绝(`event_counts` 只有 `Exception:1`,实测 1ms 内返回)没有任何 credit 可烧、重发几乎必然恢复,属于**瞬时**故障,走有界重试;只有上游**已经开工**才是确定性终止。判据必须用 `sawBillableWork()`(看上游发过哪些帧)而**不是** `hasContent()`——GPT 加密 reasoning 计费但不 surface(踩坑 #15),`hasContent()` 会把烧掉数千帧 reasoning 的流谎报为空,正好在最贵的失败上重发。与 retryable 分类**无关**(那个集合实测不完整:真实世界最常见的是泛化 `code:"error"`,不在集合里)。新增判空分支时**先问它是不是内容绑定的**,是就加进排除列表。文案同理:`selectEmptyUpstreamMessage` 的 `deterministic` 参数必须显式传,别靠 `emptyAttempts` 次数倒推(不重试时 attempts 停在 1,会误退回「please retry」把用户引向已知无效的路)。红线在 `stream-handler.ts`(重试循环)+ `non-stream-handler.ts`(对称判定)+ `stream.ts`(`sawCompletedToolUse` 判空两路对齐)+ `empty-capture.ts` 头注释;仍不明的确定性空流用 `KIRO2CLAUDE_CAPTURE_EMPTY_DIR` 抓包定位,**别凭假设盲改 converter**
 14. **工具调用文本泄漏(会历史自污染)**:上游解析偶发失败,工具调用块以纯文本掉进响应,留在会话历史会被模型模仿 → 同会话确定性复发。`KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE`(默认开)双向兜底:响应侧解析回真 tool_use、请求侧剥历史泄漏块让会话自愈。全部红线在 `claude/tool-call-text.ts` 头注释,**改前必读**;勿再引入「大文件分块写入」类 prompt 指令(已实测证伪、连同 `SYSTEM_CHUNKED_POLICY` 移除)
 15. **GPT-5.6 与 Claude 走完全相同的上游**:请求体逐字段相同,唯一差异是 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,**无需**新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload 是 `{redactedContent}`(加密、无 text/signature),`stream.ts` `processReasoningContent` 顶部 `if(!text&&!signature)return[]` 整块丢弃(否则开空 thinking 块);`metadataEvent{stopReason}` 故意落 `Unknown`、由网关自行推断(工具调用时 `tool_use` 比上游 `END_TURN` 准),**保持现状**
 16. **OpenAI `prompt_tokens` ≠ Claude `input_tokens`**:`buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage **必须**直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、**绕过** `buildClaudeUsagePayload`;计费 hook 仍照跑,首版只出标准三字段、不含 `kiro_*` 扩展
@@ -181,6 +191,8 @@ flowchart LR
 18. **GPT 反演走 credit 锚定,不做 token 级分解**:本地 kiro-cli 实测 —— ① GPT 无 prompt-cache 经济学 —— 多档对照实测(固定大前缀重发 10k/50k/100k tokens):Claude 稳定降 ~47%、GPT 全系列(sol/terra/luna)降 0%(sol credits 逐字节相同);缺口在 Kiro 计费层不传导 GPT 缓存折扣、非模型能力(官方 GPT-5.6 有 caching)→ `cache_read`/`cache_creation` 恒 0、input 全量计入;② output 含加密 reasoning(计费但不进可见 `output_tokens`,见踩坑 #15),量因任务而异且不可观测——零-reasoning 复制任务 output 侧 ≈10 credit/USD,而高-reasoning 任务同等可见 token 下 credits 高 ~47%,`(input,visibleOut,credits)` 欠定 → 无法反解「公开价等效成本」。故 GPT 成本锚定唯一可靠真值 `credits×0.04`(× multiplier),走 `deriveKiroUsage` 顶部 `isGptModel` 专属分支(status `gpt_credit_anchored`)。**绝不要给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`**:偏高的 credits 会被标准反演误推成虚高 `tEffIn` → step3 把 input 误拆成 `cache_creation`(分流必须在价格表查询**前**)。红线在 `gptCreditAnchoredBreakdown` 头注释
 19. **tool description cap 防单工具吞 context**:Kiro 对**单个** description 无字符硬上限(单个即便极大上游仍照收),真限制是 **context window**(多 tool + history + system 总量撑爆窗口报 400 "Context window is full",足够多的超大工具叠加即可触发)。`KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN`(默认 32768=32K)截住畸形超大 description 独吞 context——覆盖已知最大合法工具 Workflow 且留有充足余量;旧硬编码上限过度保守、静默截断合法工具。真相源 `converter.ts` `convertTools` + config-schema;cap 只管单工具,总量保护交给 Kiro 的 context-window 400。
 20. **断连计费:默认 drain 如实计费,abort 省 credit 但记账偏低**:客户端断连后网关默认 drain 上游到 EOF 拿尾帧 Metering **如实计费**(`stream-handler.ts` 断连仍维持上游连接 → Kiro 生成完 → 全额计费)。实测 Kiro 对 TCP 断即停生成计费,故 `KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT`(默认 false)开启后断连**主动 abort 上游**(signal 经 provider→retry-executor `axiosConfig` 透传)省下断连点之后的 credit;**代价**是拿不到 Metering、per-request 记账偏低(若按 metering 向下游计费会少记)。仅 Claude 端 stream;`logFields.drained_after_disconnect` 观测「断连后仍付费」。
+21. **★ `stream.write()` 的返回值是流控信号,不是存活信号**:`false` = 内部缓冲超过 highWaterMark、**应等 `'drain'` 再写**,socket 完全健康。`safeWrite` 曾直接 `return raw.write(chunk)`,于是全部调用点把「缓冲满」读成「客户端断连」——读循环停止向**活着的**客户端转发、终结段(`if (committed && !aborted.value)`)连 `message_stop` 都丢掉、上游仍 drain 到 EOF **全额计费**、日志还把责任记给客户端。而缓冲只会被**大量字节**填满,所以这个误判精确地咬住最长最贵的那批响应(实测被误判流 `output_tokens` 中位数比真断连高一个量级、**无一例短于 2 分钟**,而真断连中位数只有 3 秒——**字节量驱动 vs 时间驱动**是排除「用户 Ctrl-B/Ctrl-C 取消」这个混淆项的判别子)。红线:存活只看 `destroyed`/`writableEnded`/write 抛错;背压走 `awaitDrain`(带 `close`+超时兜底,避免既不读也不关的客户端把上游拖到被回收)。`disconnect_source` 区分 `client_close` 与 `write_failed`,**别退回单一 `aborted` 布尔**。守卫 `test/claude/backpressure.test.ts`(含反向守卫:真 EPIPE 仍须判断连)+ `test/static/sse-backpressure-contract.test.ts`(钉住两个 transport 不脱同步)
+22. **上游杀的是*卡住*的流,不是跑得久的流**:上游偶发在生成中途发来泛化 `Exception`(`code:"error"` / "…please try again"、**无** `ContextUsage`+`Metering` 尾帧 = 真的中途死掉),已 commit 时只能转成 in-band `error`,客户端显示为 mid-response 截断。判别子是**产出速率**:健康流 token/s 中位数约 32、失败流约 2.5(`token/s<2` 占比 0.6% vs 42.6%);持续产出的流能跑过 600s,静止的流在约 150s / 260s 被上游回收(零内容例出现时长几乎逐毫秒重复 = 硬超时签名)。**排查这类问题先算 token/s,别看总时长**——按时长分桶会得出「260s 死线」的错误结论。网关侧无治本手段(上游行为);post-commit 后 SSE 协议上也无法重试或改状态码。缓解方向见 `stream-handler.ts` 的 `armDrainGrace`(目前只在**已断连**时武装,连接中的 idle 无上界,只受 axios 720s 约束)。
 
 ## 测试
 
