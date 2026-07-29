@@ -22,13 +22,28 @@ import { logger } from '../shared/logger.js';
 import { reloadKiroClientProfile } from './client-profile.js';
 import { cleanKiroCliEnv } from './subprocess-env.js';
 
-/** 查找 `scripts/capture-kiro-cli.sh`，相对本文件位置（src/ 或 dist/） */
+/** 从本文件所在目录向上找 `scripts/capture-kiro-cli.sh` 的最大层数 */
+const CAPTURE_SCRIPT_LOOKUP_MAX_DEPTH = 6;
+
+/**
+ * 查找 `scripts/capture-kiro-cli.sh`，相对本文件位置**逐级向上**。
+ *
+ * 不能用固定层数：`scripts/` 始终在仓库根/镜像根，但本文件到那个根的距离
+ * 随布局变化——镜像里是 `/app/dist/kiro/`（2 级），monorepo 开发和本地构建
+ * 产物是 `packages/core/{src,dist}/kiro/`（4 级，根在仓库根而非 packages/core）。
+ * 固定 `'..','..'` 只在镜像里命中，本地跑 `node packages/core/dist/index.js`
+ * 会静默落到 packages/core/scripts（不存在）→ auto-capture 永远失败。
+ */
 function findCaptureScript(): string | undefined {
   try {
-    const here = fileURLToPath(import.meta.url);
-    const root = path.resolve(path.dirname(here), '..', '..');
-    const candidate = path.join(root, 'scripts', 'capture-kiro-cli.sh');
-    if (fs.existsSync(candidate)) return candidate;
+    let dir = path.dirname(fileURLToPath(import.meta.url));
+    for (let depth = 0; depth < CAPTURE_SCRIPT_LOOKUP_MAX_DEPTH; depth++) {
+      const candidate = path.join(dir, 'scripts', 'capture-kiro-cli.sh');
+      if (fs.existsSync(candidate)) return candidate;
+      const parent = path.dirname(dir);
+      if (parent === dir) break; // 已到文件系统根
+      dir = parent;
+    }
   } catch {
     // import.meta.url 在某些测试环境下不可用
   }
