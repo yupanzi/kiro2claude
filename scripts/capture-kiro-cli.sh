@@ -106,7 +106,8 @@ trap 'cleanup' EXIT INT TERM
 
 CAPTURE_FILE="$WORKDIR/raw.json"
 SERVER_PID=""
-# 实际成功设置的 endpoint key（cleanup 据此精确还原，避免删未设置的 key）。
+# 实际成功设置的 endpoint key（cleanup 据此只删自己设过的，不碰未设置的 key）。
+# 注意是 delete 而非恢复原值——脚本不保存原值，原本配过自定义 endpoint 的会丢。
 # 顶部声明，保证 trap 在脚本任意早期失败时引用都安全（set -u 下空数组也合法）。
 declare -a SET_KEYS=()
 
@@ -116,7 +117,7 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   if [[ "${#SET_KEYS[@]}" -gt 0 ]]; then
-    echo "→ 恢复 kiro-cli 设置 (删除 endpoint 覆盖)"
+    echo "→ 清理 kiro-cli 设置 (删除本次注入的 endpoint 覆盖)"
     for k in "${SET_KEYS[@]}"; do
       "$KIRO2CLAUDE_CLI_BIN" settings --delete "$k" >/dev/null 2>&1 || true
     done

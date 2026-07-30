@@ -24,7 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { logger } from '../shared/logger.js';
-import { expandTilde } from '../shared/paths.js';
+import { expandTilde, findUpwards } from '../shared/paths.js';
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -228,23 +228,15 @@ function parseCaptured(raw: unknown): KiroClientProfile {
 }
 
 function resolveDefaultFixturePath(): string | undefined {
-  // 单 repo 时代 fixtures/ 在 `../../fixtures`；workspace 化后 fixtures/ 仍在
-  // 仓库根（`packages/` 的上层），需要沿父目录向上找。生产态
-  // (`dist/kiro/client-profile.js`) 同样适用——容器里 fixtures/ 紧挨 dist/ 一层。
+  // fixtures/ 在仓库根（`packages/` 的上层），容器里紧挨 dist/ 一层——
+  // 距离随布局变化，见 `shared/paths.ts` 的 `findUpwards()`。
   try {
-    const here = fileURLToPath(import.meta.url);
-    let dir = path.dirname(here);
-    for (let i = 0; i < 8; i++) {
-      const candidate = path.join(dir, 'fixtures', 'kiro-cli-profile.json');
-      if (fs.existsSync(candidate)) return candidate;
-      const parent = path.dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
+    const from = path.dirname(fileURLToPath(import.meta.url));
+    return findUpwards(from, path.join('fixtures', 'kiro-cli-profile.json')).hit?.path;
   } catch {
     // import.meta.url 在某些测试环境下不可用
+    return undefined;
   }
-  return undefined;
 }
 
 let cached: KiroClientProfile | undefined;

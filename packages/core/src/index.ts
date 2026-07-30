@@ -8,7 +8,6 @@
  * （Builder ID 或 IAM Identity Center，详见
  * <https://kiro.dev/docs/cli/authentication/>）。
  */
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -31,6 +30,7 @@ import { registerHealthRoutes } from './routes/health.js';
 import { registerKiroRoutes } from './routes/kiro.js';
 import { registerOpenAiRoutes } from './routes/openai.js';
 import { getLogger, logger } from './shared/logger.js';
+import { findUpwards } from './shared/paths.js';
 import {
   generateReqId,
   getRequestContext,
@@ -43,15 +43,11 @@ import { initCountTokensConfig } from './token.js';
  * first-party plugins (metering, derived) are ordinary dependencies of core, so
  * they resolve from node_modules exactly like third-party npm plugins.
  *
- * Must work across layouts whose nesting depth differs, so a fixed `'..','..'`
- * from cwd cannot serve all (cwd is also user-mountable, e.g. the container's
- * WORKDIR=/data):
- *   - dev:        <repo>/packages/core/{src,dist}/index → node_modules under packages/core
- *   - container:  /app/dist/index.js                    → root=/app
- *
- * Strategy: derive candidate roots from THIS module's location (stable, not the
- * mountable cwd), then pick the first that actually holds a node_modules/.
- * `KIRO2CLAUDE_PLUGIN_ROOT` overrides everything; the cwd-based legacy path is a
+ * Anchored on THIS module's location, never cwd — cwd is user-mountable (the
+ * container's WORKDIR=/data). Nesting depth differs per layout (dev:
+ * packages/core/{src,dist} → node_modules under packages/core; container:
+ * /app/dist → /app), so the walk-up in shared/paths.ts does the work.
+ * `KIRO2CLAUDE_PLUGIN_ROOT` overrides everything; the cwd-based path is a
  * last-resort fallback for test envs where import.meta.url is unavailable.
  */
 function resolvePluginRoot(env: NodeJS.ProcessEnv): string {
@@ -59,17 +55,10 @@ function resolvePluginRoot(env: NodeJS.ProcessEnv): string {
     return path.resolve(env.KIRO2CLAUDE_PLUGIN_ROOT);
   }
   try {
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    // dev needs up-1..up-3 (packages/core/{src,dist} → repo); container needs
-    // up-1 (/app/dist → /app). Probe each depth for a node_modules/.
-    const candidates = [
-      path.resolve(dir, '..'),
-      path.resolve(dir, '..', '..'),
-      path.resolve(dir, '..', '..', '..'),
-    ];
-    for (const c of candidates) {
-      if (fs.existsSync(path.join(c, 'node_modules'))) return c;
-    }
+    const from = path.dirname(fileURLToPath(import.meta.url));
+    // marker semantics: we want the ancestor that HOLDS node_modules, not the path to it
+    const { hit } = findUpwards(from, 'node_modules');
+    if (hit) return hit.dir;
   } catch {
     // import.meta.url unavailable in some test environments — fall through.
   }

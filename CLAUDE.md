@@ -110,6 +110,8 @@ flowchart LR
 | SSE 写入为何不能看 `write()` 返回值 | 踩坑「write 背压不是断连」 + `claude/stream.ts` 的 `safeWrite` / `awaitDrain` 头注释 |
 | 上游中途 Exception / mid-response 截断 | 踩坑「上游杀卡住的流」(判别子是 token/s,不是总时长)+ `logFields.disconnect_source` |
 | 怎么发版 / 版本号从哪来 | [CONTRIBUTING.md](./CONTRIBUTING.md)「版本与发布」+ `.releaserc.json`(semantic-release 全自动,唯一手动的是 plugin 契约版本)|
+| commit message 写多长 / 哪些字段不能写进历史 | [CONTRIBUTING.md](./CONTRIBUTING.md)「提交规范」的「篇幅」+「脱敏」两节 + `.gitmessage` 模板 |
+| kiro-cli fixture 怎么升版本 | 跑 `scripts/capture-kiro-cli.sh`(头注释 = 前置条件与副作用)→ commit `fixtures/`;版本号由 `.releaserc.json` 的 `publishCmd` 用 `jq` 从 fixture 派生,故须走能触发发版的 commit type |
 
 ## 不可违反的规范
 
@@ -145,6 +147,7 @@ flowchart LR
 - 日志可用 `upstream` / `Kiro` 等运维词;响应 body 只说 `service`
 - 绝不把 `err.message` 或上游 body 拼进下游响应;只放进 `log.warn` 字段
 - 新增 mapper case **必须**加 leak-detection 断言
+- 同一条底线也管**提交历史**(commit message / PR 描述 / 贴进仓库的日志):它永久公开、`rebase` 改不掉已推送的副本。禁写字段清单与中性替代写法见 [CONTRIBUTING.md](./CONTRIBUTING.md)「提交规范」的「脱敏」节,别在这里复述
 
 ### 日志(可观测性)
 

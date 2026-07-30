@@ -50,6 +50,30 @@ docs: 补充 plugin 加载顺序说明
 
 `pnpm install` 后会自动启用 `.gitmessage` 模板(执行 `git commit` 不带 `-m` 时弹出引导)。
 
+### 篇幅
+
+commitlint 只卡标题 120 字符,正文长度靠惯例——仓库历史正文中位数 **6 行**,最长 13 行。
+
+- **正文可选,写就控制在 8 行内**。写不下说明该拆提交。
+- 只答「为什么这么改」「不这么改会怎样」。**不复述 diff**:改了哪些文件、加了哪些函数,`git show` 自己会说。
+- 分点分的是**决策**(为什么选 A 不选 B、哪条红线不能碰),不是文件清单或验证流水账。
+
+### 脱敏
+
+提交信息进公开仓库、CHANGELOG 和 Release,永久可检索,已 push 的靠 `rebase` 改不掉(镜像、fork、CI 缓存都留副本)。与「响应文案中性化」同一条底线,管的是提交历史、PR 描述和贴进仓库的日志。
+
+**禁写**:AWS account ID / 完整 `profileArn` / SSO start URL / 租户域名 / 邮箱 / 系统用户名 / token / API key(哪怕已失效)/ 本机绝对路径 / 真实上游 host。
+
+**中性替代**,信息量不减:
+
+| 别写 | 改写成 |
+|---|---|
+| `profileArn 为 arn:aws:codewhisperer:…:123456789012:profile/ABCDEF` | `profileArn 已脱敏为占位符` |
+| `在 /Users/alice/repo 跑 node packages/core/dist/index.js` | `本地跑构建产物入口` |
+| `打到 runtime.us-east-1.example.com 就 502` | `打到上游 streaming endpoint 就 502` |
+
+现成参照是 `fixtures/kiro-cli-profile.json`:`profileArn` 落成 `000000000000:profile/REDACTED`、`clientId` 落成全零 UUID。
+
 ## 版本与发布
 
 版本发布**全自动**,由 [semantic-release](https://semantic-release.gitbook.io/) 驱动——维护者**无需**手动改版本号或打 tag。每次 push 到 `master`,`.github/workflows/release.yml` 会:

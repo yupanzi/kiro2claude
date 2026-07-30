@@ -19,35 +19,31 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { logger } from '../shared/logger.js';
+import { findUpwards } from '../shared/paths.js';
 import { reloadKiroClientProfile } from './client-profile.js';
 import { cleanKiroCliEnv } from './subprocess-env.js';
 
-/** 从本文件所在目录向上找 `scripts/capture-kiro-cli.sh` 的最大层数 */
-const CAPTURE_SCRIPT_LOOKUP_MAX_DEPTH = 6;
+interface CaptureScriptLookup {
+  /** 命中的脚本绝对路径；`undefined` = 没找到 */
+  script?: string;
+  /** 探过的候选，找不到时进 warn；空数组 = `import.meta.url` 不可用 */
+  probed: string[];
+}
 
 /**
- * 查找 `scripts/capture-kiro-cli.sh`，相对本文件位置**逐级向上**。
- *
- * 不能用固定层数：`scripts/` 始终在仓库根/镜像根，但本文件到那个根的距离
- * 随布局变化——镜像里是 `/app/dist/kiro/`（2 级），monorepo 开发和本地构建
- * 产物是 `packages/core/{src,dist}/kiro/`（4 级，根在仓库根而非 packages/core）。
- * 固定 `'..','..'` 只在镜像里命中，本地跑 `node packages/core/dist/index.js`
- * 会静默落到 packages/core/scripts（不存在）→ auto-capture 永远失败。
+ * 查找 `scripts/capture-kiro-cli.sh`，相对本文件位置逐级向上。走查算法与理由见
+ * `shared/paths.ts` 的 `findUpwards()`；同款调用还有 `client-profile.ts` 的
+ * `resolveDefaultFixturePath()` 与 `index.ts` 的 `resolvePluginRoot()`。
  */
-function findCaptureScript(): string | undefined {
+function findCaptureScript(): CaptureScriptLookup {
   try {
-    let dir = path.dirname(fileURLToPath(import.meta.url));
-    for (let depth = 0; depth < CAPTURE_SCRIPT_LOOKUP_MAX_DEPTH; depth++) {
-      const candidate = path.join(dir, 'scripts', 'capture-kiro-cli.sh');
-      if (fs.existsSync(candidate)) return candidate;
-      const parent = path.dirname(dir);
-      if (parent === dir) break; // 已到文件系统根
-      dir = parent;
-    }
+    const from = path.dirname(fileURLToPath(import.meta.url));
+    const { hit, probed } = findUpwards(from, path.join('scripts', 'capture-kiro-cli.sh'));
+    return { script: hit?.path, probed };
   } catch {
     // import.meta.url 在某些测试环境下不可用
+    return { probed: [] };
   }
-  return undefined;
 }
 
 export interface AutoCaptureOptions {
@@ -59,25 +55,45 @@ export interface AutoCaptureOptions {
   timeoutMs?: number;
 }
 
-/**
- * 执行启动期 auto-capture。无论成功与否都返回一个可读的结果，调用方
- * （`src/index.ts`）据此打 info/warn，从不抛异常阻塞启动。
- */
-export function runStartupAutoCapture(options: AutoCaptureOptions): {
+export interface AutoCaptureResult {
   status: 'disabled' | 'success' | 'failed';
   message: string;
   profilePath?: string;
-} {
+}
+
+/**
+ * 执行启动期 auto-capture，返回可读结果供 `index.ts` 打 info/warn。
+ *
+ * ★ 「从不抛异常」靠这里的 try/catch 兜实，不是靠内部每步恰好不抛：`spawnSync`
+ * 参数非法时会**抛**而非落进 `result.error`，而 `index.ts` 调用处没有 try/catch，
+ * 穿透一次就是整个网关启动失败——而它刷新的只是一份可选 profile，失败退回
+ * fixture / FALLBACK 完全够用。反向守卫见 `test/kiro/auto-capture.test.ts`。
+ */
+export function runStartupAutoCapture(options: AutoCaptureOptions): AutoCaptureResult {
   if (!options.enabled) {
     return { status: 'disabled', message: 'KIRO2CLAUDE_AUTO_CAPTURE_PROFILE 未启用' };
   }
+  try {
+    return runCapture(options);
+  } catch (e) {
+    return {
+      status: 'failed',
+      message: `auto-capture 意外失败: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
 
+/** `runStartupAutoCapture` 的主体。允许抛——由上面那层统一兜成 `failed`。 */
+function runCapture(options: AutoCaptureOptions): AutoCaptureResult {
   const bin = options.kiroCliBin ?? 'kiro-cli';
-  const script = findCaptureScript();
+  const { script, probed } = findCaptureScript();
   if (!script) {
     return {
       status: 'failed',
-      message: '未找到 scripts/capture-kiro-cli.sh（项目布局被改动？）',
+      message:
+        probed.length === 0
+          ? '未找到 scripts/capture-kiro-cli.sh（无法定位本模块位置）'
+          : `未找到 scripts/capture-kiro-cli.sh（项目布局被改动？）已逐级向上探 ${probed.length} 层: ${probed.join(' | ')}`,
     };
   }
 
