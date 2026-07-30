@@ -1,3 +1,10 @@
+## [1.4.2](https://github.com/yupanzi/kiro2claude/compare/v1.4.1...v1.4.2) (2026-07-30)
+
+
+### Bug Fixes
+
+* **core:** 上游 5xx 容量不足改判可重试 503 ([88af8a4](https://github.com/yupanzi/kiro2claude/commit/88af8a4940efb8862a2db528129e59f2f2193e20))
+
 ## [1.4.1](https://github.com/yupanzi/kiro2claude/compare/v1.4.0...v1.4.1) (2026-07-28)
 
 
