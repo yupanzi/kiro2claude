@@ -1,3 +1,10 @@
+## [1.4.4](https://github.com/yupanzi/kiro2claude/compare/v1.4.3...v1.4.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* **kiro:** 升 kiro-cli fixture 到 2.15.2，统一向上走查 ([2a63eb1](https://github.com/yupanzi/kiro2claude/commit/2a63eb1236c61f4347a48f6a1e788302a7d4a841))
+
 ## [1.4.3](https://github.com/yupanzi/kiro2claude/compare/v1.4.2...v1.4.3) (2026-07-30)
 
 
