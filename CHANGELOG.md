@@ -1,3 +1,10 @@
+## [1.4.3](https://github.com/yupanzi/kiro2claude/compare/v1.4.2...v1.4.3) (2026-07-30)
+
+
+### Bug Fixes
+
+* **kiro:** auto-capture 逐级向上查找 capture 脚本 ([8acf3f6](https://github.com/yupanzi/kiro2claude/commit/8acf3f68713b5283e58e57aac58c392c72d795ae))
+
 ## [1.4.2](https://github.com/yupanzi/kiro2claude/compare/v1.4.1...v1.4.2) (2026-07-30)
 
 
