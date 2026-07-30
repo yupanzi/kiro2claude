@@ -5,7 +5,7 @@
  * 的输入总量,completionTokens = 估算输出),**不**经 buildClaudeUsagePayload
  * (避免 derived 插件的 input_tokens override 污染 prompt_tokens)。plugin 的
  * `addExtension` 扩展(kiro_metering 等)经 `extensions` 参内嵌进 usage——只搬扩展、
- * 不套 override,故 prompt_tokens 语义不受影响(踩坑 #16)。extensions 由 handler 经
+ * 不套 override,故 prompt_tokens 语义不受影响(踩坑「OpenAI prompt_tokens」)。extensions 由 handler 经
  * resolvePluginUsageExtensions 解析(镜像端点 stripPluginUsage 时为 undefined)。
  */
 

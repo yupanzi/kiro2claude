@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-把 kiro-cli(Kiro 后端)包装成 **Claude + OpenAI 双协议代理**。Claude 全系 + GPT-5.6(Sol / Terra / Luna);GPT 与 Claude 走**完全相同**的上游、两个协议端点都可用(踩坑 #15)。**MIT**:core 管 HTTP 直发 + plugin 加载;两个内置插件(`metering` 计量、`derived` credit 反演)默认启用,与第三方插件一样只经 [`@kiro2claude/plugin-api`](./packages/plugin-api/) 契约接入。
+把 kiro-cli(Kiro 后端)包装成 **Claude + OpenAI 双协议代理**。Claude 全系 + GPT-5.6(Sol / Terra / Luna);GPT 与 Claude 走**完全相同**的上游、两个协议端点都可用(踩坑「GPT 完全相同上游」)。**MIT**:core 管 HTTP 直发 + plugin 加载;两个内置插件(`metering` 计量、`derived` credit 反演)默认启用,与第三方插件一样只经 [`@kiro2claude/plugin-api`](./packages/plugin-api/) 契约接入。
 
 **运行时**:Node ≥ 22 / TypeScript / ES Modules NodeNext / Fastify / pnpm workspace。
 
@@ -47,12 +47,12 @@ packages/core/src/
 └── claude/             下游兼容层(HTTP 直发)
     ├── handlers.ts           路由 handler 薄胶水,分发到专职模块
     ├── converter.ts          Claude→Kiro 请求;mapModel / system + thinking + 身份覆写注入
-    ├── stream-handler.ts     流式 handler;deferred commit + 空流有界重试(踩坑 #13)
+    ├── stream-handler.ts     流式 handler;deferred commit + 空流有界重试(见「流式」组)
     ├── non-stream-handler.ts 非流式 handler;判空/重试镜像
     ├── non-stream-reduce.ts  reduceKiroResponse:bytes→归约;claude & openai 非流式共用的纯函数
     ├── stream.ts             SSE 状态机;finish 调 hookBus;buildClaudeUsagePayload = Claude usage 唯一组装点
     ├── empty-capture.ts      空流类型 + 诊断抓包(KIRO2CLAUDE_CAPTURE_EMPTY_DIR)
-    ├── tool-call-text.ts     泄漏工具调用的检测/救援/剥除;★ 头注释 = 全部红线(踩坑 #14)
+    ├── tool-call-text.ts     泄漏工具调用的检测/救援/剥除;★ 头注释 = 全部红线(踩坑「工具调用文本泄漏」)
     ├── error-mapper.ts       classifyProviderError(状态/文案/Retry-After 真相源)+ mapProviderError
     ├── models-catalog.ts     静态模型列表(含 GPT-5.6)
     └── schemas/ · request-validator.ts · websearch.ts · types.ts · converter/ · stream/
@@ -60,15 +60,15 @@ packages/core/src/
 openai/                 OpenAI 兼容层(下游;import claude/kiro/shared,不被反向依赖)。两个协议:
                         Chat Completions + Responses(Codex)。语义核心复用 claude(StreamContext +
                         reduceKiroResponse + provider),仅协议翻译是 OpenAI 特有。
-├── stream-transport.ts     chat+responses 共用流式脚手架(复制自 claude,隔离坑 #13)
+├── stream-transport.ts     chat+responses 共用流式脚手架(复制自 claude,隔离坑「空流有界重试」)
 ├── non-stream-transport.ts chat+responses 共用非流式(reduceKiroResponse + 计费 hook)
 ├── converter.ts            Chat 请求 → MessagesRequest;mapReasoningEffort / parseDataUri 两端共用
 ├── response-stream.ts      SseEvent → chat.completion.chunk
-├── response-nonstream.ts   归约结果 → chat.completion + buildOpenAiUsage(读原始 token,踩坑 #16)
+├── response-nonstream.ts   归约结果 → chat.completion + buildOpenAiUsage(读原始 token,踩坑「OpenAI prompt_tokens」)
 ├── stream-handler.ts · non-stream-handler.ts · handlers.ts · error-mapper.ts · models-catalog.ts
 └── responses/          OpenAI Responses API(Codex 走这;wire_api=responses)
     ├── converter.ts        Responses 请求(input items / instructions / 扁平 tools)→ MessagesRequest
-    ├── response-stream.ts  SseEvent → 严格语义事件序列(踩坑 #17);Claude thinking → reasoning item
+    ├── response-stream.ts  SseEvent → 严格语义事件序列(踩坑「Codex 只说 Responses」);Claude thinking → reasoning item
     ├── response-nonstream.ts  归约结果 → Response 对象(含 reasoning item)
     └── stream-handler.ts · non-stream-handler.ts · handlers.ts · types.ts
 ```
@@ -95,19 +95,20 @@ flowchart LR
 | context window 大小 | `getContextWindowSize()` in `converter.ts`(GPT-5.6 = 272K)|
 | effort 阈值映射 | `mapThinkingToEffort()`;OpenAI `reasoning_effort` 见 `openai/converter.ts`(minimal→low,其余透传)|
 | OpenAI 端点 / 请求响应翻译 | `packages/core/src/openai/`;路由 `routes/openai.ts`,挂载见 `index.ts` |
-| OpenAI Responses / Codex 接入 | `openai/responses/`;harness `tools/codex/`;红线见踩坑 #17 |
-| OpenAI 如何复用 Claude 语义 | `openai/` 复用 `StreamContext` + `reduceKiroResponse`;usage **不**经 `buildClaudeUsagePayload`(踩坑 #16)|
-| Responses 如何 surface reasoning | Claude thinking → `reasoning` output item(summary 通道);GPT 加密 reasoning 不产;signature 丢弃(踩坑 #17)|
+| OpenAI Responses / Codex 接入 | `openai/responses/`;harness `tools/codex/`;红线见踩坑「Codex 只说 Responses」 |
+| OpenAI 如何复用 Claude 语义 | `openai/` 复用 `StreamContext` + `reduceKiroResponse`;usage **不**经 `buildClaudeUsagePayload`(踩坑「OpenAI prompt_tokens」)|
+| Responses 如何 surface reasoning | Claude thinking → `reasoning` output item(summary 通道);GPT 加密 reasoning 不产;signature 丢弃(踩坑「Codex 只说 Responses」)|
 | 身份覆写文案 / 开关 | `IDENTITY_OVERRIDE_DIRECTIVE` in `converter.ts` + `KIRO2CLAUDE_IDENTITY_OVERRIDE`(默认开)|
 | 上游 status → 下游 status | `claude/error-mapper.ts` + `shared/upstream-status.ts` |
+| 上游"容量不足"三种形态各自出什么下游状态 | `MODEL_CAPACITY_REASONS` 头注释(`kiro/provider-error.ts`)= 三形态 + 判别顺序;施加点与红线见「错误流转」+ 踩坑「跨模型对照」 |
 | kiro-cli 伪装 wire 字段 / 期望版本 | `fixtures/kiro-cli-profile.json` + `kiro/client-profile.ts` FALLBACK_PROFILE |
 | `usage` 字段如何被 plugin 注入 | plugin 用 `event.addExtension(...)` / `event.overrideStandardField(...)`;core 不输出特定 plugin 字段 |
-| GPT 反演为何 credit 锚定(不做 token 分解)| `plugin-derived/src/derive.ts` `gptCreditAnchoredBreakdown` + 踩坑 #18 |
+| GPT 反演为何 credit 锚定(不做 token 分解)| `plugin-derived/src/derive.ts` `gptCreditAnchoredBreakdown` + 踩坑「GPT credit 锚定」 |
 | `/api/*` 怎么剥 plugin 扩展 | `index.ts` 的 `/api/*` register 处 + `buildClaudeUsagePayload`(`claude/stream.ts`)|
-| 空流重试 / 判空 / 抓包 | 踩坑 #13:`stream-handler.ts` + `stream.ts`(`sawCompletedToolUse`)+ `empty-capture.ts` 头注释 |
-| 泄漏工具调用救援红线 | `claude/tool-call-text.ts` 头注释(踩坑 #14)|
-| SSE 写入为何不能看 `write()` 返回值 | 踩坑 #21 + `claude/stream.ts` 的 `safeWrite` / `awaitDrain` 头注释 |
-| 上游中途 Exception / mid-response 截断 | 踩坑 #22(判别子是 token/s,不是总时长)+ `logFields.disconnect_source` |
+| 空流重试 / 判空 / 抓包 | 踩坑「空流有界重试」:`stream-handler.ts` + `stream.ts`(`sawCompletedToolUse`)+ `empty-capture.ts` 头注释 |
+| 泄漏工具调用救援红线 | `claude/tool-call-text.ts` 头注释(踩坑「工具调用文本泄漏」)|
+| SSE 写入为何不能看 `write()` 返回值 | 踩坑「write 背压不是断连」 + `claude/stream.ts` 的 `safeWrite` / `awaitDrain` 头注释 |
+| 上游中途 Exception / mid-response 截断 | 踩坑「上游杀卡住的流」(判别子是 token/s,不是总时长)+ `logFields.disconnect_source` |
 | 怎么发版 / 版本号从哪来 | [CONTRIBUTING.md](./CONTRIBUTING.md)「版本与发布」+ `.releaserc.json`(semantic-release 全自动,唯一手动的是 plugin 契约版本)|
 
 ## 不可违反的规范
@@ -134,8 +135,10 @@ flowchart LR
 ### 错误流转
 
 - 上游非 2xx → 抛 `KiroHttpError(status, msg)`(定义在 `kiro/token-manager.ts`)
-- `ProviderErrorKind` 是 discriminated union,新增 variant 时 tsc 强制穷尽
+- `ProviderErrorKind` 是 discriminated union,新增 variant 时 tsc 强制穷尽。两种机制并存,都是**编译错误**、都不是静默兜底,按依赖方向选:`claude/error-mapper.ts` 的 switch 用 `default: return assertNever(err.kind)`(导出自 `claude/stream.ts`,`non-stream-reduce.ts` 同用;报 TS2345 并**点名**漏掉的 variant);`kiro/provider-error.ts` 的 `defaultMessage` 只能靠**结构**穷尽(switch 就是整个函数体、无兜底 `return` → 漏 variant 即 TS2366),因为 `kiro/` 不能 import `claude/`
 - 408/429/503/504 原样透传上游 status(含 Retry-After);500/501/502/505+ 压成 502;401/403 也压 502,避免下游误判「是我的 API key 错」
+- **★ 例外(先于上面那条判):5xx 的 body 若*点名*容量不足 → `overloaded` → 503 `overloaded_error`**。「压成 502」是给**未知**失败态的默认值,而 `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY` 是已知态——同一件事上游还会用 429 和 mid-stream `ThrottlingException` 表达,那两条**早就**是可重试信号(429 / 503),只有这条曾掉进 502 让容量事件看着像网关自己坏了。施加点在 `retry-executor.ts` 的 5xx 分支而**非** `classifyErrorBody`:后者跑在 429 分支**之前**(会把更具体的 429 劫持成 503)且拿不到 header(丢 Retry-After)。**只作用于 5xx**——429 保持 `rate_limited`、408 保持透传,两条都有反向守卫。下游三元组复用 `upstreamErrorWire(true)`,与 mid-stream 容量信号同一份定义。判别子 / 判别顺序 / 为何不透传 504 / 为何绝不自己编 Retry-After:全在 `matchModelCapacityReason()` 与 `MODEL_CAPACITY_REASONS` 的头注释(`kiro/provider-error.ts`),**别在这里复述**。踩坑「跨模型对照」
+- 反过来,402 配额判定(`isMonthlyRequestLimitBody`)**故意**是宽松全文扫描,不套用上面那条「先读声明的 `reason`」——两者代价不对称:漏判配额 = 400「请检查请求体」(错且不可重试),而容量侧的产物是日志维度,一个似是而非的 token 比没有更糟。**别统一这两个函数**(反向守卫在 `test/kiro/provider-error.test.ts`)
 
 ### 响应文案中性化(防泄漏后端身份)
 
@@ -145,10 +148,11 @@ flowchart LR
 
 ### 日志(可观测性)
 
-部署形态是多容器同机 + 高频健康检查,日志既是排障依据也是磁盘成本。三条由 `test/static/` 静态守卫钉住:
+部署形态是多容器同机 + 高频健康检查,日志既是排障依据也是磁盘成本。四条由 `test/static/` 静态守卫钉住:
 
 - **每请求只打一行**:`Fastify` 内置请求日志必须 `disableRequestLogging: true`,只留 `index.ts` 的 `onResponse` hook 那条(带 `reqId` / `method` / `url` / `duration_ms`)。两者并存会每请求三行、其中两行都叫 `request completed`——不只是体积,按 incoming/completed 配对做的分析会稳定算错。守卫 `request-log-single-line.test.ts`
 - **业务字段一律 snake_case**:框架自带的 `msg`/`err`/`level`/`time`/`reqId`/`statusCode` 除外。混用会逼运维为同一指标查两种拼写。守卫 `log-field-casing.test.ts`
+- **一个指标只有一个 owner**:`capacity_reason` 只在 `kiro/retry-executor.ts` 记(429 与 5xx 两个分支各一处)。它是上游容量事件的唯一计数维度,而同一件事有 429 / 5xx 两种线格式:mapper 手里也有 `err.kind.reason`、顺手再记一次就让 5xx 形态权重翻倍;只记 5xx 分支又漏掉更常见的 429。守卫 `log-capacity-reason.test.ts`
 - **★ 网关自己造成的结果不记 `error`**:主动 `destroy()` socket、主动 abort 上游后读流抛错,都是那一行代码的必然结果而非上游故障。记成 error 会污染告警,且让人误判"上游在报错"(实测假 error 与自毁动作 1:1)。加标志位区分,降为 `info`;**真实**故障必须仍是 `error`——改这类豁免时**同时**写反向守卫用例
 
 ### 原生 reasoning 路径互斥
@@ -171,28 +175,48 @@ flowchart LR
 
 ## 高频踩坑陷阱
 
-1. **Fastify logger**:用 `loggerInstance: pinoInstance`,不是 `logger:`
-2. **Parser Result 类型守卫**:用 `'frame' in result`,**不是** `result.ok`
-3. **CRC32 符号位**:`crc-32` 返回有符号 32-bit,必须 `>>> 0`
-4. **AWS Event Stream 全 big-endian**:`readUInt32BE` / `readInt16BE` / `readBigInt64BE`
-5. **AsyncMutex 必要性**:JS 单线程,但 `await` 会让出控制权
-6. **AWS SSO OIDC wire**:Smithy 协议,请求/响应**都**是 camelCase
-7. **API key 比较**:必须 `crypto.timingSafeEqual`
-8. **SQLite 凭据不可跨机器**:refresh 可能返回新 refreshToken 写回 SQLite
-9. **better-sqlite3 跨架构**:Mac → Linux 容器构建必须在 builder 阶段编译
-10. **SIGTERM**:Docker 用 `tini` 作 PID 1,`forceCloseConnections: 'idle'` 是优雅关闭关键
-11. **core 不发 cachePoint**:`cache_control` / `cachePoint` 在 Kiro 被静默忽略,`convertTools` 只输出 `{toolSpecification}`;缓存红利由上游按相同 prefix / session 自动给,不靠请求侧 marker
-12. **convertTools 剥 tool-search marker**:client 的 tool-search 合成 marker 工具(无 `input_schema`)上送会 400;`isToolSearchTool()` 丢 marker、忽略 `defer_loading`,真实工具全量转发
-13. **空流有界重试(只吸收*瞬时*空流)**:上游偶发回「200 OK + 零内容帧」,客户端无法与真实过载区分,retry-executor 又看不到 2xx 的 event-stream body。**pre-commit**(未向客户端写任何字节)时对同一请求重发最多 `KIRO2CLAUDE_EMPTY_STREAM_RETRIES`(默认 2)次,已 commit 绝不重试。★ **确定性空流一律单次定案、不消耗重试预算**——重发同一请求上游只会同样地再失败,每次白烧 credit。四类:`max_tokens` / `model_context_window_exceeded` / **截断 tool_use**(宣告了 tool_use 却无一帧 `isComplete`;实测重试恢复率 0)/ 上游显式 Error·Exception 帧**且上游已开工**。★ 最后一类的限定词是必须的:零帧拒绝(`event_counts` 只有 `Exception:1`,实测 1ms 内返回)没有任何 credit 可烧、重发几乎必然恢复,属于**瞬时**故障,走有界重试;只有上游**已经开工**才是确定性终止。判据必须用 `sawBillableWork()`(看上游发过哪些帧)而**不是** `hasContent()`——GPT 加密 reasoning 计费但不 surface(踩坑 #15),`hasContent()` 会把烧掉数千帧 reasoning 的流谎报为空,正好在最贵的失败上重发。与 retryable 分类**无关**(那个集合实测不完整:真实世界最常见的是泛化 `code:"error"`,不在集合里)。新增判空分支时**先问它是不是内容绑定的**,是就加进排除列表。文案同理:`selectEmptyUpstreamMessage` 的 `deterministic` 参数必须显式传,别靠 `emptyAttempts` 次数倒推(不重试时 attempts 停在 1,会误退回「please retry」把用户引向已知无效的路)。红线在 `stream-handler.ts`(重试循环)+ `non-stream-handler.ts`(对称判定)+ `stream.ts`(`sawCompletedToolUse` 判空两路对齐)+ `empty-capture.ts` 头注释;仍不明的确定性空流用 `KIRO2CLAUDE_CAPTURE_EMPTY_DIR` 抓包定位,**别凭假设盲改 converter**
-14. **工具调用文本泄漏(会历史自污染)**:上游解析偶发失败,工具调用块以纯文本掉进响应,留在会话历史会被模型模仿 → 同会话确定性复发。`KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE`(默认开)双向兜底:响应侧解析回真 tool_use、请求侧剥历史泄漏块让会话自愈。全部红线在 `claude/tool-call-text.ts` 头注释,**改前必读**;勿再引入「大文件分块写入」类 prompt 指令(已实测证伪、连同 `SYSTEM_CHUNKED_POLICY` 移除)
-15. **GPT-5.6 与 Claude 走完全相同的上游**:请求体逐字段相同,唯一差异是 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,**无需**新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload 是 `{redactedContent}`(加密、无 text/signature),`stream.ts` `processReasoningContent` 顶部 `if(!text&&!signature)return[]` 整块丢弃(否则开空 thinking 块);`metadataEvent{stopReason}` 故意落 `Unknown`、由网关自行推断(工具调用时 `tool_use` 比上游 `END_TURN` 准),**保持现状**
-16. **OpenAI `prompt_tokens` ≠ Claude `input_tokens`**:`buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage **必须**直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、**绕过** `buildClaudeUsagePayload`;计费 hook 仍照跑,首版只出标准三字段、不含 `kiro_*` 扩展
-17. **Codex 只说 Responses + 只对识别的模型名发工具**:① `wire_api=chat` 在 Codex 0.122+ 被移除,Codex 必须走 `/openai/v1/responses`(Responses 与 Chat 是两套东西:请求 `input` items + 扁平 tools,响应是严格语义事件序列)。② Codex 只对内部识别的模型名下发工具,故 `mapModel` 把 `gpt-*-codex` **别名**到 `gpt-5.6-sol`,Codex config 用 `gpt-5-codex` 才有工具调用。编码器红线全在 `openai/responses/response-stream.ts` 头注释(`content_part.added` 必须先于 `output_text.delta`、done 回填全文、纯工具调用不产空 message、Claude thinking → reasoning summary item 惰性开),**改编码器前先跑一遍真实 Codex**(harness `tools/codex/`)
-18. **GPT 反演走 credit 锚定,不做 token 级分解**:本地 kiro-cli 实测 —— ① GPT 无 prompt-cache 经济学 —— 多档对照实测(固定大前缀重发 10k/50k/100k tokens):Claude 稳定降 ~47%、GPT 全系列(sol/terra/luna)降 0%(sol credits 逐字节相同);缺口在 Kiro 计费层不传导 GPT 缓存折扣、非模型能力(官方 GPT-5.6 有 caching)→ `cache_read`/`cache_creation` 恒 0、input 全量计入;② output 含加密 reasoning(计费但不进可见 `output_tokens`,见踩坑 #15),量因任务而异且不可观测——零-reasoning 复制任务 output 侧 ≈10 credit/USD,而高-reasoning 任务同等可见 token 下 credits 高 ~47%,`(input,visibleOut,credits)` 欠定 → 无法反解「公开价等效成本」。故 GPT 成本锚定唯一可靠真值 `credits×0.04`(× multiplier),走 `deriveKiroUsage` 顶部 `isGptModel` 专属分支(status `gpt_credit_anchored`)。**绝不要给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`**:偏高的 credits 会被标准反演误推成虚高 `tEffIn` → step3 把 input 误拆成 `cache_creation`(分流必须在价格表查询**前**)。红线在 `gptCreditAnchoredBreakdown` 头注释
-19. **tool description cap 防单工具吞 context**:Kiro 对**单个** description 无字符硬上限(单个即便极大上游仍照收),真限制是 **context window**(多 tool + history + system 总量撑爆窗口报 400 "Context window is full",足够多的超大工具叠加即可触发)。`KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN`(默认 32768=32K)截住畸形超大 description 独吞 context——覆盖已知最大合法工具 Workflow 且留有充足余量;旧硬编码上限过度保守、静默截断合法工具。真相源 `converter.ts` `convertTools` + config-schema;cap 只管单工具,总量保护交给 Kiro 的 context-window 400。
-20. **断连计费:默认 drain 如实计费,abort 省 credit 但记账偏低**:客户端断连后网关默认 drain 上游到 EOF 拿尾帧 Metering **如实计费**(`stream-handler.ts` 断连仍维持上游连接 → Kiro 生成完 → 全额计费)。实测 Kiro 对 TCP 断即停生成计费,故 `KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT`(默认 false)开启后断连**主动 abort 上游**(signal 经 provider→retry-executor `axiosConfig` 透传)省下断连点之后的 credit;**代价**是拿不到 Metering、per-request 记账偏低(若按 metering 向下游计费会少记)。仅 Claude 端 stream;`logFields.drained_after_disconnect` 观测「断连后仍付费」。
-21. **★ `stream.write()` 的返回值是流控信号,不是存活信号**:`false` = 内部缓冲超过 highWaterMark、**应等 `'drain'` 再写**,socket 完全健康。`safeWrite` 曾直接 `return raw.write(chunk)`,于是全部调用点把「缓冲满」读成「客户端断连」——读循环停止向**活着的**客户端转发、终结段(`if (committed && !aborted.value)`)连 `message_stop` 都丢掉、上游仍 drain 到 EOF **全额计费**、日志还把责任记给客户端。而缓冲只会被**大量字节**填满,所以这个误判精确地咬住最长最贵的那批响应(实测被误判流 `output_tokens` 中位数比真断连高一个量级、**无一例短于 2 分钟**,而真断连中位数只有 3 秒——**字节量驱动 vs 时间驱动**是排除「用户 Ctrl-B/Ctrl-C 取消」这个混淆项的判别子)。红线:存活只看 `destroyed`/`writableEnded`/write 抛错;背压走 `awaitDrain`(带 `close`+超时兜底,避免既不读也不关的客户端把上游拖到被回收)。`disconnect_source` 区分 `client_close` 与 `write_failed`,**别退回单一 `aborted` 布尔**。守卫 `test/claude/backpressure.test.ts`(含反向守卫:真 EPIPE 仍须判断连)+ `test/static/sse-backpressure-contract.test.ts`(钉住两个 transport 不脱同步)
-22. **上游杀的是*卡住*的流,不是跑得久的流**:上游偶发在生成中途发来泛化 `Exception`(`code:"error"` / "…please try again"、**无** `ContextUsage`+`Metering` 尾帧 = 真的中途死掉),已 commit 时只能转成 in-band `error`,客户端显示为 mid-response 截断。判别子是**产出速率**:健康流 token/s 中位数约 32、失败流约 2.5(`token/s<2` 占比 0.6% vs 42.6%);持续产出的流能跑过 600s,静止的流在约 150s / 260s 被上游回收(零内容例出现时长几乎逐毫秒重复 = 硬超时签名)。**排查这类问题先算 token/s,别看总时长**——按时长分桶会得出「260s 死线」的错误结论。网关侧无治本手段(上游行为);post-commit 后 SSE 协议上也无法重试或改状态码。缓解方向见 `stream-handler.ts` 的 `armDrainGrace`(目前只在**已断连**时武装,连接中的 idle 无上界,只受 axios 720s 约束)。
+> 按主题分组、组内沿依赖层排(shared→kiro→claude→openai)。正文其它处用 `踩坑「关键词」` 回指某条——grep 对应加粗标题即达;改标题时记得同步这些回指。
+
+### 运行时基础设施(框架 · 二进制 · 并发 · 生命周期)
+
+- **Fastify logger**:用 `loggerInstance: pinoInstance`,不是 `logger:`
+- **Parser Result 类型守卫**:用 `'frame' in result`,**不是** `result.ok`
+- **CRC32 符号位**:`crc-32` 返回有符号 32-bit,必须 `>>> 0`
+- **AWS Event Stream 全 big-endian**:`readUInt32BE` / `readInt16BE` / `readBigInt64BE`
+- **AsyncMutex 必要性**:JS 单线程,但 `await` 会让出控制权
+- **SIGTERM**:Docker 用 `tini` 作 PID 1,`forceCloseConnections: 'idle'` 是优雅关闭关键
+
+### 鉴权 · 凭据 · 构建部署
+
+- **AWS SSO OIDC wire**:Smithy 协议,请求/响应**都**是 camelCase
+- **API key 比较**:必须 `crypto.timingSafeEqual`
+- **SQLite 凭据不可跨机器**:refresh 可能返回新 refreshToken 写回 SQLite
+- **better-sqlite3 跨架构**:Mac → Linux 容器构建必须在 builder 阶段编译
+
+### 请求转换 · 工具(Claude→Kiro)
+
+- **core 不发 cachePoint**:`cache_control` / `cachePoint` 在 Kiro 被静默忽略,`convertTools` 只输出 `{toolSpecification}`;缓存红利由上游按相同 prefix / session 自动给,不靠请求侧 marker
+- **convertTools 剥 tool-search marker**:client 的 tool-search 合成 marker 工具(无 `input_schema`)上送会 400;`isToolSearchTool()` 丢 marker、忽略 `defer_loading`,真实工具全量转发
+- **工具调用文本泄漏(会历史自污染)**:上游解析偶发失败 → 工具调用块以纯文本掉进响应,留在历史会被模型模仿 → 同会话确定性复发。`KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE`(默认开)双向兜底:响应侧解析回真 tool_use、请求侧剥历史泄漏块。全部红线在 `claude/tool-call-text.ts` 头注释,**改前必读**;勿再引入「大文件分块写入」类 prompt 指令(已证伪、连同 `SYSTEM_CHUNKED_POLICY` 移除)
+- **tool description cap 防单工具吞 context**:Kiro 对**单个** description 无字符硬上限,真限制是 **context window**(多 tool + history + system 撑爆报 400 "Context window is full")。`KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN`(默认 32768=32K)截住畸形超大 description——覆盖已知最大合法工具 Workflow 且留余量;cap 只管单工具,总量保护交给 Kiro 的 context-window 400。真相源 `converter.ts` `convertTools` + config-schema
+
+### 流式传输 · 断连 · 空流
+
+- **空流有界重试(只吸收*瞬时*空流)**:上游偶发「200 OK + 零内容帧」,客户端无法与真实过载区分,retry-executor 看不到 2xx 的 event-stream body。**仅 pre-commit**(未写任何字节)对同一请求重发最多 `KIRO2CLAUDE_EMPTY_STREAM_RETRIES`(默认 2)次,已 commit 绝不重试。★ **确定性空流单次定案、不耗重试预算**(重发只会同样失败、白烧 credit),四类:`max_tokens` / `model_context_window_exceeded` / 截断 tool_use(宣告 tool_use 却无一帧 `isComplete`)/ 上游 Error·Exception 帧**且已开工**。末类限定词必须:零帧拒绝(未开工)属**瞬时**故障、走有界重试。判据用 `sawBillableWork()` 而**不是** `hasContent()`——GPT 加密 reasoning 计费但不 surface(踩坑「GPT 完全相同上游」),`hasContent()` 会把烧了数千帧 reasoning 的流谎报为空;与 retryable 分类无关(那个集合实测不完整)。文案 `selectEmptyUpstreamMessage` 的 `deterministic` 参数必须显式传,别靠 `emptyAttempts` 倒推。新增判空分支先问「是不是内容绑定的」,是则加进排除列表。红线在 `stream-handler.ts` / `non-stream-handler.ts` / `stream.ts`(`sawCompletedToolUse`)/ `empty-capture.ts` 头注释;不明空流用 `KIRO2CLAUDE_CAPTURE_EMPTY_DIR` 抓包,别盲改 converter
+- **断连计费:默认 drain 如实计费,abort 省 credit 但记账偏低**:客户端断连后默认 drain 上游到 EOF 拿尾帧 Metering **全额计费**。`KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT`(默认 false)开启后断连**主动 abort 上游**(signal 经 provider→retry-executor `axiosConfig` 透传)省下断连点后的 credit;**代价**是拿不到 Metering、per-request 记账偏低。仅 Claude 端 stream;`logFields.drained_after_disconnect` 观测
+- ★ **`stream.write()` 返 `false` = 背压不是断连**:`false` = 缓冲超 highWaterMark、应等 `'drain'`,socket 健康。误判会停读循环(对**活着的**客户端)、丢终结段 `message_stop`、上游仍 drain 到 EOF **全额计费**、日志还错记客户端;且因缓冲由**大量字节**填满,专咬最长最贵的响应。红线:存活只看 `destroyed`/`writableEnded`/write 抛错;背压走 `awaitDrain`(带 `close`+超时兜底);`disconnect_source` 区分 `client_close`/`write_failed`,**别退回单一 `aborted` 布尔**。真相源+实测:`safeWrite`/`awaitDrain` 头注释 + 守卫 `test/claude/backpressure.test.ts`(含真 EPIPE 反向守卫)+ `test/static/sse-backpressure-contract.test.ts`(钉住两 transport 同步)
+- **上游杀的是*卡住*的流,不是跑得久的流**:上游偶发生成中途发泛化 `Exception`(`code:"error"`、**无** `ContextUsage`+`Metering` 尾帧 = 真中途死),已 commit 只能转 in-band `error`,客户端见 mid-response 截断。判别子是**产出速率(token/s)不是总时长**——按时长分桶会得错误死线。网关侧无治本手段(上游行为)、post-commit 也无法重试或改状态码。缓解见 `stream-handler.ts` 的 `armDrainGrace`(目前只在**已断连**时武装,连接中 idle 无上界、只受 axios 720s 约束)
+
+### 多模型 · GPT · OpenAI · Codex
+
+- **GPT-5.6 与 Claude 走完全相同上游**:请求体逐字段相同,唯一差异 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,无需新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload `{redactedContent}`(加密、无 text/signature),`stream.ts` `processReasoningContent` 顶部 `if(!text&&!signature)return[]` 整块丢弃(否则开空 thinking 块);`metadataEvent{stopReason}` 故意落 `Unknown` 由网关推断(工具调用时 `tool_use` 比上游 `END_TURN` 准),保持现状
+- **OpenAI `prompt_tokens` ≠ Claude `input_tokens`**:`buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage **必须**直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、**绕过** `buildClaudeUsagePayload`;计费 hook 仍跑,只出标准三字段、不含 `kiro_*` 扩展
+- **Codex 只说 Responses + 只对识别的模型名发工具**:① `wire_api=chat` 在 Codex 0.122+ 移除,必须走 `/openai/v1/responses`(请求 `input` items + 扁平 tools,响应严格语义事件序列)。② Codex 只对内部识别的模型名下发工具,故 `mapModel` 把 `gpt-*-codex` **别名**到 `gpt-5.6-sol`,config 用 `gpt-5-codex` 才有工具调用。编码器红线全在 `openai/responses/response-stream.ts` 头注释(`content_part.added` 先于 `output_text.delta`、done 回填全文、纯工具调用不产空 message、thinking → reasoning summary 惰性开),**改编码器前先跑真实 Codex**(harness `tools/codex/`)
+- **GPT 反演走 credit 锚定,不做 token 级分解**:GPT 侧 `(input, visibleOut, credits)` 欠定——Kiro 不传导 GPT 缓存折扣(`cache_read`/`cache_creation` 恒 0、input 全量计入),且 output 含加密 reasoning(计费不 surface,踩坑「GPT 完全相同上游」),无法反解「公开价等效成本」。故唯一可靠真值 `credits×0.04`(× multiplier),走 `deriveKiroUsage` 顶部 `isGptModel` 专属分支(status `gpt_credit_anchored`)。**绝不给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`**:偏高 credits 会被标准反演误推成虚高 `tEffIn` → 把 input 误拆成 `cache_creation`(分流必须在价格表查询**前**)。红线在 `gptCreditAnchoredBreakdown` 头注释
+
+### 错误流转 · 容量事件诊断
+
+- ★ **「网关在报内部错误」先做同容器跨模型对照,再怀疑网关**:曾有一批下游 502 **全部**来自上游 5xx、网关自身零错误。判别顺序(每步独立否掉一批假设):① **同容器跨模型**——同容器同时段某模型大面积失败、另一模型零失败,只 `modelId` 变 → 上游**按模型**容量短缺,一击定案。⚠ info 级日志无模型字段(`mapped_model` 只在 `debug`),要开 debug / 用 metering 记账 / 客户端侧分桶;② **分钟级时间轴**——失败集中在十几分钟窗口、窗口后流量更高却不失败 → 是事件非长期状态;③ **请求形状对照**(`max_tokens`/`tool_count`/`system_length` 分布相同)→ 非 converter 构造错;④ region/profileArn/`tier` 全同 → 非路由或配额档。**别按主机/账号先分桶**(同机同分钟有账号全挂也有毫发无伤,会误推「账号被封」)。**有界重试对此无效**(上游恢复远慢于请求内重试),踩坑「空流有界重试」思路**不能**照搬 5xx;有效缓解是**切模型**。日志用 `capacity_reason` 结构化字段区分,别靠 substring 匹配 `error`
 
 ## 测试
 

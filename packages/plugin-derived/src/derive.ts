@@ -383,7 +383,7 @@ function passthroughBreakdown(
  *   → `cache_read` / `cache_creation` 恒 0,input 全量计入 `input_tokens`。缺口在
  *   Kiro 计费层不传导 GPT 缓存折扣,非模型能力(OpenAI 官方 GPT-5.6 有 prompt caching)。
  * - **output 含加密 reasoning,不可辨识**:GPT reasoning 计费但不进 visible
- *   `output_tokens`(踩坑 #15,redacted)。零-reasoning 的逐字复制任务 output 侧
+ *   `output_tokens`(踩坑「GPT 完全相同上游」,redacted)。零-reasoning 的逐字复制任务 output 侧
  *   ≈10 credit/USD,而 counting 等高-reasoning 任务在同等可见 token 下 credits 高
  *   ~47% → 隐藏 reasoning 量因任务而异且不可观测,`(input, visibleOut, credits)`
  *   欠定,无法唯一反解"公开价等效成本"。故 **credits 是唯一可靠成本真值**。

@@ -59,7 +59,7 @@ export interface ClaudeUsagePayload {
  *
  * **单一真相源**：Claude（`buildClaudeUsagePayload`）与 OpenAI 两协议共用此函数，
  * strip 语义不再各写一份。注意此处只解析 `addExtension` 扩展；`overrideStandardField`
- * 的标准字段覆写不经此路（OpenAI 侧刻意不套用 override，守踩坑 #16）。
+ * 的标准字段覆写不经此路（OpenAI 侧刻意不套用 override，守踩坑「OpenAI prompt_tokens」）。
  */
 /** plugin 注入的命名空间 usage 扩展（`addExtension` 通道）——`resolvePluginUsageExtensions` 的产物类型。 */
 export type PluginUsageExtensions = ReadonlyMap<string, unknown>;
@@ -238,7 +238,7 @@ const BILLABLE_WORK_EVENT_KINDS = [
  * (零帧 → 重发几乎必然恢复,且无成本可烧)。
  *
  * ★ **不能**用 `hasContent()` 代替。GPT 的 reasoning 是加密的 `redactedContent`,
- * `processReasoningContent` 会整块丢弃(踩坑 #15),于是一个已经烧掉数千帧 reasoning
+ * `processReasoningContent` 会整块丢弃(踩坑「GPT 完全相同上游」),于是一个已经烧掉数千帧 reasoning
  * 的 GPT 流在 `hasContent()` 看来是「空」的 —— 按它决定要不要重试,正好会对最贵的
  * 那类失败重发请求。判据必须落在**上游发过什么帧**上,而不是我们向下游产出了什么。
  */
@@ -284,10 +284,14 @@ export function classifyUpstreamErrorEvent(
 }
 
 /**
- * Downstream wire form for a classified mid-stream upstream error. Retryable →
- * 503 / `overloaded_error` (client retries the whole request); fatal → 502 /
- * `api_error` (hard stop, no retry). Shared by both handlers so the streaming
- * in-band event and the non-stream HTTP status stay consistent.
+ * Downstream wire form for an upstream error, keyed only on whether a retry may
+ * recover. Retryable → 503 / `overloaded_error` (client retries the whole
+ * request); fatal → 502 / `api_error` (hard stop, no retry).
+ *
+ * Shared by both stream handlers *and* by `error-mapper`'s pre-stream
+ * `overloaded` case, so the status/type/message triple has exactly one
+ * definition: a client can't tell — and needn't care — whether the shortage was
+ * reported before or during generation.
  */
 export function upstreamErrorWire(retryable: boolean): {
   status: number;

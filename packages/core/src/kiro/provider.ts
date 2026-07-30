@@ -2,10 +2,13 @@
  * Kiro API Provider
  *
  * 与 Kiro 上游 API 通信的核心组件，同时支持流式和非流式请求。
- * 网关本质是转发——上游 408/429/5xx 一律原样透传给下游（含 Retry-After
- * 头），由下游用 HTTP 标准客户端机制处理退避。唯一例外：上游 401 且
- * 响应体指示 bearer token 失效时，网关用本地 SQLite 凭据做一次 token
- * force-refresh 后重试一次（下游没有 refresh token，无法自己处理）。
+ * 网关本质是转发——上游 408/429/5xx 原样透传给下游（含 Retry-After 头），
+ * 由下游用 HTTP 标准客户端机制处理退避。两处例外：
+ *   1. 上游 401 且响应体指示 bearer token 失效时，网关用本地 SQLite 凭据做
+ *      一次 token force-refresh 后重试一次（下游没有 refresh token，无法自己
+ *      处理）——这也是网关**唯一**会重试的路径。
+ *   2. 5xx 响应体点名容量不足时改判为 503 `overloaded_error`（不重试，只换
+ *      标签；判据见 `provider-error.ts` 的 `matchModelCapacityReason`）。
  * 所有请求头统一走 kiro-cli client profile（Smithy awsJson1_0）。
  *
  * ## 架构

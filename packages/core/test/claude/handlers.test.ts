@@ -23,6 +23,7 @@ import type { AxiosResponse } from 'axios';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IDENTITY_OVERRIDE_DIRECTIVE } from '../../src/claude/converter.js';
+import { RETRYABLE_UPSTREAM_ERROR_MESSAGE } from '../../src/claude/stream.js';
 import type { KiroProvider } from '../../src/kiro/provider.js';
 import { ProviderError } from '../../src/kiro/provider-error.js';
 import { HookBus } from '../../src/plugin-host/index.js';
@@ -681,6 +682,73 @@ describe('handlers: POST /claude/v1/messages - ProviderError mapping', () => {
     // The internal err.message contains "Kiro API ..." but we MUST NOT
     // forward that to the downstream response body.
     expect(body.error.message).not.toMatch(/kiro|aws|upstream/i);
+  });
+
+  it('maps overloaded to a retryable 503/overloaded_error without leaking the backend', async () => {
+    const capacityBody =
+      '{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}';
+    const provider = makeStubProvider({
+      callApi: async () => {
+        throw new ProviderError(
+          {
+            kind: 'overloaded',
+            status: 500,
+            reason: 'MODEL_TEMPORARILY_UNAVAILABLE',
+          },
+          capacityBody,
+        );
+      },
+    });
+    app = await buildApp(provider);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: VALID_BODY,
+    });
+    // 503, NOT the generic-5xx 502 — a named capacity shortage is a known
+    // transient state, and the client SDK must read it as "retry", not
+    // "the gateway is broken".
+    expect(response.statusCode).toBe(503);
+    const body = response.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe('overloaded_error');
+    // Same wording as the mid-stream retryable path — one wire signal, one voice.
+    expect(body.error.message).toBe(RETRYABLE_UPSTREAM_ERROR_MESSAGE);
+    // Leak rule: neither the backend identity nor the upstream reason token
+    // (which is an internal wire detail) may reach the client body.
+    expect(body.error.message).not.toMatch(/kiro|aws|upstream|model|codewhisperer/i);
+    expect(body.error.message).not.toMatch(/MODEL_TEMPORARILY_UNAVAILABLE/);
+    // No upstream Retry-After → the gateway must not invent one.
+    expect(response.headers['retry-after']).toBeUndefined();
+  });
+
+  it('forwards Retry-After for overloaded when upstream supplied one', async () => {
+    const provider = makeStubProvider({
+      callApi: async () => {
+        throw new ProviderError(
+          {
+            // Upstream 500, not 503: a 503 would come out as 503 through the
+            // `transient` branch too, so it could not tell the two apart. The
+            // relabelling is only observable on a status that would otherwise
+            // have been compressed to 502.
+            kind: 'overloaded',
+            status: 500,
+            reason: 'INSUFFICIENT_MODEL_CAPACITY',
+            retryAfterSeconds: 9,
+          },
+          '{"reason":"INSUFFICIENT_MODEL_CAPACITY"}',
+        );
+      },
+    });
+    app = await buildApp(provider);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: VALID_BODY,
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.headers['retry-after']).toBe('9');
   });
 
   it('does not leak upstream backend identity in quota_exhausted response', async () => {

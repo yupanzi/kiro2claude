@@ -23,8 +23,15 @@
  * - 401/403 → optional one-shot force-refresh (above), then throw `unauthorized`
  * - 402 + MONTHLY → throw `quota_exhausted`
  * - 429 → throw `rate_limited` with parsed Retry-After
- * - 408/5xx → throw `transient` with parsed Retry-After (mapper passes status through)
+ * - 5xx naming a model-capacity reason → throw `overloaded` (mapper returns 503)
+ * - 408/other 5xx → throw `transient` with parsed Retry-After (mapper passes status through)
  * - Network error (axios throws) → throw `network` (mapper returns 502)
+ *
+ * Note that `overloaded` does **not** make this a retrying executor — it only
+ * changes the downstream *label*; the client still owns the back-off (why
+ * gateway-side retry is the wrong lever for capacity events: 踩坑「跨模型对照」). The
+ * check sits in the 5xx branch rather than in `classifyErrorBody` because that
+ * runs *before* the 429 branch and never sees response headers.
  *
  * ## What's different across the three call paths
  *
@@ -51,7 +58,12 @@ import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 
 import { getLogger } from '../shared/logger.js';
 import type { KiroCredentials } from './model/credentials.js';
-import { classifyErrorBody, isBearerTokenInvalidBody, ProviderError } from './provider-error.js';
+import {
+  classifyErrorBody,
+  isBearerTokenInvalidBody,
+  matchModelCapacityReason,
+  ProviderError,
+} from './provider-error.js';
 import type { SingleTokenManager } from './token-manager.js';
 
 /**
@@ -194,6 +206,11 @@ export class RetryExecutor {
           msg: 'API request failed (rate limited)',
           type: req.label,
           status,
+          // Logged but NOT used to re-classify: 429 is already the more specific
+          // downstream signal. Present so that querying `capacity_reason` (踩坑
+          // #23) covers *every* shape of a capacity event — 429 is the most
+          // common one, and omitting it here would silently undercount.
+          capacity_reason: matchModelCapacityReason(responseBody),
           retry_after_seconds: retryAfterSeconds,
           duration_ms: Date.now() - attemptStart,
         });
@@ -208,14 +225,37 @@ export class RetryExecutor {
       // 408/503/504 pass through, the rest become 502.
       if (status === 408 || (status >= 500 && status < 600)) {
         const retryAfterSeconds = parseRetryAfter(response.headers['retry-after']);
+
+        // A 5xx whose body *names* model-capacity shortage is not an unknown
+        // failure state — it's the same condition upstream also reports as
+        // 429/INSUFFICIENT_MODEL_CAPACITY. Classified separately so the mapper
+        // can emit a retryable 503/`overloaded_error` instead of burying it in
+        // the generic-5xx → 502 bucket.
+        //
+        // The 5xx scope is really a 408 carve-out: 408 already passes its status
+        // through verbatim, so relabelling it `overloaded` would *lose* the
+        // "request timed out" signal and gain nothing. (429 can't reach here —
+        // it threw above — and must stay `rate_limited`, a strictly more
+        // specific signal, if that branch ever moves.)
+        const capacityReason = status === 408 ? undefined : matchModelCapacityReason(responseBody);
         log.warn({
-          msg: 'API request failed (transient)',
+          msg:
+            capacityReason === undefined
+              ? 'API request failed (transient)'
+              : 'API request failed (model capacity unavailable)',
           type: req.label,
           status,
+          // pino drops undefined keys, so the transient line stays unchanged.
+          capacity_reason: capacityReason,
           retry_after_seconds: retryAfterSeconds,
           duration_ms: Date.now() - attemptStart,
         });
-        throw new ProviderError({ kind: 'transient', status, retryAfterSeconds }, responseBody);
+        throw new ProviderError(
+          capacityReason === undefined
+            ? { kind: 'transient', status, retryAfterSeconds }
+            : { kind: 'overloaded', status, reason: capacityReason, retryAfterSeconds },
+          responseBody,
+        );
       }
 
       // Other 4xx — request/config problem

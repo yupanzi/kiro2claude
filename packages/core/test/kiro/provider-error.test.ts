@@ -4,6 +4,7 @@ import {
   classifyErrorBody,
   isBearerTokenInvalidBody,
   isMonthlyRequestLimitBody,
+  matchModelCapacityReason,
   ProviderError,
   type ProviderErrorKind,
 } from '../../src/kiro/provider-error.js';
@@ -30,6 +31,10 @@ describe('ProviderError', () => {
       [{ kind: 'unauthorized', status: 401, bearerInvalid: true }, /unauthorized/],
       [{ kind: 'rate_limited', status: 429, retryAfterSeconds: 5 }, /rate limited/],
       [{ kind: 'rate_limited', status: 429 }, /retryAfter=n\/a/],
+      [
+        { kind: 'overloaded', status: 500, reason: 'MODEL_TEMPORARILY_UNAVAILABLE' },
+        /model capacity unavailable.*reason=MODEL_TEMPORARILY_UNAVAILABLE/,
+      ],
       [{ kind: 'transient', status: 503, retryAfterSeconds: 12 }, /transient.*retryAfter=12s/],
       [{ kind: 'transient', status: 500 }, /transient.*retryAfter=n\/a/],
       [{ kind: 'network', cause: new Error('ECONNREFUSED') }, /network error/],
@@ -112,6 +117,112 @@ describe('isMonthlyRequestLimitBody', () => {
 
   it('tolerates invalid JSON', () => {
     expect(isMonthlyRequestLimitBody('not json at all')).toBe(false);
+  });
+
+  it('matches superset tokens and prose mentions (deliberately permissive)', () => {
+    // ★ Reverse guard against "unifying" this with `matchModelCapacityReason`'s
+    // declared-reason-first precedence. The cost asymmetry runs the opposite way
+    // here: a miss sends an out-of-quota user to `bad_request` → 400 "check your
+    // request payload", which is wrong *and* non-retryable in the client SDKs,
+    // whereas an over-match only says "quota exhausted" about a 402 that already
+    // failed. Only one real 402 body has ever been observed, so the scan must
+    // keep covering shapes we have not seen.
+    expect(isMonthlyRequestLimitBody('{"reason":"MONTHLY_REQUEST_COUNT_LIMIT_EXCEEDED"}')).toBe(
+      true,
+    );
+    expect(
+      isMonthlyRequestLimitBody(
+        '{"reason":"FREE_TIER_LIMIT","message":"MONTHLY_REQUEST_COUNT reached"}',
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('matchModelCapacityReason', () => {
+  // Bodies below are verbatim shapes observed from upstream during a real
+  // model-capacity event.
+  it('detects MODEL_TEMPORARILY_UNAVAILABLE in the real 500 body', () => {
+    const body =
+      '{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}';
+    expect(matchModelCapacityReason(body)).toBe('MODEL_TEMPORARILY_UNAVAILABLE');
+  });
+
+  it('detects INSUFFICIENT_MODEL_CAPACITY in the real 429 body', () => {
+    const body =
+      '{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}';
+    expect(matchModelCapacityReason(body)).toBe('INSUFFICIENT_MODEL_CAPACITY');
+  });
+
+  it('detects a nested error.reason', () => {
+    expect(matchModelCapacityReason('{"error":{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}}')).toBe(
+      'MODEL_TEMPORARILY_UNAVAILABLE',
+    );
+  });
+
+  it('reads the nested reason even when an unrelated top-level reason is present', () => {
+    // The two levels are collected independently: an unrecognised top-level
+    // `reason` must not mask the nested one.
+    expect(
+      matchModelCapacityReason(
+        '{"reason":"SOMETHING_ELSE","error":{"reason":"INSUFFICIENT_MODEL_CAPACITY"}}',
+      ),
+    ).toBe('INSUFFICIENT_MODEL_CAPACITY');
+  });
+
+  it('trusts the declared reason over a token mentioned in prose', () => {
+    // ★ Precedence guard. The body *names* a different reason and merely quotes
+    // the capacity token inside `message` (upstreams echo diagnostics, and
+    // client content can contain anything). A body-wide substring scan would
+    // relabel this generic failure as a capacity shortage and stamp the wrong
+    // token into the `capacity_reason` log field — the exact text-matching
+    // failure mode 踩坑「跨模型对照」 exists to end.
+    const body =
+      '{"message":"Internal failure; not MODEL_TEMPORARILY_UNAVAILABLE","reason":"INTERNAL_ERROR"}';
+    expect(matchModelCapacityReason(body)).toBeUndefined();
+  });
+
+  it('falls back to a body scan only when no reason is declared', () => {
+    // Shapes we do not know (no `reason` field at all) still get the scan —
+    // that is what keeps a wire-format change from silently disabling this.
+    expect(
+      matchModelCapacityReason('{"__type":"X","detail":"MODEL_TEMPORARILY_UNAVAILABLE"}'),
+    ).toBe('MODEL_TEMPORARILY_UNAVAILABLE');
+    expect(matchModelCapacityReason('raw text: INSUFFICIENT_MODEL_CAPACITY')).toBe(
+      'INSUFFICIENT_MODEL_CAPACITY',
+    );
+  });
+
+  it('treats an empty declared reason as "nothing declared" and still scans', () => {
+    // ★ `{"reason":""}` names nothing. If the empty string counted as a
+    // declaration it would suppress the fallback scan below it, dropping the
+    // body back to `transient` → 502 — precisely the outcome the 503
+    // relabelling exists to remove. Same evidence class as the `reason:null`
+    // case below, which upstream really does send.
+    expect(matchModelCapacityReason('{"reason":"","detail":"MODEL_TEMPORARILY_UNAVAILABLE"}')).toBe(
+      'MODEL_TEMPORARILY_UNAVAILABLE',
+    );
+    expect(
+      matchModelCapacityReason(
+        '{"reason":"","message":"Encountered unexpectedly high load: INSUFFICIENT_MODEL_CAPACITY"}',
+      ),
+    ).toBe('INSUFFICIENT_MODEL_CAPACITY');
+  });
+
+  it('returns undefined for the generic 500 body (reason:null)', () => {
+    // ★ This is the discriminator that matters: a sizeable share of the
+    // failures in a real capacity event carried this body instead. It says
+    // "please try again" but names no reason, so the upstream state really is
+    // unknown → must stay `transient`, not `overloaded`.
+    const body =
+      '{"message":"Encountered an unexpected error when processing the request, please try again.","reason":null}';
+    expect(matchModelCapacityReason(body)).toBeUndefined();
+  });
+
+  it('returns undefined for unrelated and malformed bodies', () => {
+    expect(matchModelCapacityReason('{"reason":"MONTHLY_REQUEST_COUNT"}')).toBeUndefined();
+    expect(matchModelCapacityReason('service unavailable')).toBeUndefined();
+    expect(matchModelCapacityReason('not json at all')).toBeUndefined();
+    expect(matchModelCapacityReason('')).toBeUndefined();
   });
 });
 

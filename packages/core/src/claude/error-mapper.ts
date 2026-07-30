@@ -17,15 +17,18 @@
  * 端点复用同一个 `classifyProviderError` 再格式化成 OpenAI 形状(openai/
  * error-mapper.ts),两端的状态码/中性文案/leak 安全永远一致。
  *
- * Dispatches on `ProviderError.kind.kind` via exhaustive switch. Anything
- * that isn't a `ProviderError` (token manager failures, unexpected throws)
- * falls back to 502 with a generic message; the underlying `err.message`
- * (which may contain "Kiro API ..." text) is logged only, never sent.
+ * Dispatches on `ProviderError.kind.kind` via a switch whose `default` arm is
+ * `assertNever` — a new `ProviderErrorKind` variant that isn't handled is a tsc
+ * error there, not a silent fall-through into the 502 fallback below. Anything
+ * that isn't a `ProviderError` (token manager failures, unexpected throws) does
+ * fall back to 502 with a generic message; the underlying `err.message` (which
+ * may contain "Kiro API ..." text) is logged only, never sent.
  */
 
 import type { FastifyReply } from 'fastify';
 import { ProviderError } from '../kiro/provider-error.js';
 import { getLogger } from '../shared/logger.js';
+import { assertNever, upstreamErrorWire } from './stream.js';
 import { createErrorResponse } from './types.js';
 
 /** 分类后的下游错误描述(格式无关)。 */
@@ -35,7 +38,7 @@ export interface ClassifiedProviderError {
   errorType: string;
   /** 中性文案(不泄漏后端身份)。 */
   message: string;
-  /** rate_limited / transient 时的 Retry-After 秒数。 */
+  /** rate_limited / overloaded / transient 时的 Retry-After 秒数。 */
   retryAfterSeconds?: number;
 }
 
@@ -105,6 +108,28 @@ export function classifyProviderError(err: unknown): ClassifiedProviderError {
           message: 'Service is rate limiting requests. Please retry after the indicated delay.',
           retryAfterSeconds: err.kind.retryAfterSeconds,
         };
+      case 'overloaded':
+        // Upstream *named* a capacity shortage (token set + precedence:
+        // `matchModelCapacityReason`). Goes through `upstreamErrorWire` so the
+        // pre-stream and mid-stream capacity signals are the same
+        // status/type/message triple by construction, not by convention.
+        //
+        // Always 503, never a pass-through of the upstream 5xx the way
+        // `transient` passes 503/504: 503 is the only status this codebase pairs
+        // with `overloaded_error`, and the only 5xx RFC 9110 defines
+        // `Retry-After` for. The upstream original stays in `upstream_status`.
+        //
+        // `capacity_reason` is deliberately NOT logged here — the executor
+        // already logs it, for the 429 shape too, and is the only site that
+        // constructs this kind. A second copy would double-count 5xx against
+        // 429 in that dimension (guard: test/static/log-capacity-reason.test.ts).
+        log.error({
+          msg: 'upstream model capacity unavailable',
+          upstream_status: err.kind.status,
+          downstream_status: 503,
+          retry_after_seconds: err.kind.retryAfterSeconds,
+        });
+        return { ...upstreamErrorWire(true), retryAfterSeconds: err.kind.retryAfterSeconds };
       case 'transient': {
         const upstream = err.kind.status;
         // Forward upstream status verbatim when it carries well-defined
@@ -136,6 +161,13 @@ export function classifyProviderError(err: unknown): ClassifiedProviderError {
           errorType: 'api_error',
           message: 'Service is unreachable. Please retry.',
         };
+      default:
+        // A new `ProviderErrorKind` variant that isn't handled above is a tsc
+        // error here. Without this arm the switch would just fall through to
+        // the non-provider 502 below and the variant would be silently
+        // mapped to "Service encountered an internal error." — exactly the
+        // "looks like the gateway broke" outcome `overloaded` exists to end.
+        return assertNever(err.kind);
     }
   }
 

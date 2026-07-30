@@ -358,7 +358,7 @@ describe('mid-stream error surfacing: streaming (app.inject)', () => {
 
   it('★ 反向守卫:上游已开工(GPT 加密 reasoning)后报错 → 绝不重试', async () => {
     // 这是这条改动最危险的失误模式。GPT 的 reasoning 是加密的 redactedContent,
-    // processReasoningContent 整块丢弃(踩坑 #15)→ 既没有 output_tokens 也没有
+    // processReasoningContent 整块丢弃(踩坑「GPT 完全相同上游」)→ 既没有 output_tokens 也没有
     // thinking,`hasContent()` 谎报为「空」。若拿 hasContent() 当重试判据,一个已经
     // 烧掉数千帧 reasoning 的流会被重发,正好在最贵的失败上白烧 credit。
     // 判据必须是 sawBillableWork(看上游发过什么帧),这里钉死它。

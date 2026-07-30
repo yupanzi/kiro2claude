@@ -12,7 +12,7 @@
  * usage 用 StreamContext 原始 token(不经 buildClaudeUsagePayload,理由同 chat 端点)。
  * Claude 明文 thinking → reasoning summary item(惰性开:首个 thinking_delta 才产 item,见
  * reasoningDelta;summary 通道,兼容面最广)。GPT 加密 reasoning(redacted)在归约层已被丢、
- * 编码器收不到 thinking 事件 → 天然不产 reasoning item(Codex 路径逐字节不变,踩坑 #17)。
+ * 编码器收不到 thinking 事件 → 天然不产 reasoning item(Codex 路径逐字节不变,踩坑「Codex 只说 Responses」)。
  * signature_delta 仍丢弃:它是 continuation 凭证、非用户可读内容,本版只做下行显示。
  */
 

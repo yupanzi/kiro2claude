@@ -3,7 +3,7 @@
  *
  * 传输编排(deferred commit + 空流有界重试 + 断连 drain 计费 + keepalive)是
  * claude/stream-handler.ts 的结构复制,但**只服务 openai/ 两个新端点**,不碰
- * Claude 红线(坑#13)。语义核心复用 `StreamContext`(坑#14)。协议差异(chat
+ * Claude 红线(坑「空流有界重试」)。语义核心复用 `StreamContext`(坑「工具调用文本泄漏」)。协议差异(chat
  * chunk vs responses 事件、终止行)通过 `OpenAiStreamProtocol` 注入。
  *
  * usage 用 StreamContext 原始 token(不经 buildClaudeUsagePayload)。错误信封
@@ -328,7 +328,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     // generateFinalEvents(false) 跑计费 hook(恰好一次)+ 关掉仍打开的 block
     // (content_block_stop 等)。这些关块事件**必须**过 encoder 写出:Responses
     // 编码器据此给 open output item 补 output_item.done,否则 Codex 收到悬空
-    // in_progress item(踩坑#17)。镜像 claude/stream-handler.ts 的同路径。chat
+    // in_progress item(踩坑「Codex 只说 Responses」)。镜像 claude/stream-handler.ts 的同路径。chat
     // 编码器对 content_block_stop 仅在「打开着的无参数工具块」补一个合法 `{}` 增量
     // (见 response-stream.ts 空输入工具兜底),其余情形不产 chunk——即把可能截断的
     // 半截工具参数补成合法 JSON 再收尾,输出仍有效。

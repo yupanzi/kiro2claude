@@ -25,6 +25,7 @@ import type { AxiosResponse } from 'axios';
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { RETRYABLE_UPSTREAM_ERROR_MESSAGE } from '../../src/claude/stream.js';
 import { handleStreamRequest } from '../../src/claude/stream-handler.js';
 import type { KiroProvider } from '../../src/kiro/provider.js';
 import { ProviderError } from '../../src/kiro/provider-error.js';
@@ -751,6 +752,36 @@ describe('handlers stream: error mapping', () => {
       payload: STREAM_BODY,
     });
     expect(response.statusCode).toBe(502);
+  });
+
+  it('maps overloaded 500 at callApiStream to 503 overloaded_error (not the generic 502)', async () => {
+    // Paired with the `transient` 500 → 502 case above: same upstream status,
+    // different classification, and streaming is the path a real capacity event
+    // actually arrives on. Kept here so the stream handler can't be refactored
+    // into losing the relabelling while the non-stream test stays green.
+    const provider = makeStubProvider({
+      callApiStream: async () => {
+        throw new ProviderError(
+          { kind: 'overloaded', status: 500, reason: 'MODEL_TEMPORARILY_UNAVAILABLE' },
+          '{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}',
+        );
+      },
+    });
+    app = await buildApp(provider);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: STREAM_BODY,
+    });
+    expect(response.statusCode).toBe(503);
+    const body = response.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe('overloaded_error');
+    expect(body.error.message).toBe(RETRYABLE_UPSTREAM_ERROR_MESSAGE);
+    expect(body.error.message).not.toMatch(/kiro|aws|upstream|model|codewhisperer/i);
+    expect(body.error.message).not.toMatch(/MODEL_TEMPORARILY_UNAVAILABLE/);
+    // No upstream Retry-After → the gateway must not invent one.
+    expect(response.headers['retry-after']).toBeUndefined();
   });
 
   it('maps rate_limited at callApiStream to 429 with Retry-After header', async () => {

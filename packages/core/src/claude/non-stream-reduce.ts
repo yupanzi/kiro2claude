@@ -3,7 +3,7 @@
  *
  * 把上游一次性返回的 event-stream body(Buffer)归约成「完全后处理」的
  * `ReducedAttempt`:帧解码 → 累积 text/tool/reasoning/metering → legacy
- * `<thinking>` 提取 → 泄漏工具调用救援(坑 #14) → stop_reason 定稿 →
+ * `<thinking>` 提取 → 泄漏工具调用救援(坑「工具调用文本泄漏」) → stop_reason 定稿 →
  * silent-failure 判定。
  *
  * 抽出来的动机:Claude 非流式 handler 与 OpenAI 非流式 handler 共用这套

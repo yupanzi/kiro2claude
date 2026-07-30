@@ -6,7 +6,7 @@
 
 ## 为什么是 Responses API(不是 Chat Completions)
 
-Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(实测:配 `wire_api="chat"` 直接报错 `no longer supported`)。所以本 harness 用 `wire_api = "responses"`,网关的 `/openai/v1/responses` 端点接住(见 [踩坑 #17](../../CLAUDE.md))。
+Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(实测:配 `wire_api="chat"` 直接报错 `no longer supported`)。所以本 harness 用 `wire_api = "responses"`,网关的 `/openai/v1/responses` 端点接住(见 [踩坑「Codex 只说 Responses」](../../CLAUDE.md))。
 
 ## ⚠ 模型名必须用 `gpt-5-codex`(才有工具集)
 

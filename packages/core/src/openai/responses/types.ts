@@ -124,7 +124,7 @@ export interface ResponsesReasoningSummaryPart {
 /**
  * reasoning output item:Claude 明文思维链经 **summary 通道** surface。
  * 只做下行显示(summary 文本);signature/encrypted_content 的多轮 continuation 不做
- * (见踩坑 #17 + response-stream.ts 头注)。GPT 加密 reasoning 无内容 → 不产此 item。
+ * (见踩坑「Codex 只说 Responses」 + response-stream.ts 头注)。GPT 加密 reasoning 无内容 → 不产此 item。
  */
 export interface ResponsesReasoningOutputItemOut {
   id: string;
