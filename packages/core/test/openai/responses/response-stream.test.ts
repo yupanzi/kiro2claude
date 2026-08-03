@@ -260,3 +260,100 @@ describe('ResponsesEventEncoder: reasoning(thinking)', () => {
     expect(types(all).some((x) => x.includes('reasoning'))).toBe(false);
   });
 });
+
+// ============================================================================
+// code mode:freeform(custom)工具走另一套事件族
+// ============================================================================
+
+describe('ResponsesEventEncoder: freeform(custom)工具', () => {
+  const CUSTOM = new Set(['exec']);
+  const toolStart = (i: number, name: string, id = 'tooluse_1') =>
+    ev('content_block_start', { index: i, content_block: { type: 'tool_use', id, name } });
+  const argsDelta = (i: number, partial_json: string) =>
+    ev('content_block_delta', { index: i, delta: { type: 'input_json_delta', partial_json } });
+
+  it('custom_tool_call 事件族;delta 一次性发全文,绝不逐块转发 JSON 碎片', () => {
+    const enc = new ResponsesEventEncoder('gpt-5.6-sol', CUSTOM);
+    const js = 'await tools.apply_patch("x");';
+    const all = [
+      ...enc.push(START),
+      ...enc.push(toolStart(0, 'exec')),
+      // 上游给的是替身 schema 的 partial JSON,分两块到达
+      ...enc.push(argsDelta(0, '{"input":"await tools.')),
+      ...enc.push(argsDelta(0, 'apply_patch(\\"x\\");"}')),
+      ...enc.push(stop(0)),
+      ...enc.finalize({ input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ];
+
+    const t = types(all);
+    // 用 custom 事件族,且绝不出现 function_call 那套
+    expect(t).toContain('response.custom_tool_call_input.delta');
+    expect(t).toContain('response.custom_tool_call_input.done');
+    expect(t).not.toContain('response.function_call_arguments.delta');
+    expect(t).not.toContain('response.function_call_arguments.done');
+    // 累积期只缓冲:两块 partial JSON 只换来 1 个 delta(否则客户端会把 JSON 碎片当裸文本)
+    expect(t.filter((x) => x === 'response.custom_tool_call_input.delta')).toHaveLength(1);
+
+    const evs = parse(all);
+    const added = evs.find((e) => e.type === 'response.output_item.added')?.item as {
+      type: string;
+      call_id: string;
+      name: string;
+      input: string;
+    };
+    expect(added).toMatchObject({ type: 'custom_tool_call', call_id: 'tooluse_1', name: 'exec' });
+    expect(added.input).toBe('');
+    // delta / done / item 三处载荷都是解包后的裸文本
+    expect(evs.find((e) => e.type === 'response.custom_tool_call_input.delta')?.delta).toBe(js);
+    expect(evs.find((e) => e.type === 'response.custom_tool_call_input.done')?.input).toBe(js);
+    const itemDone = evs.find(
+      (e) =>
+        e.type === 'response.output_item.done' &&
+        (e.item as { type: string }).type === 'custom_tool_call',
+    )?.item as { input: string; status: string };
+    expect(itemDone).toMatchObject({ input: js, status: 'completed' });
+    const completed = evs.find((e) => e.type === 'response.completed')?.response as {
+      output: { type: string }[];
+    };
+    expect(completed.output.map((o) => o.type)).toEqual(['custom_tool_call']);
+  });
+
+  it('args 非法 JSON → 回退原文(模型直接吐裸文本时不丢内容)', () => {
+    const enc = new ResponsesEventEncoder('gpt-5.6-sol', CUSTOM);
+    const all = [
+      ...enc.push(START),
+      ...enc.push(toolStart(0, 'exec')),
+      ...enc.push(argsDelta(0, 'text("raw js, not json")')),
+      ...enc.push(stop(0)),
+      ...enc.finalize({ input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ];
+    const done = parse(all).find((e) => e.type === 'response.custom_tool_call_input.done');
+    expect(done?.input).toBe('text("raw js, not json")');
+  });
+
+  it('空输入 → input 为空串,不是 "{}"(那是 JSON 工具的兜底)', () => {
+    const enc = new ResponsesEventEncoder('gpt-5.6-sol', CUSTOM);
+    const all = [
+      ...enc.push(START),
+      ...enc.push(toolStart(0, 'exec')),
+      ...enc.push(stop(0)),
+      ...enc.finalize({ input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ];
+    const done = parse(all).find((e) => e.type === 'response.custom_tool_call_input.done');
+    expect(done?.input).toBe('');
+  });
+
+  it('名字不在 customToolNames 里 → 仍走 function_call(标准形态逐字节不变)', () => {
+    const enc = new ResponsesEventEncoder('gpt-5.6-sol', CUSTOM);
+    const all = [
+      ...enc.push(START),
+      ...enc.push(toolStart(0, 'wait')),
+      ...enc.push(argsDelta(0, '{"cell_id":"c1"}')),
+      ...enc.push(stop(0)),
+      ...enc.finalize({ input_tokens: 1, output_tokens: 1, total_tokens: 2 }),
+    ];
+    const t = types(all);
+    expect(t).toContain('response.function_call_arguments.done');
+    expect(t.some((x) => x.includes('custom_tool_call'))).toBe(false);
+  });
+});

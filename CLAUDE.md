@@ -60,6 +60,8 @@ packages/core/src/
 openai/                 OpenAI 兼容层(下游;import claude/kiro/shared,不被反向依赖)。两个协议:
                         Chat Completions + Responses(Codex)。语义核心复用 claude(StreamContext +
                         reduceKiroResponse + provider),仅协议翻译是 OpenAI 特有。
+├── freeform-tool.ts        ★ `type:"custom"` 工具替身编解码的**单一真相源**(schema + wrap/unwrap
+│                           + 适配说明);放共享层而非 responses/,便于将来接 chat 侧 custom 工具
 ├── stream-transport.ts     chat+responses 共用流式脚手架(复制自 claude,隔离坑「空流有界重试」)
 ├── non-stream-transport.ts chat+responses 共用非流式(reduceKiroResponse + 计费 hook)
 ├── converter.ts            Chat 请求 → MessagesRequest;mapReasoningEffort / parseDataUri 两端共用
@@ -67,7 +69,8 @@ openai/                 OpenAI 兼容层(下游;import claude/kiro/shared,不被
 ├── response-nonstream.ts   归约结果 → chat.completion + buildOpenAiUsage(读原始 token,踩坑「OpenAI prompt_tokens」)
 ├── stream-handler.ts · non-stream-handler.ts · handlers.ts · error-mapper.ts · models-catalog.ts
 └── responses/          OpenAI Responses API(Codex 走这;wire_api=responses)
-    ├── converter.ts        Responses 请求(input items / instructions / 扁平 tools)→ MessagesRequest
+    ├── converter.ts        Responses 请求(input items / instructions / 扁平 tools)→ MessagesRequest;
+    │                       collectTools 兼容 code mode(工具在 input 的 additional_tools 里)+ freeform 包裹
     ├── response-stream.ts  SseEvent → 严格语义事件序列(踩坑「Codex 只说 Responses」);Claude thinking → reasoning item
     ├── response-nonstream.ts  归约结果 → Response 对象(含 reasoning item)
     └── stream-handler.ts · non-stream-handler.ts · handlers.ts · types.ts
@@ -96,6 +99,8 @@ flowchart LR
 | effort 阈值映射 | `mapThinkingToEffort()`;OpenAI `reasoning_effort` 见 `openai/converter.ts`(minimal→low,其余透传)|
 | OpenAI 端点 / 请求响应翻译 | `packages/core/src/openai/`;路由 `routes/openai.ts`,挂载见 `index.ts` |
 | OpenAI Responses / Codex 接入 | `openai/responses/`;harness `tools/codex/`;红线见踩坑「Codex 只说 Responses」 |
+| Codex 的工具怎么进来(两套形态)| `openai/responses/converter.ts` 的 `collectTools`(顶层 `tools` ∪ `input` 里的 `additional_tools`);freeform 工具见 `FREEFORM_TOOL_SCHEMA`;踩坑「Codex code mode」|
+| freeform(`custom`)工具双向怎么走 | 上行 `converter.ts`(包成 `{input:string}`)→ 下行 `response-stream.ts` `closeCurrent` / `response-nonstream.ts`(按 `customToolNames` 还原 `custom_tool_call`)|
 | OpenAI 如何复用 Claude 语义 | `openai/` 复用 `StreamContext` + `reduceKiroResponse`;usage **不**经 `buildClaudeUsagePayload`(踩坑「OpenAI prompt_tokens」)|
 | Responses 如何 surface reasoning | Claude thinking → `reasoning` output item(summary 通道);GPT 加密 reasoning 不产;signature 丢弃(踩坑「Codex 只说 Responses」)|
 | 身份覆写文案 / 开关 | `IDENTITY_OVERRIDE_DIRECTIVE` in `converter.ts` + `KIRO2CLAUDE_IDENTITY_OVERRIDE`(默认开)|
@@ -214,7 +219,9 @@ flowchart LR
 
 - **GPT-5.6 与 Claude 走完全相同上游**:请求体逐字段相同,唯一差异 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,无需新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload `{redactedContent}`(加密、无 text/signature),`stream.ts` `processReasoningContent` 顶部 `if(!text&&!signature)return[]` 整块丢弃(否则开空 thinking 块);`metadataEvent{stopReason}` 故意落 `Unknown` 由网关推断(工具调用时 `tool_use` 比上游 `END_TURN` 准),保持现状
 - **OpenAI `prompt_tokens` ≠ Claude `input_tokens`**:`buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage **必须**直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、**绕过** `buildClaudeUsagePayload`;计费 hook 仍跑,只出标准三字段、不含 `kiro_*` 扩展
-- **Codex 只说 Responses + 只对识别的模型名发工具**:① `wire_api=chat` 在 Codex 0.122+ 移除,必须走 `/openai/v1/responses`(请求 `input` items + 扁平 tools,响应严格语义事件序列)。② Codex 只对内部识别的模型名下发工具,故 `mapModel` 把 `gpt-*-codex` **别名**到 `gpt-5.6-sol`,config 用 `gpt-5-codex` 才有工具调用。编码器红线全在 `openai/responses/response-stream.ts` 头注释(`content_part.added` 先于 `output_text.delta`、done 回填全文、纯工具调用不产空 message、thinking → reasoning summary 惰性开),**改编码器前先跑真实 Codex**(harness `tools/codex/`)
+- **Codex 只说 Responses**:`wire_api=chat` 在 Codex 0.122+ 移除,必须走 `/openai/v1/responses`(请求 `input` items + 扁平 tools,响应严格语义事件序列)。编码器红线全在 `openai/responses/response-stream.ts` 头注释(`content_part.added` 先于 `output_text.delta`、done 回填全文、纯工具调用不产空 message、thinking → reasoning summary 惰性开),**改编码器前先跑真实 Codex**(harness `tools/codex/`)
+- ★ **Codex code mode:工具不在顶层 `tools` 里**(跨版本实测一致,版本号见 `tools/codex/README.md`):Codex 按模型名走**两套请求形态**。**认识**的名字(`gpt-5.6-sol`)→ code mode:顶层 `tools` 与 `instructions` **双双不存在**,工具改由 `input[0]` 的 `{type:"additional_tools"}` item 携带,含 `type:"custom"` 的 freeform 工具;**不认识**的名字(`gpt-5-codex`/`o3`/`sol`)→ 打 `Model metadata not found` 后 fallback 到标准顶层 `tools`。⚠ 判别只看**字段在不在**,别按模型名分支(旧结论「只对识别的名字下发工具」是**反的**,已证伪)。code mode 下**所有真实工具(`apply_patch` 写文件、`exec_command`)都不是独立 tool**,只写在 `exec` 的 description 里,模型必须调 `exec` 传 JS(`await tools.apply_patch(...)`)。freeform 工具上游无通道 → 包成单 `input` 字符串字段的 JSON 工具(`FREEFORM_TOOL_SCHEMA`),**必须同时追加适配说明**(原描述明写 "not JSON",不说明则模型吐裸文本);工具名经 `customToolNames` 传到响应侧还原 `custom_tool_call`,漏传即错编成 `function_call`。★ 流式**不能边收边发**:手里是 partial JSON,须缓冲到 block 结束解出 `input` 再一次性发。`namespace` 工具**故意不转发**(实测 Codex 拒绝直调子工具,`unsupported call: …`)。替身编解码的单一真相源是 `openai/freeform-tool.ts`(schema + wrap/unwrap,守卫 `test/static/freeform-tool-contract.test.ts`);两套请求形态与 wire 细节见 `openai/responses/converter.ts` + `types.ts` 头注释,真实抓包 fixture 在 `test/fixtures/responses/codex-code-mode-request.json`。⚠ **chat 端点未实现 custom 工具**:Chat Completions 规范同样有 `type:"custom"`(但嵌套在 `custom` 下,Responses 是扁平),`openai/converter.ts` 的 `convertTools` 仍是 function 白名单——已知无客户端(Codex 0.122+ 只说 Responses、无法端到端验证),故**刻意**不实现;codec 已放在 `openai/` 而非 `openai/responses/`,将来要接只需加一层 wire 形状适配
+- **Codex 侧无法用 web search**:code mode 的 `additional_tools` 里**没有** `web_search`(`tools.web_search=true` 等三种配置均无效),fallback 形态倒是发 `{"type":"web_search"}`,但那是 **hosted(服务端执行)** 工具、无 `parameters`,上游给不了。网关自带的 `claude/websearch.ts`(走 Kiro MCP)触发条件是「工具**只有一个**且名为 `web_search`」——那是 Claude Code 的独立子请求路径,Codex 把它混在工具集里,**走不通**。实测 Codex **接受**网关产的 `web_search_call` item(渲染成 `web search: <query>`),故要支持是可行的,但需新功能(注入工具 + 网关自己执行 MCP 搜索 + 产 item),不是转发能解决的
 - **GPT 反演走 credit 锚定,不做 token 级分解**:GPT 侧 `(input, visibleOut, credits)` 欠定——Kiro 不传导 GPT 缓存折扣(`cache_read`/`cache_creation` 恒 0、input 全量计入),且 output 含加密 reasoning(计费不 surface,踩坑「GPT 完全相同上游」),无法反解「公开价等效成本」。故唯一可靠真值 `credits×0.04`(× multiplier),走 `deriveKiroUsage` 顶部 `isGptModel` 专属分支(status `gpt_credit_anchored`)。**绝不给 GPT 填 `CLAUDE_PRICE_USD_PER_TOK`**:偏高 credits 会被标准反演误推成虚高 `tEffIn` → 把 input 误拆成 `cache_creation`(分流必须在价格表查询**前**)。红线在 `gptCreditAnchoredBreakdown` 头注释
 
 ### 错误流转 · 容量事件诊断

@@ -9,6 +9,14 @@
  *   - `response.completed` 的 `response.output` 要带完整 items。
  *   - 工具调用走 `function_call_arguments.delta/done`。
  *
+ * ★ **freeform(custom)工具**(踩坑「Codex code mode」):走**另一套**事件
+ *   `custom_tool_call` item + `custom_tool_call_input.delta/done`(载荷字段是
+ *   `input` 裸文本,不是 `arguments` JSON 串)。判别靠构造时传入的 `customToolNames`
+ *   (请求侧收集,见 responses/converter.ts),名字对不上就会错编成 function_call。
+ *   ⚠ 这类工具**不能边收边发**:上游给的是替身 schema `{"input":"…"}` 的 partial
+ *   JSON,逐块转发等于把 JSON 碎片当裸文本喂给客户端。必须缓冲到 block 结束、解出
+ *   `input` 再一次性发 delta+done(实测 Codex 接受单次 delta)。
+ *
  * usage 用 StreamContext 原始 token(不经 buildClaudeUsagePayload,理由同 chat 端点)。
  * Claude 明文 thinking → reasoning summary item(惰性开:首个 thinking_delta 才产 item,见
  * reasoningDelta;summary 通道,兼容面最广)。GPT 加密 reasoning(redacted)在归约层已被丢、
@@ -18,6 +26,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import type { SseEvent } from '../../claude/stream.js';
+import { NO_FREEFORM_TOOLS, unwrapFreeformArgs } from '../freeform-tool.js';
 import type {
   ResponsesObject,
   ResponsesOutputItem,
@@ -25,32 +34,53 @@ import type {
   ResponsesUsage,
 } from './types.js';
 
-type CurrentItem =
-  | { kind: 'message'; claudeIdx: number; index: number; itemId: string; text: string }
-  | { kind: 'reasoning'; claudeIdx: number; index: number; itemId: string; summaryText: string }
-  | {
-      kind: 'function_call';
-      claudeIdx: number;
-      index: number;
-      itemId: string;
-      args: string;
-      callId: string;
-      name: string;
-    };
+type MessageItem = {
+  kind: 'message';
+  claudeIdx: number;
+  index: number;
+  itemId: string;
+  text: string;
+};
+type ReasoningItem = {
+  kind: 'reasoning';
+  claudeIdx: number;
+  index: number;
+  itemId: string;
+  summaryText: string;
+};
+type ToolCallItem = {
+  kind: 'function_call';
+  claudeIdx: number;
+  index: number;
+  itemId: string;
+  args: string;
+  callId: string;
+  name: string;
+};
+
+type CurrentItem = MessageItem | ReasoningItem | ToolCallItem;
+
+/** 关闭一个 item 产出的事件行 + 该 item 的最终形态(进 completedItems)。 */
+interface ClosedItem {
+  out: string[];
+  item: ResponsesOutputItem;
+}
 
 export class ResponsesEventEncoder {
   private seq = 0;
   private readonly responseId = `resp_${uuidv4().replace(/-/g, '')}`;
   private readonly createdAt = Math.floor(Date.now() / 1000);
   private readonly model: string;
+  private readonly customToolNames: ReadonlySet<string>;
 
   private createdEmitted = false;
   private outputIndex = 0;
   private current: CurrentItem | undefined;
   private readonly completedItems: ResponsesOutputItem[] = [];
 
-  constructor(model: string) {
+  constructor(model: string, customToolNames: ReadonlySet<string> = NO_FREEFORM_TOOLS) {
     this.model = model;
+    this.customToolNames = customToolNames;
   }
 
   /** 把事件对象序列化成一行 SSE(带自增 sequence_number)。 */
@@ -224,9 +254,15 @@ export class ResponsesEventEncoder {
     return out;
   }
 
+  /** 该工具是否 freeform(走 custom_tool_call 事件族)。 */
+  private isCustom(name: string): boolean {
+    return this.customToolNames.has(name);
+  }
+
   private openFunctionCall(claudeIdx: number, id: string | undefined, name: string): string[] {
     const out = this.closeCurrent();
-    const itemId = `fc_${uuidv4().replace(/-/g, '')}`;
+    const custom = this.isCustom(name);
+    const itemId = `${custom ? 'ctc' : 'fc'}_${uuidv4().replace(/-/g, '')}`;
     const callId = id ?? `call_${uuidv4().replace(/-/g, '')}`;
     const index = this.outputIndex;
     this.current = { kind: 'function_call', claudeIdx, index, itemId, args: '', callId, name };
@@ -234,14 +270,23 @@ export class ResponsesEventEncoder {
       this.line({
         type: 'response.output_item.added',
         output_index: index,
-        item: {
-          id: itemId,
-          type: 'function_call',
-          call_id: callId,
-          name,
-          arguments: '',
-          status: 'in_progress',
-        },
+        item: custom
+          ? {
+              id: itemId,
+              type: 'custom_tool_call',
+              call_id: callId,
+              name,
+              input: '',
+              status: 'in_progress',
+            }
+          : {
+              id: itemId,
+              type: 'function_call',
+              call_id: callId,
+              name,
+              arguments: '',
+              status: 'in_progress',
+            },
       }),
     );
     return out;
@@ -250,6 +295,9 @@ export class ResponsesEventEncoder {
   private argsDelta(partial: string): string[] {
     if (!this.current || this.current.kind !== 'function_call') return [];
     this.current.args += partial;
+    // freeform:只累积。此刻手里是 `{"input":"…"}` 的 JSON 碎片,发出去会被客户端
+    // 当成工具原始文本(见文件头红线);完整文本在 closeCustomToolCall 一次性发。
+    if (this.isCustom(this.current.name)) return [];
     return [
       this.line({
         type: 'response.function_call_arguments.delta',
@@ -265,104 +313,154 @@ export class ResponsesEventEncoder {
     return [];
   }
 
-  /** 关闭当前 open item(发 done 事件、回填完整文本/参数、进 completedItems)。幂等。 */
-  private closeCurrent(): string[] {
-    const cur = this.current;
-    if (!cur) return [];
-    this.current = undefined;
-    this.outputIndex++;
-    const out: string[] = [];
-
-    if (cur.kind === 'message') {
-      const part = { type: 'output_text' as const, text: cur.text, annotations: [] };
-      out.push(
-        this.line({
-          type: 'response.output_text.done',
-          item_id: cur.itemId,
-          output_index: cur.index,
-          content_index: 0,
-          text: cur.text,
-        }),
-      );
-      out.push(
-        this.line({
-          type: 'response.content_part.done',
-          item_id: cur.itemId,
-          output_index: cur.index,
-          content_index: 0,
-          part,
-        }),
-      );
-      const item: ResponsesOutputItem = {
+  private closeMessage(cur: MessageItem): ClosedItem {
+    const part = { type: 'output_text' as const, text: cur.text, annotations: [] };
+    const out = [
+      this.line({
+        type: 'response.output_text.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        content_index: 0,
+        text: cur.text,
+      }),
+      this.line({
+        type: 'response.content_part.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        content_index: 0,
+        part,
+      }),
+    ];
+    return {
+      out,
+      item: {
         id: cur.itemId,
         type: 'message',
         role: 'assistant',
         status: 'completed',
         content: [part],
-      };
-      out.push(this.line({ type: 'response.output_item.done', output_index: cur.index, item }));
-      this.completedItems.push(item);
-    } else if (cur.kind === 'reasoning') {
-      // reasoning:summary_text.done → summary_part.done → output_item.done(回填完整摘要)
-      out.push(
-        this.line({
-          type: 'response.reasoning_summary_text.done',
-          item_id: cur.itemId,
-          output_index: cur.index,
-          summary_index: 0,
-          text: cur.summaryText,
-        }),
-      );
-      out.push(
-        this.line({
-          type: 'response.reasoning_summary_part.done',
-          item_id: cur.itemId,
-          output_index: cur.index,
-          summary_index: 0,
-          part: { type: 'summary_text', text: cur.summaryText },
-        }),
-      );
-      const item: ResponsesReasoningOutputItemOut = {
+      },
+    };
+  }
+
+  /** reasoning:summary_text.done → summary_part.done(回填完整摘要)。 */
+  private closeReasoning(cur: ReasoningItem): ClosedItem {
+    const out = [
+      this.line({
+        type: 'response.reasoning_summary_text.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        summary_index: 0,
+        text: cur.summaryText,
+      }),
+      this.line({
+        type: 'response.reasoning_summary_part.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        summary_index: 0,
+        part: { type: 'summary_text', text: cur.summaryText },
+      }),
+    ];
+    const item: ResponsesReasoningOutputItemOut = {
+      id: cur.itemId,
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: cur.summaryText }],
+    };
+    return { out, item };
+  }
+
+  /**
+   * freeform:delta 在这里才发(累积期只缓冲,见 argsDelta)。载荷是解包后的裸文本,
+   * 空输入给 ""——**不是** "{}",那是 JSON 工具的兜底,对裸文本工具是一段垃圾内容。
+   */
+  private closeCustomToolCall(cur: ToolCallItem): ClosedItem {
+    const input = unwrapFreeformArgs(cur.args);
+    const out = [
+      this.line({
+        type: 'response.custom_tool_call_input.delta',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        delta: input,
+      }),
+      this.line({
+        type: 'response.custom_tool_call_input.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        input,
+      }),
+    ];
+    return {
+      out,
+      item: {
         id: cur.itemId,
-        type: 'reasoning',
-        summary: [{ type: 'summary_text', text: cur.summaryText }],
-      };
-      out.push(this.line({ type: 'response.output_item.done', output_index: cur.index, item }));
-      this.completedItems.push(item);
-    } else {
-      // 空输入工具:上游无 input_json_delta → args 停在 ""(非法 JSON,Codex serde_json
-      // 解析报错)。补 "{}" 使 arguments 合法,delta+done 两通道一致——与非流式
-      // reduceKiroResponse 的 `if(!buffer) input={}` 归一对齐。
-      if (cur.args.length === 0) {
-        cur.args = '{}';
-        out.push(
-          this.line({
-            type: 'response.function_call_arguments.delta',
-            item_id: cur.itemId,
-            output_index: cur.index,
-            delta: '{}',
-          }),
-        );
-      }
+        type: 'custom_tool_call',
+        call_id: cur.callId,
+        name: cur.name,
+        input,
+        status: 'completed',
+      },
+    };
+  }
+
+  private closeFunctionCall(cur: ToolCallItem): ClosedItem {
+    const out: string[] = [];
+    // 空输入工具:上游无 input_json_delta → args 停在 ""(非法 JSON,Codex serde_json
+    // 解析报错)。补 "{}" 使 arguments 合法,delta+done 两通道一致——与非流式
+    // reduceKiroResponse 的 `if(!buffer) input={}` 归一对齐。
+    if (cur.args.length === 0) {
+      cur.args = '{}';
       out.push(
         this.line({
-          type: 'response.function_call_arguments.done',
+          type: 'response.function_call_arguments.delta',
           item_id: cur.itemId,
           output_index: cur.index,
-          arguments: cur.args,
+          delta: '{}',
         }),
       );
-      const item: ResponsesOutputItem = {
+    }
+    out.push(
+      this.line({
+        type: 'response.function_call_arguments.done',
+        item_id: cur.itemId,
+        output_index: cur.index,
+        arguments: cur.args,
+      }),
+    );
+    return {
+      out,
+      item: {
         id: cur.itemId,
         type: 'function_call',
         call_id: cur.callId,
         name: cur.name,
         arguments: cur.args,
         status: 'completed',
-      };
-      out.push(this.line({ type: 'response.output_item.done', output_index: cur.index, item }));
-      this.completedItems.push(item);
-    }
+      },
+    };
+  }
+
+  /**
+   * 关闭当前 open item(发 done 事件、回填完整文本/参数、进 completedItems)。幂等。
+   * 各形态的收尾细节在 closeX;「output_item.done 与 completedItems 必须成对」这条不变量
+   * **只在这里**出现一次,新增 item 形态别把它抄进 closeX。
+   */
+  private closeCurrent(): string[] {
+    const cur = this.current;
+    if (!cur) return [];
+    this.current = undefined;
+    this.outputIndex++;
+
+    const { out, item } =
+      cur.kind === 'message'
+        ? this.closeMessage(cur)
+        : cur.kind === 'reasoning'
+          ? this.closeReasoning(cur)
+          : this.isCustom(cur.name)
+            ? this.closeCustomToolCall(cur)
+            : this.closeFunctionCall(cur);
+
+    out.push(this.line({ type: 'response.output_item.done', output_index: cur.index, item }));
+    this.completedItems.push(item);
     return out;
   }
 

@@ -23,7 +23,8 @@ export async function handleResponsesNonStreamRequest(
   reply: FastifyReply,
   createdAt: number,
   emptyStreamRetries = 0,
-  rescueRegistry?: ToolTextRegistry,
+  rescueRegistry: ToolTextRegistry | undefined,
+  customToolNames: ReadonlySet<string>,
 ): Promise<MessageHandlerResult> {
   return runOpenAiNonStream(
     provider,
@@ -44,6 +45,7 @@ export async function handleResponsesNonStreamRequest(
         outputTokens: outputTok,
         createdAt,
         extensions,
+        customToolNames,
       }),
   );
 }

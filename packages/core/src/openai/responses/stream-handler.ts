@@ -26,10 +26,13 @@ export async function handleResponsesStreamRequest(
   hookBus: HookBus,
   reply: FastifyReply,
   emptyStreamRetries = 0,
-  rescueRegistry?: ToolTextRegistry,
+  rescueRegistry: ToolTextRegistry | undefined,
+  customToolNames: ReadonlySet<string>,
 ): Promise<MessageHandlerResult> {
   const protocol: OpenAiStreamProtocol<ResponsesEventEncoder> = {
-    makeEncoder: (m) => new ResponsesEventEncoder(m),
+    // customToolNames 走闭包注入:它是 responses 协议特有的,而 runOpenAiStream 的签名
+    // 由 chat 端点共用。
+    makeEncoder: (m) => new ResponsesEventEncoder(m, customToolNames),
     finalTerminal: (encoder, ctx) =>
       encoder.finalize(
         buildResponsesUsage(

@@ -9,7 +9,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION" 2>/dev/null || echo 'latest')"
 DEFAULT_BASE_URL="http://host.docker.internal:8080/openai/v1"
-DEFAULT_MODEL="gpt-5-codex"
+DEFAULT_MODEL="gpt-5.6-sol"
 DEFAULT_NETWORK="bridge"
 IMAGE_PREFIX="kiro2claude-codex"
 VOLUME_NAME="kiro2claude-codex-home"
@@ -26,7 +26,7 @@ ${CYAN}kiro2claude × OpenAI Codex Docker 启动脚本${NC}
 选项:
   -t, --token TOKEN        API 认证 token(必填,或交互输入)→ KIRO2CLAUDE_API_KEY
   -u, --url URL            网关 OpenAI 端点(默认: $DEFAULT_BASE_URL)
-  -m, --model MODEL        Codex model(默认: $DEFAULT_MODEL;保持 *codex* 名字才有工具集)
+  -m, --model MODEL        Codex model(默认: $DEFAULT_MODEL)
   -v, --version VERSION    Codex 版本(默认: $DEFAULT_VERSION,源: VERSION 文件)
   -n, --network NETWORK    Docker 网络: bridge | host(默认: bridge)
   -w, --workspace DIR      挂载到容器内 /workspace 的宿主机目录
@@ -44,8 +44,10 @@ ${CYAN}kiro2claude × OpenAI Codex Docker 启动脚本${NC}
   # 挂载项目目录 + 交互
   $0 -t sk-local-test -w ~/projects/myapp
 
-说明: Codex 只支持 Responses API(wire_api=responses);model 默认 gpt-5-codex——
-Codex 只对它识别的模型名下发工具集,网关把它别名到 gpt-5.6-sol。
+说明: Codex 只支持 Responses API(wire_api=responses);model 默认 gpt-5.6-sol(真名)。
+Codex 按模型名走两套请求形态:认识的名字走 code mode(工具在 input 的
+additional_tools 里,含 freeform exec),不认识的名字 fallback 到顶层 tools。
+网关两套都支持,细节见 entrypoint.sh 头注释。
 EOF
     exit 0
 }
@@ -145,7 +147,7 @@ echo -e "${CYAN}┌────────────────────�
 echo -e "${CYAN}│  kiro2claude × OpenAI Codex Docker    │${NC}"
 echo -e "${CYAN}├─────────────────────────────────────────┤${NC}"
 echo -e "${CYAN}│${NC}  版本:   ${GREEN}${CODEX_VERSION}${NC}"
-echo -e "${CYAN}│${NC}  模型:   ${GREEN}${MODEL}${NC}  ${YELLOW}(别名→gpt-5.6-sol)${NC}"
+echo -e "${CYAN}│${NC}  模型:   ${GREEN}${MODEL}${NC}"
 echo -e "${CYAN}│${NC}  网关:   ${GREEN}${RUNTIME_URL}${NC}"
 echo -e "${CYAN}│${NC}  Token:  ${GREEN}${AUTH_TOKEN:0:16}...${NC}"
 [[ -n "$WORKSPACE" ]] && echo -e "${CYAN}│${NC}  工作区: ${GREEN}${ABS_WORKSPACE}${NC}"

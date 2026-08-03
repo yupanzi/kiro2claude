@@ -125,11 +125,10 @@ export function mapModel(model: string): string | undefined {
     if (lower.includes('sol')) return 'gpt-5.6-sol';
     if (lower.includes('terra')) return 'gpt-5.6-terra';
     if (lower.includes('luna')) return 'gpt-5.6-luna';
-    // Codex CLI 别名:Codex 只对它**内部识别**的模型名下发工具集(实测
-    // gpt-5.6-sol→0 工具 / gpt-5-codex→10 工具)。所以走 Codex 且要工具调用时,
-    // config.toml 必须用 `gpt-5-codex` 这类名字;网关把它们别名到 GPT-5.6 旗舰
-    // (sol),让 Codex 工具调用端到端可用。想换档在 Codex 端改不了(会丢工具),
-    // 只能改这里的别名目标。
+    // Codex CLI 别名:`gpt-*-codex` 一律映到 GPT-5.6 旗舰(sol)。这**不是**工具调用的
+    // 前提——Codex 认识 `gpt-5.6-sol` 并对它走 code mode(工具在 input 的 additional_tools
+    // 里),网关已直接支持,harness 默认就用真名。别名保留只为不打断老配置:不认识的名字
+    // fallback 到标准顶层 tools 形态、同样可用。详见踩坑「Codex code mode」。
     if (lower.includes('codex')) return 'gpt-5.6-sol';
     return undefined;
   }

@@ -4,12 +4,16 @@ set -e
 # 运行时从环境变量生成 ~/.codex/config.toml,把 Codex 指向 kiro2claude 网关的
 # OpenAI **Responses API** 端点(wire_api=responses;Codex 0.122+ 只支持 responses)。
 #
-# 关键:model 默认 `gpt-5-codex`——Codex 只对它**内部识别**的模型名下发工具集
-# (实测 gpt-5.6-sol→0 工具 / gpt-5-codex→10 工具),网关 mapModel 再把
-# `gpt-5-codex` 别名到真实的 gpt-5.6-sol。想要工具调用就保持这个名字。
+# model 默认 `gpt-5.6-sol`(真名,无需别名)。★ Codex 按模型名走**两套请求形态**:
+#   - **认识**的名字(gpt-5.6-sol)→ code mode:顶层 tools/instructions 消失,工具
+#     改由 input 的 `additional_tools` item 携带,含 type:"custom" 的 freeform
+#     `exec`(所有真实工具如 apply_patch/exec_command 都藏在它的描述里)。
+#   - **不认识**的名字(gpt-5-codex / o3 / sol …)→ 打印 "Model metadata not found"
+#     并 fallback 到标准顶层 tools(10 个 function/namespace/web_search)。
+# 网关两套都支持(见 core/src/openai/responses/converter.ts),所以直接用真名即可。
 
 CONFIG="$HOME/.codex/config.toml"
-: "${CODEX_MODEL:=gpt-5-codex}"
+: "${CODEX_MODEL:=gpt-5.6-sol}"
 : "${KIRO2CLAUDE_BASE_URL:=http://host.docker.internal:8080/openai/v1}"
 
 cat > "$CONFIG" <<EOF

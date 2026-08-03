@@ -166,3 +166,67 @@ describe('buildResponsesUsage', () => {
     });
   });
 });
+
+describe('buildResponsesObject: freeform(custom)工具', () => {
+  it('customToolNames 命中 → custom_tool_call item(input 取回裸文本)', () => {
+    const r = buildResponsesObject({
+      reduced: reduced({
+        toolUses: [
+          { type: 'tool_use', id: 'tooluse_1', name: 'exec', input: { input: 'text("hi")' } },
+          { type: 'tool_use', id: 'tooluse_2', name: 'wait', input: { cell_id: 'c1' } },
+        ],
+        hasToolUse: true,
+      }),
+      model: 'gpt-5.6-sol',
+      inputTokens: 1,
+      outputTokens: 1,
+      createdAt: 0,
+      customToolNames: new Set(['exec']),
+    });
+    // 同一响应里两种形态并存:custom 走 input 裸文本,其余仍是 function_call + arguments
+    expect(r.output).toEqual([
+      expect.objectContaining({
+        type: 'custom_tool_call',
+        call_id: 'tooluse_1',
+        name: 'exec',
+        input: 'text("hi")',
+        status: 'completed',
+      }),
+      expect.objectContaining({
+        type: 'function_call',
+        call_id: 'tooluse_2',
+        name: 'wait',
+        arguments: '{"cell_id":"c1"}',
+      }),
+    ]);
+  });
+
+  it('替身字段缺失/非字符串 → input 空串(不塞 JSON 串)', () => {
+    const r = buildResponsesObject({
+      reduced: reduced({
+        toolUses: [{ type: 'tool_use', id: 'c', name: 'exec', input: { input: { oops: 1 } } }],
+        hasToolUse: true,
+      }),
+      model: 'gpt-5.6-sol',
+      inputTokens: 1,
+      outputTokens: 1,
+      createdAt: 0,
+      customToolNames: new Set(['exec']),
+    });
+    expect(r.output[0]).toMatchObject({ type: 'custom_tool_call', input: '' });
+  });
+
+  it('不传 customToolNames → 全部 function_call(标准形态不变)', () => {
+    const r = buildResponsesObject({
+      reduced: reduced({
+        toolUses: [{ type: 'tool_use', id: 'c', name: 'exec', input: { input: 'x' } }],
+        hasToolUse: true,
+      }),
+      model: 'gpt-5.6-sol',
+      inputTokens: 1,
+      outputTokens: 1,
+      createdAt: 0,
+    });
+    expect(r.output[0]).toMatchObject({ type: 'function_call', arguments: '{"input":"x"}' });
+  });
+});

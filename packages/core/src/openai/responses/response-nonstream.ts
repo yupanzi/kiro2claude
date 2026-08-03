@@ -10,6 +10,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { type ReducedAttempt, reducedReasoning } from '../../claude/non-stream-reduce.js';
 import { mergeUsageExtensions, type PluginUsageExtensions } from '../../claude/stream.js';
+import { NO_FREEFORM_TOOLS, unwrapFreeformInput } from '../freeform-tool.js';
 import type { ResponsesObject, ResponsesOutputItem, ResponsesUsage } from './types.js';
 
 export function buildResponsesUsage(
@@ -33,8 +34,18 @@ export function buildResponsesObject(args: {
   outputTokens: number;
   createdAt: number;
   extensions?: PluginUsageExtensions;
+  /** freeform 工具名(请求侧收集);命中者产 custom_tool_call 而非 function_call。 */
+  customToolNames?: ReadonlySet<string>;
 }): ResponsesObject {
-  const { reduced, model, inputTokens, outputTokens, createdAt, extensions } = args;
+  const {
+    reduced,
+    model,
+    inputTokens,
+    outputTokens,
+    createdAt,
+    extensions,
+    customToolNames = NO_FREEFORM_TOOLS,
+  } = args;
 
   const output: ResponsesOutputItem[] = [];
 
@@ -60,14 +71,26 @@ export function buildResponsesObject(args: {
   }
 
   for (const tu of reduced.toolUses) {
-    output.push({
-      id: `fc_${uuidv4().replace(/-/g, '')}`,
-      type: 'function_call',
-      call_id: String(tu.id),
-      name: String(tu.name),
-      arguments: JSON.stringify(tu.input ?? {}),
-      status: 'completed',
-    });
+    const name = String(tu.name);
+    const base = { call_id: String(tu.id), name, status: 'completed' as const };
+    const uid = uuidv4().replace(/-/g, '');
+    // freeform 工具:从替身取回裸文本(codec 见 openai/freeform-tool.ts)。流式侧的同一
+    // 分派在 response-stream.ts 的 closeCurrent。
+    output.push(
+      customToolNames.has(name)
+        ? {
+            ...base,
+            id: `ctc_${uid}`,
+            type: 'custom_tool_call',
+            input: unwrapFreeformInput(tu.input),
+          }
+        : {
+            ...base,
+            id: `fc_${uid}`,
+            type: 'function_call',
+            arguments: JSON.stringify(tu.input ?? {}),
+          },
+    );
   }
 
   return {

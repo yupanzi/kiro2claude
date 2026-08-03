@@ -4,6 +4,12 @@
  * Codex CLI 0.122+ 只说 Responses API(`wire_api=chat` 已移除)。请求用
  * `input`(items 数组)+ `instructions` + 扁平 `tools`;响应是 `output`(items)
  * + 语义 SSE 事件流。只覆盖网关实际读写的字段。
+ *
+ * ★ **两套请求形态**(踩坑「Codex code mode」):Codex 对**内部已知**的模型名
+ * (实测 `gpt-5.6-sol`)切到 **code mode**——`tools` 与 `instructions` 顶层字段
+ * 双双消失,工具改由 `input` 里的 `additional_tools` item 携带,且含 `type:"custom"`
+ * 的 freeform 工具;不认识的名字(实测 `gpt-5-codex` / `o3`)才 fallback 到标准
+ * 顶层 `tools`。两套都必须支持,判别只看**字段在不在**、不看模型名。
  */
 
 // ============================================================================
@@ -44,19 +50,66 @@ export interface ResponsesReasoningItem {
   encrypted_content?: string;
 }
 
+/**
+ * code mode 的工具投递通道:工具不在顶层 `tools`,而是作为 `input` 的**第一个 item**
+ * 送来(role 是 `developer`,但**不是** message——误当 message 会既丢工具又把它落进
+ * 兜底分支)。见文件头「两套请求形态」。
+ */
+export interface ResponsesAdditionalToolsItem {
+  type: 'additional_tools';
+  role?: string;
+  tools?: ResponsesTool[];
+}
+
+/**
+ * freeform(`type:"custom"`)工具的调用历史项。★ `input` 是**裸字符串**(工具原始
+ * 文本,如 JS 源码),不是 `function_call.arguments` 那样的 JSON 串。
+ */
+export interface ResponsesCustomToolCallItem {
+  type: 'custom_tool_call';
+  id?: string;
+  call_id: string;
+  name: string;
+  input: string;
+  status?: string;
+}
+
+/**
+ * freeform 工具的结果项。★ `output` 实测是 **content part 数组**
+ * (`[{type:"input_text",text}]`),而 `function_call_output.output` 是**字符串**——
+ * 两者不可互套,归一复用 converter 的 `partsText`。
+ */
+export interface ResponsesCustomToolCallOutputItem {
+  type: 'custom_tool_call_output';
+  call_id: string;
+  output: string | ResponsesContentPart[];
+}
+
 export type ResponsesInputItem =
   | ResponsesMessageItem
   | ResponsesFunctionCallItem
   | ResponsesFunctionCallOutputItem
-  | ResponsesReasoningItem;
+  | ResponsesReasoningItem
+  | ResponsesAdditionalToolsItem
+  | ResponsesCustomToolCallItem
+  | ResponsesCustomToolCallOutputItem;
 
-/** Responses 工具定义(扁平:name/description/parameters 在顶层) */
+/**
+ * Responses 工具定义(扁平:name/description/parameters 在顶层)。
+ *
+ * `type` 实测有四种:`function`(标准)、`custom`(freeform,带 `format` 语法约束、
+ * **无** `parameters`)、`namespace`(容器,子工具在 `tools`)、`web_search`(hosted)。
+ */
 export interface ResponsesTool {
   type: string;
   name?: string;
   description?: string;
   parameters?: Record<string, unknown>;
   strict?: boolean;
+  /** freeform 工具的语法约束(实测 `{type:'grammar',syntax:'lark',definition}`)。上游无对应通道,丢弃。 */
+  format?: { type?: string; syntax?: string; definition?: string };
+  /** `type:'namespace'` 的子工具。实测 Codex 拒绝直调,不展开(见 convertTools)。 */
+  tools?: ResponsesTool[];
 }
 
 export interface ResponsesRequest {
@@ -132,10 +185,25 @@ export interface ResponsesReasoningOutputItemOut {
   summary: ResponsesReasoningSummaryPart[];
 }
 
+/**
+ * freeform 工具调用 output item(code mode)。与 `function_call` 的区别:载荷字段是
+ * `input`(裸文本)而非 `arguments`(JSON 串),流式事件也换成
+ * `custom_tool_call_input.delta/done`(见 response-stream.ts 头注释)。
+ */
+export interface ResponsesCustomToolCallOutItem {
+  id: string;
+  type: 'custom_tool_call';
+  call_id: string;
+  name: string;
+  input: string;
+  status: 'in_progress' | 'completed';
+}
+
 export type ResponsesOutputItem =
   | ResponsesMessageOutputItem
   | ResponsesFunctionCallOutputItemOut
-  | ResponsesReasoningOutputItemOut;
+  | ResponsesReasoningOutputItemOut
+  | ResponsesCustomToolCallOutItem;
 
 export interface ResponsesObject {
   id: string;

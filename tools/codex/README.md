@@ -8,11 +8,20 @@
 
 Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(实测:配 `wire_api="chat"` 直接报错 `no longer supported`)。所以本 harness 用 `wire_api = "responses"`,网关的 `/openai/v1/responses` 端点接住(见 [踩坑「Codex 只说 Responses」](../../CLAUDE.md))。
 
-## ⚠ 模型名必须用 `gpt-5-codex`(才有工具集)
+## ⚠ Codex 按模型名走两套请求形态
 
-实测:**Codex 只对它内部识别的模型名下发工具集**——`gpt-5.6-sol`(自定义名)→ 0 工具;`gpt-5-codex`(Codex 认识)→ 10 工具(shell / apply_patch 等)。所以要工具调用就用 `gpt-5-codex`(harness 默认),网关 `mapModel` 把它**别名**到真实的 `gpt-5.6-sol`。Codex 会打一条 `Model metadata for gpt-5-codex not found, defaulting to fallback` 警告——**cosmetic,不影响功能**。
+抓包对比得到(**推翻了旧结论「只对识别的名字下发工具」**):
 
-想换成 terra/luna 档位:改网关 `converter.ts` 里 codex 别名的目标(Codex 端改模型名会丢工具)。
+| 模型名 | Codex 行为 | 工具在哪 |
+|---|---|---|
+| `gpt-5.6-sol`(**认识**) | **code mode** | `input[0]` 的 `additional_tools` item;顶层 `tools` / `instructions` **都不存在** |
+| `gpt-5-codex` / `o3` / `sol`(不认识) | 打 `Model metadata not found` 警告后 fallback | 顶层 `tools`(10 个) |
+
+code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wait` + `request_user_input` + `collaboration`(namespace)。**所有真实工具——`apply_patch` 写文件、`exec_command` 执行命令、`update_plan`、`view_image`——都不是独立 tool**,只写在 `exec` 那 10199 字符描述里的 TS 声明中;模型必须调 `exec` 传一段 JS(`await tools.apply_patch(...)`)才能干活。
+
+网关两套都支持(`core/src/openai/responses/converter.ts` 的 `collectTools`;freeform 工具包成单 `input` 字符串字段的 JSON 工具转发,响应侧还原成 `custom_tool_call`),所以 **harness 默认直接用真名 `gpt-5.6-sol`**。换 terra/luna 档位直接 `-m gpt-5.6-terra` 即可。
+
+> `namespace` 工具(`collaboration` / `multi_agent_v1`)**故意不转发**:实测 Codex 拒绝直调其子工具(`unsupported call: list_agents`,换 `collaboration.list_agents` 同样被拒),转发只会造出一批调不动的工具。
 
 ## 前置条件
 
@@ -40,7 +49,7 @@ Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(�
 |---|---|---|
 | `-t, --token` | API token → `KIRO2CLAUDE_API_KEY` | (必填/交互) |
 | `-u, --url` | 网关 OpenAI 端点 | `http://host.docker.internal:8080/openai/v1` |
-| `-m, --model` | Codex model(保持 `*codex*` 名字才有工具) | `gpt-5-codex` |
+| `-m, --model` | Codex model | `gpt-5.6-sol` |
 | `-v, --version` | Codex 版本 | `VERSION` 文件(`latest`) |
 | `-n, --network` | `bridge` / `host` | `bridge` |
 | `-w, --workspace` | 挂载到 `/workspace` | (无) |
@@ -50,8 +59,11 @@ Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(�
 
 ## 实测结论(已跑通)
 
+> 抓包与下列验证跑在 Codex **0.144.4 / 0.146.0**,两版行为一致。此处是本仓唯一记录 Codex 版本号的地方——判别 code mode 只看**字段在不在**,代码与其它文档都不按版本分支。
+
 - ✅ **对话**:`codex exec "..."` → 网关 `/openai/v1/responses` → gpt-5.6-sol → 正确回答。
-- ✅ **工具调用**:`gpt-5-codex` 别名 → Codex 发 10 个工具 → 模型 function_call → 容器内真实执行(如 `/bin/bash -lc 'uname -s'` → `Linux`)→ 结果回填 → 模型最终答案(多轮 function_call 全通)。
+- ✅ **工具调用(fallback 形态)**:`gpt-5-codex` → Codex 发 10 个顶层工具 → 模型 function_call → 容器内真实执行(如 `/bin/bash -lc 'uname -s'` → `Linux`)→ 结果回填 → 模型最终答案(多轮 function_call 全通)。
+- ✅ **工具调用(code mode)**:`gpt-5.6-sol` → `additional_tools` 里的 freeform `exec` → 网关编码 `custom_tool_call` → Codex 执行 JS 里的 `tools.apply_patch(...)` → 文件真实落到挂载的 workspace。
 - 容器内沙箱设 `danger-full-access` + `approval_policy=never`(容器本身即隔离,避免 landlock/seatbelt 在 Docker 里的兼容问题)。
 
 ## 调试

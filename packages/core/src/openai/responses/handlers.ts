@@ -15,6 +15,7 @@ import {
 import { captureEmptyRequest, type MessageHandlerResult } from '../../claude/empty-capture.js';
 import type { PostMessagesDeps } from '../../claude/handlers.js';
 import { buildToolTextRegistry } from '../../claude/tool-call-text.js';
+import type { MessagesRequest } from '../../claude/types.js';
 import { isThinkingEnabled } from '../../claude/types.js';
 import type { KiroRequest } from '../../kiro/model/requests/kiro.js';
 import { serializeKiroRequest } from '../../kiro/model/requests/kiro.js';
@@ -44,16 +45,35 @@ export function createPostResponses(deps: PostMessagesDeps) {
     const oaiReq = body as ResponsesRequest;
     const stream = oaiReq.stream ?? false;
 
+    // 这行是本请求的**唯一**日志(CLAUDE.md 日志红线),故转换必须在它之前完成:
+    // tool_count 要记**转换后**的数量——code mode 下顶层 tools 不存在(工具在 input 的
+    // additional_tools 里),读顶层会把这类请求恒记成 0,而「工具全丢」只在这个字段上可见。
+    // 转换抛错时也不能把这行吞掉(那正是最需要它的时候),故兜住异常补记再抛。
+    let payload: MessagesRequest;
+    let customToolNames: ReadonlySet<string>;
+    try {
+      ({ payload, customToolNames } = convertResponsesRequest(oaiReq));
+    } catch (e) {
+      log.info({
+        msg: 'POST /openai/v1/responses',
+        model: oaiReq.model,
+        stream,
+        input_type: Array.isArray(oaiReq.input) ? `items[${oaiReq.input.length}]` : 'string',
+        conversion_failed: true,
+      });
+      throw e;
+    }
+
     log.info({
       msg: 'POST /openai/v1/responses',
       model: oaiReq.model,
       stream,
       input_type: Array.isArray(oaiReq.input) ? `items[${oaiReq.input.length}]` : 'string',
-      tool_count: oaiReq.tools?.length ?? 0,
+      tool_count: payload.tools?.length ?? 0,
+      custom_tool_count: customToolNames.size,
       reasoning_effort: oaiReq.reasoning?.effort,
     });
 
-    const payload = convertResponsesRequest(oaiReq);
     const provider = deps.kiroProvider;
 
     const rescueRegistry =
@@ -120,6 +140,7 @@ export function createPostResponses(deps: PostMessagesDeps) {
         reply,
         deps.emptyStreamRetries,
         rescueRegistry,
+        customToolNames,
       );
     } else {
       result = await handleResponsesNonStreamRequest(
@@ -134,6 +155,7 @@ export function createPostResponses(deps: PostMessagesDeps) {
         Math.floor(Date.now() / 1000),
         deps.emptyStreamRetries,
         rescueRegistry,
+        customToolNames,
       );
     }
 
