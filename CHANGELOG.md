@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/yupanzi/kiro2claude/compare/v1.4.4...v1.5.0) (2026-08-03)
+
+
+### Features
+
+* **openai:** 支持 Codex code mode 与 freeform 工具 ([46968e5](https://github.com/yupanzi/kiro2claude/commit/46968e53e5741fcb739db3c4d307feddf546b8a8))
+
 ## [1.4.4](https://github.com/yupanzi/kiro2claude/compare/v1.4.3...v1.4.4) (2026-07-30)
 
 
