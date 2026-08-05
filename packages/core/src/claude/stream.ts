@@ -1443,6 +1443,11 @@ export class StreamContext {
     // Use contextUsageEvent input_tokens if available, otherwise estimated
     const finalInputTokens = this.contextInputTokens ?? this.inputTokens;
 
+    // 物化一次:hook meta 与下面的 stream statistics 日志共用同一份快照。别在其中
+    // 一处改回直接读 `this.eventCounts` —— `getEventCounts()` 是对外唯一访问器,
+    // 绕过它的那一处会在访问器将来加过滤/缓存时与 hook meta 悄悄分叉。
+    const finalEventCounts = this.getEventCounts();
+
     // Build the hook event surface for plugins
     const hookEvent = buildKiroUsageFinishEvent({
       model: this.model,
@@ -1450,7 +1455,7 @@ export class StreamContext {
       outputTokens: this.outputTokens,
       inputTokensFromUpstream: this.contextInputTokens !== undefined,
       kiroMetering: this.kiroMeteringRaw,
-      eventCounts: this.getEventCounts(),
+      eventCounts: finalEventCounts,
       logger: getLogger(),
     });
     await this.hookBus.runUsageFinish(hookEvent);
@@ -1465,7 +1470,7 @@ export class StreamContext {
 
     getLogger().debug({
       msg: 'stream statistics',
-      event_counts: Object.fromEntries(this.eventCounts),
+      event_counts: finalEventCounts,
       thinking_detected: this.thinkingExtracted,
       output_tokens: this.outputTokens,
       input_tokens: finalInputTokens,

@@ -846,27 +846,29 @@ function synthesizeMissingToolResults(
     if (msg.kind !== 'assistant') continue;
 
     const toolUses = msg.assistantResponseMessage.toolUses;
-    if (!toolUses) continue;
+    if (!toolUses?.length) continue;
+
+    // 挂载点只取决于**位置**,与补了几条无关 —— 先选好 sink 直推,不必先攒进中间
+    // 数组再决定往哪倒。tool_result 属于该 assistant 之后那条 user 消息;末条
+    // assistant(或交替被破坏)则归 currentMessage,经返回值交给调用方。
+    const next = history[i + 1];
+    const sink =
+      next?.kind === 'user' ? next.userInputMessage.userInputMessageContext.toolResults : trailing;
 
     // `delete` 而非 `has`:一次消费一个 id,使这一趟**幂等**。同一个 toolUseId 若
     // 出现在两条 assistant 上(畸形历史/客户端重发),`has` 会给它合成两条
     // tool_result、挂到两条不同 user 消息上——正好是本函数要消除的那类坏配对。
     // 旧的「删除 tool_use」实现天然幂等,换成补齐后必须显式维持。
-    // (返回 boolean 的 delete 同时省掉了中间数组。)
-    const synthesized: ToolResult[] = [];
     for (const tu of toolUses) {
-      if (!orphanedIds.delete(tu.toolUseId)) continue;
-      synthesized.push(toolResultError(tu.toolUseId, INTERRUPTED_TOOL_RESULT_TEXT));
+      if (orphanedIds.delete(tu.toolUseId)) {
+        sink.push(toolResultError(tu.toolUseId, INTERRUPTED_TOOL_RESULT_TEXT));
+      }
     }
-    if (synthesized.length === 0) continue;
 
-    const next = history[i + 1];
-    if (next?.kind === 'user') {
-      next.userInputMessage.userInputMessageContext.toolResults.push(...synthesized);
-    } else {
-      // 末条 assistant(或交替被破坏):它的 tool_result 归当前消息。
-      trailing.push(...synthesized);
-    }
+    // 孤儿消费完即止:再往后 `delete` 恒为 false、循环不再有任何副作用。早退是把这
+    // 个不变式写进代码,省得读到这里的人自己论证一遍——收益在可读性,不在耗时(函数
+    // 开头的 `size === 0` 早返回已把无孤儿的请求整个挡在循环外)。
+    if (orphanedIds.size === 0) break;
   }
 
   return trailing;

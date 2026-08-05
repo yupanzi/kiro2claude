@@ -514,14 +514,11 @@ export async function handleStreamRequest(
     stop_reason: ctx.stateManager.getStopReason(),
     thinking_detected: ctx.thinkingExtracted,
     kiro_metering: ctx.kiroMeteringRaw,
-    // 上游已扣费、这边记不了账(判据与理由见 isMeteringLost —— plugin 侧的
-    // `kiro.meteringMissing` meta 同源于它)。单独打标而不是靠 kiro_metering 为空
-    // 去推:与 drained_after_disconnect 的口径**不同**——后者是「付了钱但客户端
-    // 不要了」,这个是「付了钱且账目丢了」,排查和治理路径不一样。
-    // ⚠ 两者对 abortUpstreamOnDisconnect 的反应**相反**:该 flag 消除
-    // drained_after_disconnect(不再为没人读的响应付费),却让本字段在**每次**断连
-    // 时为真——abort 只掐掉断连点之后的生成,之前已烧的 credit 照样没有 Metering
-    // 帧可记。那个配置下本字段的基线不为零,统计漏账规模时必须先按 aborted 分桶。
+    // 上游已扣费、这边记不了账。判据与两条口径偏差(abort flag 下多报、判空路径下
+    // 漏报)都在 isMeteringLost 头注释,plugin 侧的 `kiro.meteringMissing` 同源于它。
+    // 这里只记本文件独有的一点:与紧邻的 drained_after_disconnect **口径不同**——
+    // 后者是「付了钱但客户端不要了」,本字段是「付了钱且账目丢了」,两者对
+    // abortUpstreamOnDisconnect 的反应恰好相反,排查与治理路径也不一样。
     metering_lost: isMeteringLost(ctx.kiroMeteringRaw, finalEventCounts),
     committed,
     aborted: aborted.value,

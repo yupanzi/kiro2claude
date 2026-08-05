@@ -127,6 +127,12 @@ export async function handleNonStreamRequest(
       unknownEventTypes,
     } = reduceKiroResponse(bodyBytes, model, thinkingEnabled, toolNameMap, rescueRegistry);
 
+    // 物化一次:判空/错误/成功三条路径都要读它,取同一份快照才保证同一条日志里
+    // metering_lost 与 event_counts 互相自洽,读的人也不必回头论证中途没人改过这个
+    // Map。与 stream-handler.ts 的 finalEventCounts、openai/non-stream-transport.ts
+    // 的 eventCounts 同手法——这里是四条 transport 里最后一个拉齐的。
+    const finalEventCounts = Object.fromEntries(eventCounts);
+
     // Mid-stream upstream Error/Exception frame → surface as a real error instead
     // of silently returning partial content (or being misread as an empty stream
     // and burning retries). Non-stream never mid-commits (single reply.send at the
@@ -137,11 +143,7 @@ export async function handleNonStreamRequest(
       // 恢复且无成本可烧 → 走与空响应相同的有界重试。上游**已开工**才是确定性终止,
       // 那时重发只会再烧一遍。与流式路径 deterministicUpstreamError 对称;判据用
       // sawBillableWork 而非「有无 toolUses/文本」(GPT 加密 reasoning 不可见但计费)。
-      if (
-        !sawBillableWork(Object.fromEntries(eventCounts)) &&
-        attempt < maxAttempts &&
-        !aborted.value
-      ) {
+      if (!sawBillableWork(finalEventCounts) && attempt < maxAttempts && !aborted.value) {
         emptyAttempts++;
         log.warn({
           msg: 'upstream rejected with zero frames (non-stream), retrying',
@@ -164,7 +166,7 @@ export async function handleNonStreamRequest(
           outputTokens: 0,
           inputTokensFromUpstream: contextInputTokens !== undefined,
           kiroMetering,
-          eventCounts: Object.fromEntries(eventCounts),
+          eventCounts: finalEventCounts,
           logger: log,
         });
         await hookBus.runUsageFinish(hookEvent);
@@ -177,8 +179,8 @@ export async function handleNonStreamRequest(
         input_tokens: contextInputTokens ?? inputTokens,
         // 这条路径上 usage-finish hook 只在 `if (kiroMetering)` 里跑,所以「已开工
         // 但没拿到 Metering」的漏账**对 plugin 不可见**——日志是它唯一的出口。
-        metering_lost: isMeteringLost(kiroMetering, Object.fromEntries(eventCounts)),
-        event_counts: Object.fromEntries(eventCounts),
+        metering_lost: isMeteringLost(kiroMetering, finalEventCounts),
+        event_counts: finalEventCounts,
         unknown_event_types: [...unknownEventTypes],
         total_duration_ms: Date.now() - apiStart,
       });
@@ -201,7 +203,7 @@ export async function handleNonStreamRequest(
           remaining: maxAttempts - attempt,
           input_tokens: contextInputTokens ?? inputTokens,
           stop_reason: stopReason,
-          event_counts: Object.fromEntries(eventCounts),
+          event_counts: finalEventCounts,
           tool_use_names: [...announcedToolNames],
         });
         continue;
@@ -211,7 +213,7 @@ export async function handleNonStreamRequest(
           msg: 'upstream announced tool_use but never completed the frame (non-stream) — deterministic empty, not retrying',
           attempt,
           stop_reason: stopReason,
-          event_counts: Object.fromEntries(eventCounts),
+          event_counts: finalEventCounts,
           tool_use_names: [...announcedToolNames],
         });
       }
@@ -222,7 +224,7 @@ export async function handleNonStreamRequest(
         empty_attempts: emptyAttempts,
         input_tokens: contextInputTokens ?? inputTokens,
         stop_reason: stopReason,
-        event_counts: Object.fromEntries(eventCounts),
+        event_counts: finalEventCounts,
         tool_use_names: [...announcedToolNames],
         total_duration_ms: Date.now() - apiStart,
       });
@@ -273,7 +275,7 @@ export async function handleNonStreamRequest(
       outputTokens,
       inputTokensFromUpstream: contextInputTokens !== undefined,
       kiroMetering,
-      eventCounts: Object.fromEntries(eventCounts),
+      eventCounts: finalEventCounts,
       logger: log,
     });
     await hookBus.runUsageFinish(hookEvent);
@@ -305,7 +307,7 @@ export async function handleNonStreamRequest(
       // 与流式 transport 同源同名(判据见 isMeteringLost)。非流式没有 drain grace,
       // 但上游照样可能只发内容帧、不发尾帧 Metering;缺了这行,按此字段统计的漏账
       // 规模就只覆盖流式那一半。
-      metering_lost: isMeteringLost(kiroMetering, Object.fromEntries(eventCounts)),
+      metering_lost: isMeteringLost(kiroMetering, finalEventCounts),
       // 前向兼容观测:上游若发来未识别 event-type,在此显形(当前为良性 metadata)。
       unknown_event_types: [...unknownEventTypes],
       total_duration_ms: Date.now() - apiStart,
@@ -313,7 +315,7 @@ export async function handleNonStreamRequest(
 
     log.debug({
       msg: 'non-stream event distribution',
-      event_counts: Object.fromEntries(eventCounts),
+      event_counts: finalEventCounts,
     });
 
     reply.send(responseBody);
