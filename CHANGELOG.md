@@ -1,3 +1,10 @@
+## [1.5.1](https://github.com/yupanzi/kiro2claude/compare/v1.5.0...v1.5.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **core:** 孤儿 tool_use 补齐结果、漏账显式打标 ([eb9e3c3](https://github.com/yupanzi/kiro2claude/commit/eb9e3c3dd91a5dcbfc0efcb786ddc811bb989bb5))
+
 # [1.5.0](https://github.com/yupanzi/kiro2claude/compare/v1.4.4...v1.5.0) (2026-08-03)
 
 
