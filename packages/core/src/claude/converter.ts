@@ -60,6 +60,17 @@ export const UNSUPPORTED_DOCUMENT_PLACEHOLDER =
   'so it was not delivered to the model. If its contents matter, extract the text yourself ' +
   '(e.g. via a shell tool like `pdftotext`, or a PDF/Office parsing library) and resend it as plain text.]';
 
+/**
+ * 补给孤儿 tool_use 的 tool_result 文案(见 synthesizeMissingToolResults)。写给
+ * **模型**看,不是给人看:说清这次调用没有结果、别当成功、也别无脑重跑。措辞保持
+ * 中性,不提网关/上游身份(响应文案中性化规则)——它会随历史一起进上游,也可能被
+ * 模型转述给终端用户。与上面两条同放此处:「网关塞给模型看的文案」应当一处可枚举。
+ */
+export const INTERRUPTED_TOOL_RESULT_TEXT =
+  'This tool call did not complete and returned no result. It was either interrupted before finishing, ' +
+  'or its result was dropped from the conversation history. Do not assume it succeeded; re-run it only ' +
+  'if the task still requires it.';
+
 /** Kiro API max tool name length */
 // TOOL_NAME_MAX_LEN / shortenToolName / mapToolName live in ./converter/tool-name-map.ts
 // so the 63-char upstream cap has exactly one source of truth. Re-imported above
@@ -780,41 +791,85 @@ function validateToolPairing(
     }
   }
 
-  // Log orphaned tool_uses
-  for (const orphanedId of unpairedToolUseIds) {
-    getLogger().warn(
-      `Detected orphaned tool_use: no corresponding tool_result, will remove from history, tool_use_id=${orphanedId}`,
-    );
-  }
-
   return [filteredResults, unpairedToolUseIds];
 }
 
 /**
- * Remove orphaned tool_uses from history.
+ * 给孤儿 tool_use **补齐** tool_result,而不是把 tool_use 从历史里删掉。
  *
- * Kiro API requires each tool_use to have a corresponding tool_result.
+ * Kiro API 要求每个 tool_use 都有对应的 tool_result,否则整个请求被拒——这是上游
+ * 硬约束,不是可选项。历史实现满足它的方式是**删除** tool_use:请求能过,但代价是
+ * 模型再也看不到自己调用过那个工具,可能原地重复调用;而客户端收到的是正常 200,
+ * 唯一的痕迹是网关日志里一行 warn,用户无从得知历史被改写过。
+ *
+ * 孤儿的成因全在客户端侧,且都会**固化**:用户在工具执行中途打断(ESC)、并行
+ * tool_use 只回收了部分 tool_result、或上下文压缩裁掉了带 tool_result 的那条 user
+ * 消息。任一情况下这段坏历史都留在客户端会话里,之后每次请求重发一遍(实测同一
+ * tool_use_id 跨 12 个 reqId、11 分钟)——所以「一次性失误」会变成永久失忆。
+ *
+ * 补一条 isError 的 tool_result 同时满足两边:上游的配对约束成立,模型也看得到
+ * 「这次调用被中断、没有结果」,据此不重复调用、必要时在回复里向用户说明。
+ * Messages API 没有 warning 通道,**让模型转述是唯一能闭环到用户的路径**。
+ *
+ * 挂载位置遵循 Kiro 历史的 user/assistant 严格交替:tool_result 属于 tool_use 所在
+ * assistant **之后**的那条 user 消息。若该 assistant 是 history 末条,其 tool_result
+ * 本就该落在 currentMessage 上——这部分经返回值交给调用方,不在这里改 history 结构
+ * (插入新消息会破坏交替,风险远大于收益)。
+ *
+ * 连带效应(有意):tool_use 不再被删,`collectHistoryToolNames` 就仍能看见这些工具名,
+ * 于是第 10 步照常为它们补 placeholder 工具定义——上游需要这些定义才认历史里的调用。
+ *
+ * @returns 需挂到 currentMessage 的合成 tool_result;history 内的已就地补齐
  */
-function removeOrphanedToolUses(history: KiroMessage[], orphanedIds: Set<string>): void {
-  if (orphanedIds.size === 0) return;
+function synthesizeMissingToolResults(
+  history: KiroMessage[],
+  orphanedIds: Set<string>,
+): ToolResult[] {
+  if (orphanedIds.size === 0) return [];
 
-  for (const msg of history) {
-    if (msg.kind === 'assistant') {
-      const am = msg.assistantResponseMessage;
-      if (am.toolUses) {
-        const originalLen = am.toolUses.length;
-        am.toolUses = am.toolUses.filter((tu) => !orphanedIds.has(tu.toolUseId));
+  // 日志归这里而不是发现孤儿的 validateToolPairing:那边只知道「有孤儿」,这条 warn
+  // 说的却是「怎么处理孤儿」——策略写在这个函数里,写在别处必然随策略变更而说谎
+  // (上一版就是这样,文案还停在「will remove from history」)。
+  // 聚合成一条而非按 id 逐条:孤儿**固化**在客户端会话里,同一段坏历史每次请求重发
+  // 一遍(实测同一 tool_use_id 跨 12 个 reqId),逐条打会刷屏且掩盖「是同一个」这个
+  // 关键事实。结构化字段而非拼字符串,便于按 orphaned_count 统计分布。
+  getLogger().warn({
+    msg: 'orphaned tool_use has no tool_result, synthesizing an interrupted result',
+    orphaned_count: orphanedIds.size,
+    tool_use_ids: [...orphanedIds],
+  });
 
-        if (am.toolUses.length === 0) {
-          am.toolUses = undefined;
-        } else if (am.toolUses.length !== originalLen) {
-          getLogger().debug(
-            `Removed ${originalLen - am.toolUses.length} orphaned tool_use(s) from assistant message`,
-          );
-        }
-      }
+  const trailing: ToolResult[] = [];
+
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    if (msg.kind !== 'assistant') continue;
+
+    const toolUses = msg.assistantResponseMessage.toolUses;
+    if (!toolUses) continue;
+
+    // `delete` 而非 `has`:一次消费一个 id,使这一趟**幂等**。同一个 toolUseId 若
+    // 出现在两条 assistant 上(畸形历史/客户端重发),`has` 会给它合成两条
+    // tool_result、挂到两条不同 user 消息上——正好是本函数要消除的那类坏配对。
+    // 旧的「删除 tool_use」实现天然幂等,换成补齐后必须显式维持。
+    // (返回 boolean 的 delete 同时省掉了中间数组。)
+    const synthesized: ToolResult[] = [];
+    for (const tu of toolUses) {
+      if (!orphanedIds.delete(tu.toolUseId)) continue;
+      synthesized.push(toolResultError(tu.toolUseId, INTERRUPTED_TOOL_RESULT_TEXT));
+    }
+    if (synthesized.length === 0) continue;
+
+    const next = history[i + 1];
+    if (next?.kind === 'user') {
+      next.userInputMessage.userInputMessageContext.toolResults.push(...synthesized);
+    } else {
+      // 末条 assistant(或交替被破坏):它的 tool_result 归当前消息。
+      trailing.push(...synthesized);
     }
   }
+
+  return trailing;
 }
 
 // ============================================================================
@@ -1458,8 +1513,9 @@ export function convertRequest(
   // 8. Validate and filter tool_use/tool_result pairing
   const [validatedToolResults, orphanedToolUseIds] = validateToolPairing(history, toolResults);
 
-  // 9. Remove orphaned tool_uses from history
-  removeOrphanedToolUses(history, orphanedToolUseIds);
+  // 9. 给孤儿 tool_use 补齐 tool_result（保住历史完整性，见函数头注释）。
+  // 返回值 = 该落在 currentMessage 上的那部分（末条 assistant 的 tool_use）。
+  const synthesizedToolResults = synthesizeMissingToolResults(history, orphanedToolUseIds);
 
   // 10. Collect history tool names and create placeholder definitions for missing tools
   const historyToolNames = collectHistoryToolNames(history);
@@ -1486,7 +1542,9 @@ export function convertRequest(
 
   // 11. Build UserInputMessageContext —— current message 同样带 envState
   const context: UserInputMessageContext = {
-    toolResults: validatedToolResults,
+    // 合成的排在客户端真实结果之后:末条 assistant 的 tool_use 逻辑上属于「当前
+    // 这一轮」,顺序上也应跟在客户端本次真正回来的 tool_result 后面。
+    toolResults: [...validatedToolResults, ...synthesizedToolResults],
     tools,
     envState,
   };

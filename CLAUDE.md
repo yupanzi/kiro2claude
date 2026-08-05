@@ -50,7 +50,8 @@ packages/core/src/
     ├── stream-handler.ts     流式 handler;deferred commit + 空流有界重试(见「流式」组)
     ├── non-stream-handler.ts 非流式 handler;判空/重试镜像
     ├── non-stream-reduce.ts  reduceKiroResponse:bytes→归约;claude & openai 非流式共用的纯函数
-    ├── stream.ts             SSE 状态机;finish 调 hookBus;buildClaudeUsagePayload = Claude usage 唯一组装点
+    ├── stream.ts             SSE 状态机;finish 调 hookBus;buildClaudeUsagePayload = Claude usage 唯一组装点;
+    │                         buildKiroUsageFinishEvent = `kiro.*` meta 唯一构造点;isMeteringLost = 漏账判据唯一定义点
     ├── empty-capture.ts      空流类型 + 诊断抓包(KIRO2CLAUDE_CAPTURE_EMPTY_DIR)
     ├── tool-call-text.ts     泄漏工具调用的检测/救援/剥除;★ 头注释 = 全部红线(踩坑「工具调用文本泄漏」)
     ├── error-mapper.ts       classifyProviderError(状态/文案/Retry-After 真相源)+ mapProviderError
@@ -108,6 +109,9 @@ flowchart LR
 | 上游"容量不足"三种形态各自出什么下游状态 | `MODEL_CAPACITY_REASONS` 头注释(`kiro/provider-error.ts`)= 三形态 + 判别顺序;施加点与红线见「错误流转」+ 踩坑「跨模型对照」 |
 | kiro-cli 伪装 wire 字段 / 期望版本 | `fixtures/kiro-cli-profile.json` + `kiro/client-profile.ts` FALLBACK_PROFILE |
 | `usage` 字段如何被 plugin 注入 | plugin 用 `event.addExtension(...)` / `event.overrideStandardField(...)`;core 不输出特定 plugin 字段 |
+| plugin 能读到哪些 `kiro.*` meta 键 | 实现 = `buildKiroUsageFinishEvent`(`claude/stream.ts`)的 meta 字面量;文档两份(`plugin-api/src/types.ts` 的 `getMeta` 头注释 + [PLUGIN-DEVELOPMENT.md](./docs/PLUGIN-DEVELOPMENT.md)「Meta 键」表)。三方由 `test/static/usage-meta-contract.test.ts` 钉死,**加键必须同改三处**。⚠ 键恒在、值可为 `undefined`,别用 `listMetaKeys().includes()` 判可用性 |
+| 上游已扣费但网关没记上账 | `isMeteringLost`(`claude/stream.ts`)= 判据唯一定义点;plugin 侧读 `kiro.meteringMissing` meta,运维侧读四条终态路径日志的 `metering_lost`。★ 用它估规模前先读其头注释的两条口径偏差(abort 配置下**多报**、判空/重试路径**漏报**)|
+| 孤儿 tool_use(无配对 tool_result)怎么处理 | `synthesizeMissingToolResults`(`claude/converter.ts`)**补** isError tool_result,不再删 tool_use——删了模型会失忆并原地重复调用。挂载位置规则、幂等性(`orphanedIds.delete`)、对 `collectHistoryToolNames` 的连带效应全在其头注释 |
 | GPT 反演为何 credit 锚定(不做 token 分解)| `plugin-derived/src/derive.ts` `gptCreditAnchoredBreakdown` + 踩坑「GPT credit 锚定」 |
 | `/api/*` 怎么剥 plugin 扩展 | `index.ts` 的 `/api/*` register 处 + `buildClaudeUsagePayload`(`claude/stream.ts`)|
 | 空流重试 / 判空 / 抓包 | 踩坑「空流有界重试」:`stream-handler.ts` + `stream.ts`(`sawCompletedToolUse`)+ `empty-capture.ts` 头注释 |
@@ -211,7 +215,7 @@ flowchart LR
 ### 流式传输 · 断连 · 空流
 
 - **空流有界重试(只吸收*瞬时*空流)**:上游偶发「200 OK + 零内容帧」,客户端无法与真实过载区分,retry-executor 看不到 2xx 的 event-stream body。**仅 pre-commit**(未写任何字节)对同一请求重发最多 `KIRO2CLAUDE_EMPTY_STREAM_RETRIES`(默认 2)次,已 commit 绝不重试。★ **确定性空流单次定案、不耗重试预算**(重发只会同样失败、白烧 credit),四类:`max_tokens` / `model_context_window_exceeded` / 截断 tool_use(宣告 tool_use 却无一帧 `isComplete`)/ 上游 Error·Exception 帧**且已开工**。末类限定词必须:零帧拒绝(未开工)属**瞬时**故障、走有界重试。判据用 `sawBillableWork()` 而**不是** `hasContent()`——GPT 加密 reasoning 计费但不 surface(踩坑「GPT 完全相同上游」),`hasContent()` 会把烧了数千帧 reasoning 的流谎报为空;与 retryable 分类无关(那个集合实测不完整)。文案 `selectEmptyUpstreamMessage` 的 `deterministic` 参数必须显式传,别靠 `emptyAttempts` 倒推。新增判空分支先问「是不是内容绑定的」,是则加进排除列表。红线在 `stream-handler.ts` / `non-stream-handler.ts` / `stream.ts`(`sawCompletedToolUse`)/ `empty-capture.ts` 头注释;不明空流用 `KIRO2CLAUDE_CAPTURE_EMPTY_DIR` 抓包,别盲改 converter
-- **断连计费:默认 drain 如实计费,abort 省 credit 但记账偏低**:客户端断连后默认 drain 上游到 EOF 拿尾帧 Metering **全额计费**。`KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT`(默认 false)开启后断连**主动 abort 上游**(signal 经 provider→retry-executor `axiosConfig` 透传)省下断连点后的 credit;**代价**是拿不到 Metering、per-request 记账偏低。仅 Claude 端 stream;`logFields.drained_after_disconnect` 观测
+- **断连计费:默认 drain 如实计费,abort 省 credit 但记账偏低**:客户端断连后默认 drain 上游到 EOF 拿尾帧 Metering **全额计费**。`KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT`(默认 false)开启后断连**主动 abort 上游**(signal 经 provider→retry-executor `axiosConfig` 透传)省下断连点后的 credit;**代价**是拿不到 Metering、per-request 记账偏低。仅 Claude 端 stream;`logFields.drained_after_disconnect` 观测。⚠ 该 flag 与 `metering_lost` 的关系是**相反**的:它消除前者、却让后者在每次断连时为真(见 `isMeteringLost` 头注释的口径偏差)
 - ★ **`stream.write()` 返 `false` = 背压不是断连**:`false` = 缓冲超 highWaterMark、应等 `'drain'`,socket 健康。误判会停读循环(对**活着的**客户端)、丢终结段 `message_stop`、上游仍 drain 到 EOF **全额计费**、日志还错记客户端;且因缓冲由**大量字节**填满,专咬最长最贵的响应。红线:存活只看 `destroyed`/`writableEnded`/write 抛错;背压走 `awaitDrain`(带 `close`+超时兜底);`disconnect_source` 区分 `client_close`/`write_failed`,**别退回单一 `aborted` 布尔**。真相源+实测:`safeWrite`/`awaitDrain` 头注释 + 守卫 `test/claude/backpressure.test.ts`(含真 EPIPE 反向守卫)+ `test/static/sse-backpressure-contract.test.ts`(钉住两 transport 同步)
 - **上游杀的是*卡住*的流,不是跑得久的流**:上游偶发生成中途发泛化 `Exception`(`code:"error"`、**无** `ContextUsage`+`Metering` 尾帧 = 真中途死),已 commit 只能转 in-band `error`,客户端见 mid-response 截断。判别子是**产出速率(token/s)不是总时长**——按时长分桶会得错误死线。网关侧无治本手段(上游行为)、post-commit 也无法重试或改状态码。缓解见 `stream-handler.ts` 的 `armDrainGrace`(目前只在**已断连**时武装,连接中 idle 无上界、只受 axios 720s 约束)
 

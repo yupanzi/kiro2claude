@@ -16,6 +16,7 @@ import {
 } from '../claude/non-stream-reduce.js';
 import {
   buildKiroUsageFinishEvent,
+  isMeteringLost,
   type PluginUsageExtensions,
   resolvePluginUsageExtensions,
   selectEmptyUpstreamMessage,
@@ -102,6 +103,8 @@ export async function runOpenAiNonStream(
       rescueRegistry,
     );
     const finalInputTokens = reduced.contextInputTokens ?? inputTokens;
+    // hook 与终态日志各取一次,物化一份避免重复 Object.fromEntries。
+    const eventCounts = Object.fromEntries(reduced.eventCounts);
 
     if (reduced.upstreamError) {
       if (reduced.kiroMetering) {
@@ -111,6 +114,7 @@ export async function runOpenAiNonStream(
           outputTokens: 0,
           inputTokensFromUpstream: reduced.contextInputTokens !== undefined,
           kiroMetering: reduced.kiroMetering,
+          eventCounts,
           logger: log,
         });
         await hookBus.runUsageFinish(hookEvent);
@@ -119,6 +123,8 @@ export async function runOpenAiNonStream(
       log.warn({
         msg: 'openai non-stream: mid-stream error frame, surfacing error',
         downstream_status: status,
+        // hook 只在 `if (kiroMetering)` 里跑 → 漏账对 plugin 不可见,日志是唯一出口。
+        metering_lost: isMeteringLost(reduced.kiroMetering, eventCounts),
         total_duration_ms: Date.now() - apiStart,
       });
       reply.status(status).send(createOpenAiError(message, errorType));
@@ -146,6 +152,7 @@ export async function runOpenAiNonStream(
       outputTokens,
       inputTokensFromUpstream: reduced.contextInputTokens !== undefined,
       kiroMetering: reduced.kiroMetering,
+      eventCounts,
       logger: log,
     });
     await hookBus.runUsageFinish(hookEvent);
@@ -162,6 +169,9 @@ export async function runOpenAiNonStream(
       input_tokens: finalInputTokens,
       output_tokens: outputTokens,
       tool_use_count: reduced.toolUses.length,
+      // 与其余三个 transport 同源同名(判据见 isMeteringLost)——四条终态路径齐了,
+      // 按此字段统计的漏账规模才是全量而非某个协议的切片。
+      metering_lost: isMeteringLost(reduced.kiroMetering, eventCounts),
       total_duration_ms: Date.now() - apiStart,
     });
 

@@ -544,9 +544,12 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   //    a tool_use block with stop_reason=tool_use, round 2 replays the
   //    assistant response + a tool_result and must receive a final text
   //    answer with stop_reason=end_turn. This exercises `validateToolPairing`
-  //    (converter.ts:398) since the second request contains a historical
-  //    assistant message whose tool_use id MUST be matched by our synthetic
-  //    tool_result — otherwise the orphan-stripping path would drop it.
+  //    since the second request contains a historical assistant message whose
+  //    tool_use id MUST be matched by our synthetic tool_result — leave it
+  //    unmatched and `synthesizeMissingToolResults` steps in with a canned
+  //    isError result, so the round trip would still pass while testing
+  //    nothing about real pairing. (It used to DELETE the orphaned tool_use;
+  //    either way the fixture's id match is what makes this test meaningful.)
   // --------------------------------------------------------------------------
   it(
     '8. POST /claude/v1/messages custom tool round trip (tool_use -> tool_result -> final text)',

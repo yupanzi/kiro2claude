@@ -118,6 +118,9 @@ export function buildClaudeUsagePayload(args: {
  *
  * `inputTokensFromUpstream`:上游 ContextUsage 是否还原出了 input_tokens
  * (决定 inputTokensSource: upstream-reported / client-estimate)。
+ *
+ * `eventCounts`:本次尝试的上游事件分布,仅用于判定 `kiro.meteringMissing`
+ * (上游已扣费但账目丢失,定义与理由见 `isMeteringLost`)。
  */
 export function buildKiroUsageFinishEvent(args: {
   model: string;
@@ -125,6 +128,7 @@ export function buildKiroUsageFinishEvent(args: {
   outputTokens: number;
   inputTokensFromUpstream: boolean;
   kiroMetering: KiroMeteringData | undefined;
+  eventCounts: Record<string, number>;
   logger: ReturnType<typeof getLogger>;
 }): UsageFinishEventImpl {
   return new UsageFinishEventImpl({
@@ -137,6 +141,7 @@ export function buildKiroUsageFinishEvent(args: {
       'kiro.creditsUsed': args.kiroMetering?.usage,
       'kiro.pricedModel': args.model,
       'kiro.upstreamRaw': args.kiroMetering,
+      'kiro.meteringMissing': isMeteringLost(args.kiroMetering, args.eventCounts),
     },
     logger: args.logger,
   });
@@ -244,6 +249,43 @@ const BILLABLE_WORK_EVENT_KINDS = [
  */
 export function sawBillableWork(eventCounts: Record<string, number>): boolean {
   return BILLABLE_WORK_EVENT_KINDS.some((kind) => (eventCounts[kind] ?? 0) > 0);
+}
+
+/**
+ * 上游**已扣费、网关却记不了账**——即「开过工」但尾帧 Metering 没到。credit 只在
+ * 流末尾那一帧里,拿不到就等于这笔消费上游算了、这边算不了:消费方(plugin-metering)
+ * 因 `kiro.creditsUsed == null` 整笔跳过,累计用量于是系统性偏低且无人察觉。主因是
+ * 客户端断连后 drain grace 到期、网关自己 destroy 了 socket(生产实测:该标志的出现
+ * 次数与 `sse upstream drain grace expired` 的 warn 数精确 1:1)。
+ *
+ * ★ 判据必须是 `sawBillableWork` 而**不是** `outputTokens > 0`:后者是产出侧代理,
+ * 正是 sawBillableWork 头注释否决的那一类(GPT 加密 reasoning 计费但不 surface),
+ * 会让最该被统计的 GPT 漏账恰好落选。真·空流(上游零帧)本就没有 credit 可记,
+ * 那是正常的 `null` 而非漏账——这个守卫就是用来把两者分开的。
+ *
+ * **故意不拿 token 数估算 credit 顶上**:credit 公式是上游黑盒(含按模型的
+ * multiplier),编一个数字会把「accumulated vs limit」这条真账混成假账——宁可显式
+ * 承认这笔不可知,也不要一个看起来合理的错数。
+ *
+ * 这是该信号的唯一定义点:plugin 侧读 `kiro.meteringMissing` meta,运维侧读四条
+ * 终态路径(claude/openai × 流式/非流式)日志里的 `metering_lost` 字段,两者必须
+ * 同源(一个指标只有一个 owner)。
+ *
+ * ★ 用它估算漏账规模前必须知道的两条口径偏差:
+ * 1. **多报**:`KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT=true` 时每次客户端断连都
+ *    为真——abort 只掐掉断连点之后的生成,之前已烧的 credit 同样没有 Metering 帧
+ *    可记。那个配置下基线不为零,统计时先按 `aborted` 分桶。
+ * 2. **漏报**:判空路径(`silentFailure`)与空流重试压根不跑 usage-finish hook,
+ *    重试还会整个换掉 StreamContext、丢弃上一轮已捕获的 `kiroMeteringRaw`。那类
+ *    漏账里 Metering 帧其实**到了**,本判据返回 false,覆盖不到。
+ * 换句话说:本字段度量的是「有产出但没拿到 Metering 帧」,不等于「有 credit 没记账」
+ * 的全集。要覆盖第 2 类需要改 hook 的触发时机,那是独立的改动。
+ */
+export function isMeteringLost(
+  kiroMetering: KiroMeteringData | undefined,
+  eventCounts: Record<string, number>,
+): boolean {
+  return kiroMetering === undefined && sawBillableWork(eventCounts);
 }
 
 /** A classified mid-stream upstream error awaiting downstream surfacing. */
@@ -1408,6 +1450,7 @@ export class StreamContext {
       outputTokens: this.outputTokens,
       inputTokensFromUpstream: this.contextInputTokens !== undefined,
       kiroMetering: this.kiroMeteringRaw,
+      eventCounts: this.getEventCounts(),
       logger: getLogger(),
     });
     await this.hookBus.runUsageFinish(hookEvent);

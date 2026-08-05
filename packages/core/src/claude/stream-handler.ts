@@ -56,6 +56,7 @@ import { mapProviderError } from './error-mapper.js';
 import {
   awaitDrain,
   createSseErrorEvent,
+  isMeteringLost,
   type SseEvent,
   StreamContext,
   safeEnd,
@@ -500,6 +501,10 @@ export async function handleStreamRequest(
   // message_stop.
   const silentFailure = !hasContent();
 
+  // 物化一次:下面 logFields 里 metering_lost 与 event_counts 都要用,
+  // getEventCounts() 每次都重建一个对象。取同一份快照也保证两个字段互相自洽。
+  const finalEventCounts = ctx.getEventCounts();
+
   const logFields = {
     // 事故排查经验:失败模式与 model 强相关(某些模型 0 事故、某些不是),但 model 只
     // 出现在入口那条日志上,统计分布得跨行按 reqId join。放在这里让它一行可查。
@@ -509,6 +514,15 @@ export async function handleStreamRequest(
     stop_reason: ctx.stateManager.getStopReason(),
     thinking_detected: ctx.thinkingExtracted,
     kiro_metering: ctx.kiroMeteringRaw,
+    // 上游已扣费、这边记不了账(判据与理由见 isMeteringLost —— plugin 侧的
+    // `kiro.meteringMissing` meta 同源于它)。单独打标而不是靠 kiro_metering 为空
+    // 去推:与 drained_after_disconnect 的口径**不同**——后者是「付了钱但客户端
+    // 不要了」,这个是「付了钱且账目丢了」,排查和治理路径不一样。
+    // ⚠ 两者对 abortUpstreamOnDisconnect 的反应**相反**:该 flag 消除
+    // drained_after_disconnect(不再为没人读的响应付费),却让本字段在**每次**断连
+    // 时为真——abort 只掐掉断连点之后的生成,之前已烧的 credit 照样没有 Metering
+    // 帧可记。那个配置下本字段的基线不为零,统计漏账规模时必须先按 aborted 分桶。
+    metering_lost: isMeteringLost(ctx.kiroMeteringRaw, finalEventCounts),
     committed,
     aborted: aborted.value,
     // 'client_close' = 客户端真的走了;'write_failed' = 写 socket 失败(存活判定见
@@ -522,7 +536,7 @@ export async function handleStreamRequest(
     empty_attempts: emptyAttempts,
     // 空流诊断:事件计数区分「纯零帧」与「宣告了 tool_use 却没吐完整帧的截断流」;
     // 工具名把这类截断空流的范围缩小到具体调用点(完整的空参数 tool_use 已不再落空)。
-    event_counts: ctx.getEventCounts(),
+    event_counts: finalEventCounts,
     tool_use_names: [...ctx.seenToolUseNames],
     // 前向兼容观测:上游若发来未识别 event-type,在此显形(当前为良性 metadata)。
     unknown_event_types: [...ctx.unknownEventTypes],

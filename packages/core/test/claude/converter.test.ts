@@ -4,6 +4,7 @@ import {
   convertRequest,
   getContextWindowSize,
   IDENTITY_OVERRIDE_DIRECTIVE,
+  INTERRUPTED_TOOL_RESULT_TEXT,
   mapModel,
   UNSUPPORTED_DOCUMENT_PLACEHOLDER,
   usesNativeReasoning,
@@ -1417,5 +1418,211 @@ describe('interleaved system-role messages (Claude Code <system-reminder> blocks
     const dump = JSON.stringify(state);
     expect(dump).toContain('s1');
     expect(dump).toContain('s4');
+  });
+});
+
+// ============================================================================
+// Orphaned tool_use → synthesized tool_result
+// ============================================================================
+//
+// 回归护栏。历史实现把未配对的 tool_use 从 history 里**删掉**以满足 Kiro 的配对
+// 约束,代价是模型失忆 + 客户端零感知(收到正常 200,只有网关日志留痕)。现在改为
+// 补一条 isError 的 tool_result:约束照样满足,模型看得到「这次调用被中断」。
+// 生产实测该场景会固化在客户端会话里反复重发(同一 tool_use_id 跨 12 个 reqId)。
+
+describe('convertRequest - orphaned tool_use gets a synthesized tool_result', () => {
+  /** 展平 history + currentMessage 里所有 toolResults，避免断言硬编码索引。 */
+  function allToolResults(state: ReturnType<typeof convertRequest>['conversationState']) {
+    const out = [...state.currentMessage.userInputMessage.userInputMessageContext.toolResults];
+    for (const m of state.history) {
+      if (m.kind === 'user') out.push(...m.userInputMessage.userInputMessageContext.toolResults);
+    }
+    return out;
+  }
+
+  it('synthesizes for a partially-collected parallel tool_use (the ESC-interrupt shape)', () => {
+    // assistant 并行发了两个 tool_use，客户端只回收了一个 —— 用户在第二个跑完前
+    // 打断。第二个永远等不到 tool_result。
+    const state = convertRequest(
+      baseRequest({
+        messages: [
+          { role: 'user', content: 'read both files' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'toolu_done', name: 'read_file', input: { path: '/a.txt' } },
+              { type: 'tool_use', id: 'toolu_cut', name: 'read_file', input: { path: '/b.txt' } },
+            ],
+          },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'toolu_done', content: 'A' }],
+          },
+        ],
+      }),
+      { identityOverride: false },
+    ).conversationState;
+
+    const results = allToolResults(state);
+    const done = results.find((r) => r.toolUseId === 'toolu_done');
+    const cut = results.find((r) => r.toolUseId === 'toolu_cut');
+
+    // 真实结果原样保留
+    expect(done).toBeDefined();
+    expect(done?.isError).not.toBe(true);
+
+    // 被打断的那个补上了 isError 结果，而不是消失
+    expect(cut).toBeDefined();
+    expect(cut?.isError).toBe(true);
+    expect(cut?.status).toBe('error');
+    expect(JSON.stringify(cut?.content)).toContain(INTERRUPTED_TOOL_RESULT_TEXT);
+
+    // ★ 核心回归点：tool_use 本身**没有**被从历史里删掉，且两个仍在**同一条**
+    // assistant 上、顺序不变（比 arrayContaining 更强：那个断言在两个 tool_use 被
+    // 拆到不同消息时也会通过，而那已经破坏了 Kiro 的 user/assistant 交替）。
+    const assistant = state.history.find((m) => m.kind === 'assistant');
+    expect(assistant?.kind).toBe('assistant');
+    if (assistant?.kind === 'assistant') {
+      expect(assistant.assistantResponseMessage.toolUses?.map((t) => t.toolUseId)).toEqual([
+        'toolu_done',
+        'toolu_cut',
+      ]);
+    }
+  });
+
+  it('attaches the synthesized result to the following user message when the orphan is mid-history', () => {
+    // 上下文压缩裁掉了带 tool_result 的那条 user 消息：assistant 的 tool_use 后面
+    // 直接跟了一条无关的 user 消息。合成结果必须挂到**那条** user 上，而不是
+    // currentMessage —— 否则 tool_use 与 tool_result 跨轮次错位。
+    const state = convertRequest(
+      baseRequest({
+        messages: [
+          { role: 'user', content: 'read it' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'toolu_dropped', name: 'read_file', input: { path: '/x' } },
+            ],
+          },
+          { role: 'user', content: 'never mind, do something else' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'continue' },
+        ],
+      }),
+      { identityOverride: false },
+    ).conversationState;
+
+    // 合成结果落在 history 里的某条 user 上，不在 currentMessage 上
+    const inCurrent =
+      state.currentMessage.userInputMessage.userInputMessageContext.toolResults.some(
+        (r) => r.toolUseId === 'toolu_dropped',
+      );
+    expect(inCurrent).toBe(false);
+
+    const inHistory = allToolResults(state).find((r) => r.toolUseId === 'toolu_dropped');
+    expect(inHistory).toBeDefined();
+    expect(inHistory?.isError).toBe(true);
+
+    // 该 tool_result 必须紧跟在带它 tool_use 的 assistant 之后那条 user 上
+    const idx = state.history.findIndex(
+      (m) =>
+        m.kind === 'assistant' &&
+        (m.assistantResponseMessage.toolUses ?? []).some((t) => t.toolUseId === 'toolu_dropped'),
+    );
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const next = state.history[idx + 1];
+    expect(next?.kind).toBe('user');
+    if (next?.kind === 'user') {
+      expect(
+        next.userInputMessage.userInputMessageContext.toolResults.map((r) => r.toolUseId),
+      ).toContain('toolu_dropped');
+    }
+  });
+
+  it('keeps the orphan tool visible to tool-definition collection (placeholder still created)', () => {
+    // tool_use 不再被删 → collectHistoryToolNames 仍看得见它 → 第 10 步照常补
+    // placeholder 定义。上游需要这个定义才认历史里的调用。
+    const state = convertRequest(
+      baseRequest({
+        tools: [
+          {
+            name: 'other_tool',
+            description: 'unrelated',
+            input_schema: { type: 'object', properties: {} },
+          },
+        ] as ClaudeTool[],
+        messages: [
+          { role: 'user', content: 'go' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_orphan', name: 'vanished_tool', input: {} }],
+          },
+          { role: 'user', content: 'nothing came back' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'next' },
+        ],
+      }),
+      { identityOverride: false },
+    ).conversationState;
+
+    const toolNames = state.currentMessage.userInputMessage.userInputMessageContext.tools.map(
+      (t) => t.toolSpecification.name,
+    );
+    expect(toolNames).toContain('vanished_tool');
+  });
+
+  it('synthesizes nothing when every tool_use is properly paired', () => {
+    // 负向守卫：正常会话绝不能被塞进合成结果。
+    const state = convertRequest(
+      baseRequest({
+        messages: [
+          { role: 'user', content: 'read it' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_ok', name: 'read_file', input: {} }],
+          },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'toolu_ok', content: 'contents' }],
+          },
+        ],
+      }),
+      { identityOverride: false },
+    ).conversationState;
+
+    const synthesized = allToolResults(state).filter((r) =>
+      JSON.stringify(r.content).includes(INTERRUPTED_TOOL_RESULT_TEXT),
+    );
+    expect(synthesized).toHaveLength(0);
+  });
+
+  it('synthesizes at most one result per tool_use_id even if the id repeats in history', () => {
+    // 幂等守卫。旧的「删除 tool_use」实现天然幂等(删两遍等于删一遍);改成补齐
+    // 之后,同一个 id 若出现在两条 assistant 上,逐条合成会产出两份 tool_result、
+    // 挂到两条不同 user 消息上 —— 正好是本函数要消除的那类坏配对。
+    const state = convertRequest(
+      baseRequest({
+        messages: [
+          { role: 'user', content: 'go' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_dup', name: 'read_file', input: {} }],
+          },
+          { role: 'user', content: 'nothing came back' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_dup', name: 'read_file', input: {} }],
+          },
+          { role: 'user', content: 'still nothing' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'continue' },
+        ],
+      }),
+      { identityOverride: false },
+    ).conversationState;
+
+    const forDup = allToolResults(state).filter((r) => r.toolUseId === 'toolu_dup');
+    expect(forDup).toHaveLength(1);
+    expect(forDup[0]?.isError).toBe(true);
   });
 });

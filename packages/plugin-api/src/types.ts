@@ -142,16 +142,32 @@ export interface UsageFinishEvent {
    * for kiro-specific data. Plugins should treat all values as untrusted
    * and validate types.
    *
-   * Well-known keys:
-   *   'kiro.inputTokens'        number
-   *   'kiro.outputTokens'       number
-   *   'kiro.cacheReadTokens'    number
-   *   'kiro.cacheCreationTokens' number
-   *   'kiro.creditsUsed'        number
-   *   'kiro.pricedModel'        string
+   * Well-known keys (`?` = the key is always present but the VALUE may be
+   * undefined — see listMetaKeys below):
+   *   'kiro.inputTokens'      number
+   *   'kiro.outputTokens'     number
+   *   'kiro.creditsUsed'      number?   raw kiro credit for this request
+   *   'kiro.pricedModel'      string    model id for price-table lookups
+   *   'kiro.upstreamRaw'      unknown?  full upstream metering payload
+   *   'kiro.meteringMissing'  boolean   upstream billed us but the metering
+   *                                     frame never arrived, so creditsUsed is
+   *                                     undefined for a request that DID cost
+   *                                     money. Distinguishes real lost billing
+   *                                     from a genuinely empty response.
+   *
+   * This list is the contract; the host pins it against its own implementation
+   * with a static guard, so anything absent here is not emitted.
    */
   getMeta<T = unknown>(key: string): T | undefined;
-  /** All meta keys currently populated. For debugging / compatibility checks. */
+  /**
+   * All meta keys the host populated on this event.
+   *
+   * ⚠ Presence is NOT availability: the host writes every well-known key on
+   * every event, so an unavailable reading shows up as a key whose VALUE is
+   * `undefined`, not as a missing key. Test with
+   * `getMeta(k) === undefined`, never with `listMetaKeys().includes(k)`.
+   * Use this for debugging and for detecting keys a newer host added.
+   */
   listMetaKeys(): readonly string[];
 
   /**

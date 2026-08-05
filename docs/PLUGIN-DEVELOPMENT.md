@@ -106,13 +106,18 @@ core 把这些约定键写入每个 `UsageFinishEvent`。插件用 `event.getMet
 |---|---|---|
 | `kiro.inputTokens` | number | 计费用的最终 token 数 |
 | `kiro.outputTokens` | number | |
-| `kiro.cacheReadTokens` | number? | 仅当上游报告时 |
-| `kiro.cacheCreationTokens` | number? | 仅当上游报告时 |
 | `kiro.creditsUsed` | number? | 原始 kiro credit 值(`meteringUsage`) |
 | `kiro.pricedModel` | string | 供计价类插件查询价格表的模型 id |
-| `kiro.upstreamRaw` | unknown | 预留;给高级插件的完整上游计量 payload |
+| `kiro.upstreamRaw` | unknown? | 完整上游计量 payload,给高级插件 |
+| `kiro.meteringMissing` | boolean | 上游**已扣费**但计量帧没到 → `creditsUsed` 为空却确实花了钱 |
 
-`event.listMetaKeys()` 返回所有已填充的键。缺失的键应视为"该特性不可用"的信号。
+`?` 表示**值**可能是 `undefined`,不表示键会缺席。
+
+这张表就是契约本身:core 侧有静态守卫(`packages/core/test/static/usage-meta-contract.test.ts`)把它与实际写入的键钉在一起,表里没有的键 core 不会产出。
+
+**`kiro.meteringMissing` 怎么用**:`creditsUsed` 为空有两种成因——真·空响应(本就没有 credit,静默跳过是对的)与「上游算了账、网关没收到账单」。只有后者是漏账,这个键把两者分开。⚠ 它度量的是「有产出但没拿到计量帧」,并**不等于**「有 credit 没记账」的全集,口径偏差(哪些情况多报、哪些漏报)见 core 侧 `isMeteringLost` 的头注释。
+
+**`event.listMetaKeys()`** 返回本次事件上所有已填充的键。⚠ **有键 ≠ 有值**:core 每次都会写入全部约定键,读不到数据时表现为**值**是 `undefined`,而不是键消失。判断可用性一律用 `getMeta(k) === undefined`,不要用 `listMetaKeys().includes(k)`——后者恒为真。`listMetaKeys()` 的用途是调试,以及探测更高版本 host 新增的键。
 
 ### Wire 改写
 
