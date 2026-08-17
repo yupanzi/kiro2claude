@@ -23,7 +23,8 @@ import {
   usesNativeReasoning,
 } from '../../src/claude/converter.js';
 import { type SseEvent, StreamContext } from '../../src/claude/stream.js';
-import type { MessagesRequest } from '../../src/claude/types.js';
+import { buildToolTextRegistry } from '../../src/claude/tool-call-text.js';
+import type { MessagesRequest, Tool } from '../../src/claude/types.js';
 import { eventFromFrame } from '../../src/kiro/model/events/base.js';
 import { parseFrame } from '../../src/kiro/parser/frame.js';
 import { HookBus } from '../../src/plugin-host/index.js';
@@ -32,6 +33,7 @@ import {
   buildReasoningContentFrame,
   buildRedactedReasoningFrame,
 } from '../helpers/event-stream.js';
+import { collectThinkingDeltas } from '../helpers/sse-blocks.js';
 
 // ============================================================================
 // helpers
@@ -48,14 +50,6 @@ function decodeFrame(frame: Buffer) {
   const r = parseFrame(frame);
   if (!r) throw new Error('frame parse failed');
   return eventFromFrame(r.frame);
-}
-
-function thinkingDeltas(events: SseEvent[]): string[] {
-  return events
-    .filter(
-      (e) => e.event === 'content_block_delta' && (e.data.delta as any)?.type === 'thinking_delta',
-    )
-    .map((e) => (e.data.delta as any).thinking as string);
 }
 
 function signatureDeltas(events: SseEvent[]): string[] {
@@ -160,8 +154,32 @@ describe('stream: GPT redacted reasoning', () => {
     all.push(...ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame())));
     all.push(...ctx.processKiroEvent(decodeFrame(buildAssistantResponseFrame('pong'))));
     expect(textDeltas(all)).toBe('pong');
-    expect(thinkingDeltas(all)).toEqual([]);
+    expect(collectThinkingDeltas(all)).toEqual([]);
     expect(blockStarts(all).some((b) => b.type === 'thinking')).toBe(false);
+  });
+
+  it('redacted reasoning 会锁定 native 模式，后续完整 legacy-looking 文本仍原样可见', () => {
+    const ctx = makeContext(true);
+    const all: SseEvent[] = [];
+    all.push(...ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame())));
+    const literal = '<thinking>literal.</thinking>\n\nVisible literal.';
+    all.push(...ctx.processKiroEvent(decodeFrame(buildAssistantResponseFrame(literal))));
+
+    expect(textDeltas(all)).toBe(literal);
+    expect(collectThinkingDeltas(all)).toEqual([]);
+    expect(blockStarts(all).some((block) => block.type === 'thinking')).toBe(false);
+  });
+
+  it('空 native 帧后首个有内容的 native 帧仍会正常开启 thinking block', () => {
+    const ctx = makeContext(true);
+    expect(ctx.processKiroEvent(decodeFrame(buildReasoningContentFrame('')))).toEqual([]);
+
+    const events = ctx.processKiroEvent(
+      decodeFrame(buildReasoningContentFrame('surfaceable reasoning', 'sig-after-empty')),
+    );
+    expect(blockStarts(events).map((block) => block.type)).toEqual(['thinking']);
+    expect(collectThinkingDeltas(events)).toEqual(['surfaceable reasoning']);
+    expect(signatureDeltas(events)).toEqual(['sig-after-empty']);
   });
 
   it('Claude 明文 reasoning 不受守卫影响(回归)', () => {
@@ -169,7 +187,7 @@ describe('stream: GPT redacted reasoning', () => {
     const all: SseEvent[] = [];
     all.push(...ctx.processKiroEvent(decodeFrame(buildReasoningContentFrame('thinking...'))));
     all.push(...ctx.processKiroEvent(decodeFrame(buildReasoningContentFrame(' more', 'sig123'))));
-    expect(thinkingDeltas(all).join('')).toContain('thinking...');
+    expect(collectThinkingDeltas(all).join('')).toContain('thinking...');
     expect(signatureDeltas(all)).toContain('sig123');
     expect(blockStarts(all).some((b) => b.type === 'thinking')).toBe(true);
   });
@@ -261,15 +279,15 @@ describe('usesNativeReasoning: 模型能力探测', () => {
 
 describe('clientModelHasEncryptedReasoning: 仅 GPT(加密 reasoning)命中', () => {
   it('GPT 客户端名(含 Codex 别名 gpt-*-codex)→ true', () => {
-    // handler 侧据此关掉 legacy <thinking> 扫描:GPT redacted reasoning 不置
-    // sawReasoningContent,运行时无法关闭扫描,必须靠静态判定,否则字面 <thinking> 被误剥离。
+    // handler 侧据此从响应开始就关掉 legacy 解码；即使 redacted event 缺失/晚到，
+    // 字面 <thinking> 也不会被暂存或误解。
     expect(clientModelHasEncryptedReasoning('gpt-5.6-sol')).toBe(true);
     // Codex 用 gpt-5-codex,mapModel 别名到 gpt-5.6-sol —— 未映射名也须命中
     expect(clientModelHasEncryptedReasoning('gpt-5-codex')).toBe(true);
   });
 
   it('Claude 原生 reasoning(明文,4.7/4.8)→ false —— 绝不能关其扫描/破坏块顺序', () => {
-    // 回归护栏:Claude 原生 reasoning 是明文,靠运行时 sawReasoningContent 关闭扫描,
+    // 回归护栏:Claude 原生 reasoning 是明文,靠运行时 native event 锁定模式,
     // 且需 thinkingEnabled=true 维持 thinking→text 块顺序(否则 e2e 流式顺序断言失败)。
     expect(clientModelHasEncryptedReasoning('claude-opus-4.7')).toBe(false);
     expect(clientModelHasEncryptedReasoning('claude-opus-4.8')).toBe(false);
@@ -409,7 +427,7 @@ describe('stream: processReasoningContent', () => {
     expect(starts.length).toBe(1);
     expect(starts[0].type).toBe('thinking');
 
-    expect(thinkingDeltas(events)).toEqual(['Let me think.']);
+    expect(collectThinkingDeltas(events)).toEqual(['Let me think.']);
     expect(signatureDeltas(events)).toEqual([]);
   });
 
@@ -421,7 +439,7 @@ describe('stream: processReasoningContent', () => {
       all.push(...ctx.processKiroEvent({ kind: 'ReasoningContent', text, signature: undefined }));
     }
     expect(blockStarts(all).filter((b) => b.type === 'thinking').length).toBe(1);
-    expect(thinkingDeltas(all)).toEqual([' Hmm.', ' Continuing.', ' Done.']);
+    expect(collectThinkingDeltas(all)).toEqual([' Hmm.', ' Continuing.', ' Done.']);
   });
 
   it('payload 带 signature → emit signature_delta', () => {
@@ -433,8 +451,22 @@ describe('stream: processReasoningContent', () => {
       text: ' final fragment.',
       signature: sig,
     });
-    expect(thinkingDeltas(events)).toEqual([' final fragment.']);
+    expect(collectThinkingDeltas(events)).toEqual([' final fragment.']);
     expect(signatureDeltas(events)).toEqual([sig]);
+  });
+
+  it('signature-only payload 也算可用 reasoning 并开启 thinking block', () => {
+    const ctx = makeContext(true);
+    const events = ctx.processKiroEvent({
+      kind: 'ReasoningContent',
+      text: '',
+      signature: 'signature-only',
+    });
+
+    expect(blockStarts(events).map((block) => block.type)).toEqual(['thinking']);
+    expect(collectThinkingDeltas(events)).toEqual([]);
+    expect(signatureDeltas(events)).toEqual(['signature-only']);
+    expect(ctx.thinkingExtracted).toBe(true);
   });
 
   it('ReasoningContent 后切到 AssistantResponse → 关 thinking block + 开 text block', () => {
@@ -510,7 +542,7 @@ describe('e2e: reasoningContentEvent 帧 → stream SSE 序列', () => {
     }
     all.push(...(await ctx.generateFinalEvents()));
 
-    expect(thinkingDeltas(all)).toEqual([' Step 1.', ' Step 2.', ' Done.']);
+    expect(collectThinkingDeltas(all)).toEqual([' Step 1.', ' Step 2.', ' Done.']);
     expect(signatureDeltas(all)).toEqual(['final-sig-value']);
 
     expect(textDeltas(all)).toBe('The answer is 42.');
@@ -518,5 +550,69 @@ describe('e2e: reasoningContentEvent 帧 → stream SSE 序列', () => {
     // block 顺序：thinking 然后 text（thinkingEnabled=true 时初始不开 text block）
     const starts = blockStarts(all);
     expect(starts.map((s) => s.type)).toEqual(['thinking', 'text']);
+  });
+});
+
+describe('空/redacted native 帧只能作废尚未落定的 legacy 分类', () => {
+  // 锁 native 模式是静态判定的运行时兜底（见上面的「redacted reasoning 会锁定
+  // native 模式」），但空帧不能越过两条边界，否则代价比它防的问题更大。
+  it('不打断已经开着的 legacy thinking 块', () => {
+    const ctx = makeContext(true);
+    const all: SseEvent[] = [];
+    all.push(
+      ...ctx.processKiroEvent({ kind: 'AssistantResponse', content: '<thinking>part one ' }),
+    );
+    all.push(...ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame())));
+    all.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: 'part two</thinking>\n\nanswer',
+      }),
+    );
+
+    // 强行关块会把 'part two' 连同字面 `</thinking>` 推进可见文本通道。
+    expect(collectThinkingDeltas(all).join('')).toBe('part one part two');
+    expect(textDeltas(all)).toBe('answer');
+  });
+
+  it('不 flush 救援检测器，跨帧的泄漏工具调用候选仍能救回', async () => {
+    const tools: Tool[] = [
+      {
+        name: 'Read',
+        description: 'read a file',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path'],
+        },
+      },
+    ];
+    const ctx = new StreamContext(
+      'test-model',
+      1,
+      false,
+      new Map(),
+      new HookBus(),
+      buildToolTextRegistry(tools),
+    );
+    const all: SseEvent[] = [];
+    all.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: '<invoke name="Read">\n<parameter name="file_path">/tmp/x',
+      }),
+    );
+    all.push(...ctx.processKiroEvent(decodeFrame(buildRedactedReasoningFrame())));
+    all.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: '.txt</parameter>\n</invoke>',
+      }),
+    );
+    all.push(...(await ctx.generateFinalEvents()));
+
+    const toolBlocks = blockStarts(all).filter((b) => b.type === 'tool_use');
+    expect(toolBlocks).toHaveLength(1);
+    expect(textDeltas(all)).toBe('');
   });
 });

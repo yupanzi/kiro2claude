@@ -221,13 +221,12 @@ export function usesNativeReasoning(mappedModelId: string): boolean {
  * 客户端模型名(**未映射**)是否走**加密 reasoning** 原生路径(GPT-5.6 系列:
  * reasoning 内容 redacted,上游不给明文/signature)。先 mapModel 再判。
  *
- * handler 侧据此在计算 `extractThinking` 时关掉 legacy `<thinking>` 扫描:GPT 的
- * reasoningContentEvent 被 `processReasoningContent` 的 `if(!text&&!signature)` 守卫
- * 丢弃,**不会**置 `sawReasoningContent`,故运行时信号无法关闭扫描——必须靠此静态
- * 判定关掉,否则 GPT 可见输出里的字面 `<thinking>` 会被误当思维链剥离。
+ * handler 侧据此在计算 `extractThinking` 时提前关掉 legacy `<thinking>` 解码:GPT
+ * 没有可 surface 的 thinking，静态判定能从响应开始就选择纯文本模式，即使上游
+ * redacted event 缺失或晚到也不会暂存/误解可见输出里的字面 `<thinking>`。
  *
  * ⚠ **仅限 GPT**:Claude 原生 reasoning(4.7/4.8)是**明文**,靠运行时
- * `sawReasoningContent` 关闭扫描,且**必须** `thinkingEnabled=true` 才能维持
+ * 原生 event 运行时锁定 native 模式,且**必须** `thinkingEnabled=true` 才能维持
  * thinking→text 的 content block 顺序(`generateInitialEvents` 在 thinkingEnabled=false
  * 时会提前开 text block,把 thinking block 挤到其后——实测 e2e 流式顺序断言失败)。
  * 所以绝不能把 Claude 原生模型纳入此判定。未知模型 → false(convertRequest 已先拒)。

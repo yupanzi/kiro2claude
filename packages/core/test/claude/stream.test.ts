@@ -12,8 +12,13 @@ import type { Event } from '../../src/kiro/model/events/base.js';
 import { HookBus, UsageFinishEventImpl } from '../../src/plugin-host/index.js';
 import { getLogger } from '../../src/shared/logger.js';
 import { requestContextStorage } from '../../src/shared/request-context.js';
+import {
+  collectTextContent,
+  collectThinkingText,
+  expectThinkingStoppedBefore,
+} from '../helpers/sse-blocks.js';
 
-const { findRealThinkingStartTag, findRealThinkingEndTag, estimateTokens } = __testing__;
+const { estimateTokens } = __testing__;
 
 function makeContext(
   thinkingEnabled: boolean,
@@ -40,25 +45,6 @@ function makeToolUse(
   isComplete = false,
 ): Extract<Event, { kind: 'ToolUse' }> {
   return { kind: 'ToolUse', name, toolUseId: id, input, isComplete };
-}
-
-function collectThinkingContent(events: SseEvent[]): string {
-  return events
-    .filter(
-      (e) => e.event === 'content_block_delta' && (e.data.delta as any)?.type === 'thinking_delta',
-    )
-    .map((e) => ((e.data.delta as any)?.thinking as string) ?? '')
-    .filter((s) => s.length > 0)
-    .join('');
-}
-
-function collectTextContent(events: SseEvent[]): string {
-  return events
-    .filter(
-      (e) => e.event === 'content_block_delta' && (e.data.delta as any)?.type === 'text_delta',
-    )
-    .map((e) => ((e.data.delta as any)?.text as string) ?? '')
-    .join('');
 }
 
 describe('SSE event format', () => {
@@ -157,18 +143,20 @@ describe('text_delta after tool_use', () => {
   });
 });
 
-describe('Tool use flushes pending thinking buffer', () => {
-  it('test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block', () => {
+describe('Plain text before tool use', () => {
+  it('emits a strict-prologue mismatch immediately and closes text before the tool block', () => {
     const ctx = makeContext(true);
     ctx.generateInitialEvents();
 
-    // Two short text chunks under thinking mode -> buffered
+    // The first non-whitespace character rules out the only legal opening-tag
+    // position, so ordinary text no longer waits for a rolling tag buffer.
     const ev1 = ctx.processKiroEvent({ kind: 'AssistantResponse', content: '有修' });
-    expect(ev1.every((e) => e.event !== 'content_block_delta')).toBe(true);
+    expect(collectTextContent(ev1)).toBe('有修');
     const ev2 = ctx.processKiroEvent({ kind: 'AssistantResponse', content: '改：' });
-    expect(ev2.every((e) => e.event !== 'content_block_delta')).toBe(true);
+    expect(collectTextContent(ev2)).toBe('改：');
 
-    const events = ctx.processToolUse(makeToolUse('Write', 'tool_1'));
+    const toolEvents = ctx.processToolUse(makeToolUse('Write', 'tool_1'));
+    const events = [...ev1, ...ev2, ...toolEvents];
 
     let textStartIndex: number | undefined;
     let posTextDelta = -1;
@@ -200,14 +188,7 @@ describe('Tool use flushes pending thinking buffer', () => {
     expect(posTextDelta).toBeLessThan(posTextStop);
     expect(posTextStop).toBeLessThan(posToolStart);
 
-    expect(
-      events.some(
-        (e) =>
-          e.event === 'content_block_delta' &&
-          (e.data.delta as any)?.type === 'text_delta' &&
-          (e.data.delta as any)?.text === '有修改：',
-      ),
-    ).toBe(true);
+    expect(collectTextContent(events)).toBe('有修改：');
   });
 });
 
@@ -219,62 +200,64 @@ describe('estimateTokens', () => {
   });
 });
 
-describe('findRealThinkingStartTag', () => {
-  it('test_find_real_thinking_start_tag_basic', () => {
-    expect(findRealThinkingStartTag('<thinking>')).toBe(0);
-    expect(findRealThinkingStartTag('prefix<thinking>')).toBe(6);
+describe('Issue #2 legacy thinking stream regression', () => {
+  it.each([
+    {
+      name: 'ASCII period with LF separator',
+      thinking: 'Reasoning.',
+      separator: '\n\n',
+      text: 'Visible answer',
+    },
+    {
+      name: 'Chinese full stop with LF separator',
+      thinking: '这是推理。',
+      separator: '\n\n',
+      text: '这是正文',
+    },
+    {
+      name: 'Chinese question mark with CRLF separator',
+      thinking: '为什么？',
+      separator: '\r\n\r\n',
+      text: '最终答案',
+    },
+  ])('decodes $name identically at every single split point', async ({
+    thinking,
+    separator,
+    text,
+  }) => {
+    const input = `<thinking>${thinking}</thinking>${separator}${text}`;
+
+    for (let split = 0; split <= input.length; split++) {
+      const ctx = makeContext(true);
+      const all = ctx.generateInitialEvents();
+      all.push(
+        ...ctx.processKiroEvent({ kind: 'AssistantResponse', content: input.slice(0, split) }),
+      );
+      all.push(...ctx.processKiroEvent({ kind: 'AssistantResponse', content: input.slice(split) }));
+      all.push(...(await ctx.generateFinalEvents()));
+
+      const diagnostic = `split=${split}, input=${JSON.stringify(input)}`;
+      expect(collectThinkingText(all), diagnostic).toBe(thinking);
+      expect(collectTextContent(all), diagnostic).toBe(text);
+      expectThinkingStoppedBefore(all, 'text', diagnostic);
+    }
   });
 
-  it('test_find_real_thinking_start_tag_with_backticks', () => {
-    expect(findRealThinkingStartTag('`<thinking>`')).toBeUndefined();
-    expect(findRealThinkingStartTag('use `<thinking>` tag')).toBeUndefined();
-    expect(findRealThinkingStartTag('about `<thinking>` tag<thinking>content')).toBe(22);
-  });
-
-  it('test_find_real_thinking_start_tag_with_quotes', () => {
-    expect(findRealThinkingStartTag('"<thinking>"')).toBeUndefined();
-    expect(findRealThinkingStartTag('the "<thinking>" tag')).toBeUndefined();
-    expect(findRealThinkingStartTag("'<thinking>'")).toBeUndefined();
-    expect(findRealThinkingStartTag('about "<thinking>" and \'<thinking>\' then<thinking>')).toBe(
-      40,
+  it('implicitly closes an unclosed thinking block before a structured tool starts', async () => {
+    const ctx = makeContext(true);
+    const all = ctx.generateInitialEvents();
+    all.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: '<thinking>Draft tool arguments.',
+      }),
     );
-  });
-});
+    all.push(...ctx.processToolUse(makeToolUse('Write', 'tool_1', '{}', true)));
+    all.push(...(await ctx.generateFinalEvents()));
 
-describe('findRealThinkingEndTag', () => {
-  it('test_find_real_thinking_end_tag_basic', () => {
-    expect(findRealThinkingEndTag('</thinking>\n\n')).toBe(0);
-    expect(findRealThinkingEndTag('content</thinking>\n\n')).toBe(7);
-    expect(findRealThinkingEndTag('some text</thinking>\n\nmore text')).toBe(9);
-    expect(findRealThinkingEndTag('</thinking>')).toBeUndefined();
-    expect(findRealThinkingEndTag('</thinking>\n')).toBeUndefined();
-    expect(findRealThinkingEndTag('</thinking> more')).toBeUndefined();
-  });
-
-  it('test_find_real_thinking_end_tag_with_backticks', () => {
-    expect(findRealThinkingEndTag('`</thinking>`\n\n')).toBeUndefined();
-    expect(findRealThinkingEndTag('mention `</thinking>` in code\n\n')).toBeUndefined();
-    expect(findRealThinkingEndTag('`</thinking>\n\n')).toBeUndefined();
-    expect(findRealThinkingEndTag('</thinking>`\n\n')).toBeUndefined();
-  });
-
-  it('test_find_real_thinking_end_tag_with_quotes', () => {
-    expect(findRealThinkingEndTag('"</thinking>"\n\n')).toBeUndefined();
-    expect(findRealThinkingEndTag('the string "</thinking>" is a tag\n\n')).toBeUndefined();
-    expect(findRealThinkingEndTag("'</thinking>'\n\n")).toBeUndefined();
-    expect(findRealThinkingEndTag("use '</thinking>' as marker\n\n")).toBeUndefined();
-    expect(findRealThinkingEndTag('about "</thinking>" tag</thinking>\n\n')).toBe(23);
-    expect(findRealThinkingEndTag("about '</thinking>' tag</thinking>\n\n")).toBe(23);
-  });
-
-  it('test_find_real_thinking_end_tag_mixed', () => {
-    expect(findRealThinkingEndTag('discussing `</thinking>` tag</thinking>\n\n')).toBe(28);
-    expect(findRealThinkingEndTag('`</thinking>` and `</thinking>` done</thinking>\n\n')).toBe(36);
-    expect(
-      findRealThinkingEndTag(
-        '`</thinking>` and "</thinking>" and \'</thinking>\' done</thinking>\n\n',
-      ),
-    ).toBe(54);
+    expect(collectThinkingText(all)).toBe('Draft tool arguments.');
+    expect(collectTextContent(all)).toBe('');
+    expectThinkingStoppedBefore(all, 'tool_use');
   });
 });
 
@@ -350,7 +333,7 @@ describe('Thinking newline stripping', () => {
       kind: 'AssistantResponse',
       content: '<thinking>\nHello world',
     });
-    const fullThinking = collectThinkingContent(events);
+    const fullThinking = collectThinkingText(events);
     expect(fullThinking.startsWith('\n')).toBe(false);
   });
 
@@ -360,7 +343,7 @@ describe('Thinking newline stripping', () => {
     const events1 = ctx.processKiroEvent({ kind: 'AssistantResponse', content: '<thinking>' });
     const events2 = ctx.processKiroEvent({ kind: 'AssistantResponse', content: '\nHello world' });
     const all = [...events1, ...events2];
-    const fullThinking = collectThinkingContent(all);
+    const fullThinking = collectThinkingText(all);
     expect(fullThinking.startsWith('\n')).toBe(false);
   });
 
@@ -371,7 +354,7 @@ describe('Thinking newline stripping', () => {
       kind: 'AssistantResponse',
       content: '<thinking>abc</thinking>\n\ntext',
     });
-    const fullThinking = collectThinkingContent(events);
+    const fullThinking = collectThinkingText(events);
     expect(fullThinking).toBe('abc');
   });
 
@@ -404,7 +387,7 @@ describe('Thinking split across chunks', () => {
     all.push(...ctx.processKiroEvent({ kind: 'AssistantResponse', content: '你好' }));
     all.push(...(await ctx.generateFinalEvents()));
 
-    expect(collectThinkingContent(all)).toBe('abc');
+    expect(collectThinkingText(all)).toBe('abc');
     expect(collectTextContent(all)).toBe('你好');
   });
 
@@ -419,7 +402,7 @@ describe('Thinking split across chunks', () => {
     all.push(...ctx.processKiroEvent({ kind: 'AssistantResponse', content: '\n\n你好' }));
     all.push(...(await ctx.generateFinalEvents()));
 
-    expect(collectThinkingContent(all)).toBe('abc');
+    expect(collectThinkingText(all)).toBe('abc');
     expect(collectTextContent(all)).toBe('你好');
   });
 
@@ -436,7 +419,7 @@ describe('Thinking split across chunks', () => {
     );
     all.push(...(await ctx.generateFinalEvents()));
 
-    expect(collectThinkingContent(all)).toBe('abc');
+    expect(collectThinkingText(all)).toBe('abc');
     expect(collectTextContent(all)).toBe('text');
   });
 
@@ -463,7 +446,7 @@ describe('Thinking split across chunks', () => {
     }
     all.push(...(await ctx.generateFinalEvents()));
 
-    expect(collectThinkingContent(all)).toBe('hello');
+    expect(collectThinkingText(all)).toBe('hello');
     expect(collectTextContent(all)).toBe('world');
   });
 });

@@ -19,11 +19,10 @@ import { EventStreamDecoder } from '../kiro/parser/decoder.js';
 import { getLogger } from '../shared/logger.js';
 import { resolveContextUsage } from './converter.js';
 import {
-  assertNever,
-  classifyUpstreamErrorEvent,
-  extractThinkingFromCompleteText,
-  type PendingUpstreamError,
-} from './stream.js';
+  LegacyThinkingDecoder,
+  type LegacyThinkingDecoderItem,
+} from './stream/legacy-thinking-decoder.js';
+import { assertNever, classifyUpstreamErrorEvent, type PendingUpstreamError } from './stream.js';
 import { extractToolCallsFromCompleteText, type ToolTextRegistry } from './tool-call-text.js';
 
 /** 一次上游响应归约后的完整结果。 */
@@ -82,13 +81,34 @@ export function reduceKiroResponse(
   }
 
   let textContent = '';
+  let rawAssistantText = '';
+  let legacyText = '';
+  let legacyThinking = '';
+  let sawLegacyThinking = false;
+  let sawReasoningContentEvent = false;
+  // Retired (set to undefined) the moment legacy framing can no longer apply,
+  // mirroring how `stream.ts` encodes the same rule. One mechanism, so a new
+  // call site can't forget a second "is legacy still live?" conjunct.
+  let legacyDecoder = thinkingEnabled ? new LegacyThinkingDecoder() : undefined;
+
+  const collectLegacyItems = (items: LegacyThinkingDecoderItem[]): void => {
+    for (const item of items) {
+      if (item.type === 'thinking_start') {
+        sawLegacyThinking = true;
+      } else if (item.type === 'thinking') {
+        legacyThinking += item.text;
+      } else if (item.type === 'text') {
+        legacyText += item.text;
+      }
+    }
+  };
   const toolUses: Record<string, unknown>[] = [];
   let hasToolUse = false;
   let stopReason = 'end_turn';
   let contextInputTokens: number | undefined;
   let kiroMetering: KiroMeteringData | undefined;
-  // kiro-cli 2.6.0+ 原生 reasoning 累积。一旦 reasoningText 非空就走新路径
-  // （直接塞 thinking content block），跳过 `<thinking>` 标签的 regex 提取。
+  // kiro-cli 2.6.0+ 原生 reasoning 累积。任意 native event 都会锁定该路径，
+  // 跳过 legacy 文本 framing；text/signature 决定是否有可 surface 的 thinking。
   let reasoningText = '';
   let reasoningSignature: string | undefined;
 
@@ -120,17 +140,31 @@ export function reduceKiroResponse(
 
     switch (event.kind) {
       case 'AssistantResponse':
-        textContent += event.content;
+        rawAssistantText += event.content;
+        if (legacyDecoder) collectLegacyItems(legacyDecoder.feed(event.content));
         break;
 
       case 'ReasoningContent':
-        // GPT redacted reasoning: event.text='' → reasoningText 保持空 →
-        // 下面 `if (reasoningText)` 为假 → 不产 thinking 块(天然正确)。
+        // 任意原生帧都是权威的（含空/redacted）。保留一份 raw AssistantResponse
+        // 副本，好让晚到的原生帧作废试探性的 legacy 分类而不丢失可见字节。
+        //
+        // ★ 与流式 `processReasoningContent` 同源的边界:空帧只能作废**尚未
+        // 落定**的分类。thinking 块已经开着时不能退掉 decoder——否则剩下的私有
+        // 推理连同字面 `</thinking>` 会掉进可见文本。
+        if (!event.text && !event.signature && legacyDecoder?.hasOpenThinking) break;
+
+        sawReasoningContentEvent = true;
+        legacyDecoder = undefined;
         reasoningText += event.text;
         if (event.signature) reasoningSignature = event.signature;
         break;
 
       case 'ToolUse': {
+        // A structured tool event ends the legacy thinking phase even when the
+        // model omitted its close marker. Repeated incremental frames are safe:
+        // after the first boundary the decoder is permanently in text mode.
+        if (legacyDecoder) collectLegacyItems(legacyDecoder.boundary('tool_boundary'));
+
         hasToolUse = true;
         announcedToolNames.add(toolNameMap.get(event.name) ?? event.name);
 
@@ -225,17 +259,15 @@ export function reduceKiroResponse(
     }
   }
 
-  // 先做 legacy `<thinking>` 标签提取（非原生 reasoning 且开启 thinking 时），
-  // 让下面的救援只作用于**非 thinking** 文本——模型在思考里起草的调用不是
-  // 真实调用，物化它会造成幻影执行。与流式路径行为对齐（流式的 thinking
-  // 内容走 thinking_delta，从不经过救援检测器）。
+  // Resolve the native-vs-legacy mode only after all frames are known. This is
+  // what makes a late native event authoritative in the non-stream path.
   let thinkingText: string | undefined;
-  if (!reasoningText && thinkingEnabled && textContent) {
-    const [thinking, remainingText] = extractThinkingFromCompleteText(textContent);
-    if (thinking) {
-      thinkingText = thinking;
-      textContent = remainingText;
-    }
+  if (legacyDecoder) {
+    collectLegacyItems(legacyDecoder.finish());
+    thinkingText = sawLegacyThinking && legacyThinking ? legacyThinking : undefined;
+    textContent = legacyText;
+  } else {
+    textContent = rawAssistantText;
   }
 
   // 泄漏工具调用文本救援：上游偶发把模型的工具调用当纯文本发下来（而非
@@ -245,7 +277,13 @@ export function reduceKiroResponse(
   // 因此 rescued.text 变化 ⟺ 有完整调用被救援。放在 stop_reason 判定和
   // silent-failure 检测之前:纯泄漏 turn 救援后 stop_reason 应为 tool_use,
   // 且不算空响应。
-  if (rescueRegistry && textContent) {
+  // If native mode was announced only after a tentative legacy thinking block,
+  // non-stream can roll the classification back to raw text but must not then
+  // execute an invoke draft that had already been identified as thinking. This
+  // mixed ordering is an upstream protocol violation; preserving bytes without
+  // rescue is the only safe rollback.
+  const rolledBackLegacyThinking = sawReasoningContentEvent && sawLegacyThinking;
+  if (rescueRegistry && textContent && !rolledBackLegacyThinking) {
     const rescued = extractToolCallsFromCompleteText(textContent, rescueRegistry);
     if (rescued.calls.length > 0) {
       log.warn({
@@ -266,21 +304,38 @@ export function reduceKiroResponse(
     }
   }
 
-  // Determine stop_reason
-  if (hasToolUse && stopReason === 'end_turn') {
-    stopReason = 'tool_use';
+  // Derive implicit terminals without overriding an explicit upstream stop.
+  // Match the streaming path for a response that ends with thinking only: it
+  // is truncated from the client's perspective, so use max_tokens and add the
+  // same harmless text placeholder required by downstream clients.
+  //
+  // ★ 判据必须是「thinking 阶段**开过**」而非「thinking 内容非空」:流式那边用的是
+  // `thinkingBlockIndex !== undefined`（`stream.ts` 的 `sawAnyThinking`），一个空块
+  // `<thinking></thinking>\n\n` 同样算数。这里若跟着 `thinkingText`（要求内容非空）
+  // 走，空块就会一路掉进下面的 silent-failure，让非流式对同一份上游字节先重试
+  // 再回 503，而流式回 200 + max_tokens。语法已经由 LegacyThinkingDecoder 统一，
+  // 终态判定也必须同源。
+  const hasSurfaceableThinking = !!(reasoningText || reasoningSignature || sawLegacyThinking);
+  if (stopReason === 'end_turn') {
+    if (hasToolUse) {
+      stopReason = 'tool_use';
+    } else if (thinkingEnabled && hasSurfaceableThinking && textContent === '') {
+      stopReason = 'max_tokens';
+      textContent = ' ';
+    }
   }
 
   // Silent-failure detection: upstream occasionally returns a 200 OK
   // event-stream body that decodes into zero content frames. 判空 = 无 text、
-  // 无 toolUses、无 reasoning;但排除 model_context_window_exceeded / max_tokens
-  // 这两个带空 content 的合法终止信号。`!reasoningText` guard:纯原生-reasoning
-  // 响应仍产 thinking content block,不算空。
+  // 无 toolUses、无 thinking;但排除 model_context_window_exceeded / max_tokens
+  // 这两个带空 content 的合法终止信号。
+  //
+  // 复用 `hasSurfaceableThinking` 而不是把它的三个项再拼一遍:多一种拼法,
+  // 将来加第四种 thinking 来源时就会漏掉其中一处。
   const silentFailure =
     textContent === '' &&
     toolUses.length === 0 &&
-    !reasoningText &&
-    !thinkingText &&
+    !hasSurfaceableThinking &&
     stopReason !== 'model_context_window_exceeded' &&
     stopReason !== 'max_tokens';
 

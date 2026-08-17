@@ -11,23 +11,15 @@ import { getLogger } from '../shared/logger.js';
 import { getRequestContext } from '../shared/request-context.js';
 import { resolveContextUsage } from './converter.js';
 import {
-  extractThinkingFromCompleteText,
-  findCharBoundary,
-  findRealThinkingEndTag,
-  findRealThinkingEndTagAtBufferEnd,
-  findRealThinkingStartTag,
-} from './stream/thinking-detector.js';
+  type LegacyThinkingBoundaryReason,
+  LegacyThinkingDecoder,
+  type LegacyThinkingDecoderItem,
+} from './stream/legacy-thinking-decoder.js';
 import {
   type DetectorItem,
   ToolCallTextDetector,
   type ToolTextRegistry,
 } from './tool-call-text.js';
-
-// Re-export thinking-detector symbols so existing consumers
-// (`import { extractThinkingFromCompleteText } from './stream.js'`) keep
-// working without needing to know that the implementation lives in
-// `./stream/thinking-detector.js`.
-export { extractThinkingFromCompleteText };
 
 // ============================================================================
 // Claude usage wire format
@@ -699,19 +691,26 @@ export class StreamContext {
   toolBlockIndices: Map<string, number>;
   toolNameMap: Map<string, string>;
   thinkingEnabled: boolean;
-  thinkingBuffer: string;
-  inThinkingBlock: boolean;
+  /**
+   * A thinking phase happened on **either** path — legacy `<thinking>` framing
+   * or a native `reasoningContentEvent` that could surface. This is the single
+   * spelling of that predicate; don't re-derive it from `thinkingBlockIndex` /
+   * `sawReasoningContent` at a use site. `hasContent()` (stream-handler and the
+   * OpenAI transport) and the thinking-only `max_tokens` terminal both read it,
+   * and a second spelling lets silent-failure detection drift away from
+   * termination — they must agree.
+   */
   thinkingExtracted: boolean;
   thinkingBlockIndex: number | undefined;
   textBlockIndex: number | undefined;
-  private stripThinkingLeadingNewline: boolean;
+  /** Shared incremental parser for the legacy text-framed thinking protocol. */
+  private legacyThinkingDecoder: LegacyThinkingDecoder | undefined;
   /**
    * kiro-cli 2.6.0+ 原生 reasoning 路径状态。
    *
-   * 收到第一个 `reasoningContentEvent` 时置 true，后续：
-   *   1. `processContentWithThinking` 跳过 `<thinking>` 标签扫描——上游已经
-   *      用独立 event-type 给出 thinking 内容，再走 prompt 提取就会双重处理；
-   *   2. `processReasoningContent` 自己管理 thinking content block（包括 signature）。
+   * `sawReasoningContent` 在第一个**有内容**（text 或 signature）的原生帧上置位，
+   * 负责锁定 native 模式、结算 legacy 相位、开 content block、参与 thinking-only
+   * 终态。空/redacted 帧不置位也不做任何事——理由见 `processReasoningContent`。
    *
    * `reasoningBlockIndex` 记录当前 thinking content block 的 SSE index。
    */
@@ -779,12 +778,10 @@ export class StreamContext {
     this.toolBlockIndices = new Map();
     this.toolNameMap = toolNameMap;
     this.thinkingEnabled = thinkingEnabled;
-    this.thinkingBuffer = '';
-    this.inThinkingBlock = false;
     this.thinkingExtracted = false;
     this.thinkingBlockIndex = undefined;
     this.textBlockIndex = undefined;
-    this.stripThinkingLeadingNewline = false;
+    this.legacyThinkingDecoder = thinkingEnabled ? new LegacyThinkingDecoder() : undefined;
     this.sawReasoningContent = false;
     this.reasoningBlockIndex = undefined;
     this.kiroMeteringRaw = undefined;
@@ -873,16 +870,8 @@ export class StreamContext {
       case 'ReasoningContent':
         return this.processReasoningContent(event.text, event.signature);
 
-      case 'ToolUse': {
-        // 真实的结构化 toolUseEvent 到达：先让救援检测器结算待定缓冲（悬空
-        // 候选按文本吐回，保证时序——被缓冲的文本在真实 tool_use 之前发射），
-        // 再处理事件本身。合成救援调用不走这里（直接调 processToolUse）。
-        if (this.toolCallDetector) {
-          const settled = this.processDetectorItems(this.toolCallDetector.flush());
-          return settled.concat(this.processToolUse(event));
-        }
+      case 'ToolUse':
         return this.processToolUse(event);
-      }
 
       case 'Metering': {
         const { kind: _, ...metering } = event;
@@ -963,26 +952,42 @@ export class StreamContext {
    * 处理 kiro-cli 2.6.0+ 的 `reasoningContentEvent`。
    *
    * 与"手搓 `<thinking>` 标签"路径区别：
-   *   - 上游用独立 event-type 显式给出 thinking 内容，不需要 regex 扫描
+   *   - 上游用独立 event-type 显式给出 thinking 内容，不需要 legacy 文本解码
    *   - payload 可能带 signature 字段（最后一个 chunk），对应 Anthropic
    *     `signature_delta` 协议——透传给下游可用于 multi-turn thinking continuation
    *
-   * 首次到达时关闭可能已开的 text block（防止 thinking block 出现在 text 之后），
-   * 然后开 thinking block。`sawReasoningContent` 置 true 后，
-   * `processContentWithThinking` 入口会跳过 `<thinking>` 标签扫描，避免双重处理。
+   * 任意原生帧（含空/redacted）都锁定 native 模式、退掉 legacy decoder——GPT 的
+   * `extractThinking` 虽已由 `usesEncryptedNativeReasoning` 在 handler 侧静态关掉，
+   * 这条运行时信号是万一模型别名漏判时的最后一道防线。
+   *
+   * ★ 但空帧只能作废**尚未落定**的 legacy 分类，两条边界不能越:
+   *   1. **绝不打断已经开着的 thinking 块**（`hasOpenThinking`）。上游偶发空
+   *      reasoning 帧；强行关块会把剩下的私有推理连同字面 `</thinking>` 一起
+   *      推进可见文本通道。开过块 = 分类已落定，没有内容的帧不足以推翻它。
+   *   2. **绝不 flush 救援检测器**。那只在真要开 thinking block 时才需要（为了
+   *      保住 wire order），在这里做会把跨帧的泄漏工具调用候选拦腰截断，本该
+   *      救回来的 tool_use 变成裸文本——而 redacted 帧的唯一来源恰恰是 GPT。
    */
   private processReasoningContent(text: string, signature: string | undefined): SseEvent[] {
-    // GPT-5.6 的 reasoningContentEvent 只带 redactedContent(加密隐藏思维链,无
-    // text/signature)——无内容可 surface。直接丢弃,不开 thinking 块(否则会产一个
-    // 空 thinking content block,且 sawReasoningContent 误置为 true)。顺带修掉
-    // 「上游偶发空 reasoning 帧开空块」的既有 bug。对 Claude 明文 reasoning 零影响:
-    // 其首帧带 text、尾帧带 signature,守卫都不触发。
-    if (!text && !signature) return [];
-
     const events: SseEvent[] = [];
+
+    if (this.legacyThinkingDecoder && !this.legacyThinkingDecoder.hasOpenThinking) {
+      const decoder = this.legacyThinkingDecoder;
+      this.legacyThinkingDecoder = undefined;
+      events.push(...this.processLegacyThinkingItems(decoder.boundary('native_takeover')));
+    }
+
+    // 无可 surface 的内容 → 到此为止（尤其不碰救援检测器，理由见上）。
+    if (!text && !signature) return events;
 
     if (!this.sawReasoningContent) {
       this.sawReasoningContent = true;
+      this.thinkingExtracted = true;
+
+      // Native reasoning arriving after assistant text is an upstream ordering
+      // violation. Settling here keeps wire order from becoming
+      // text-prefix → native-thinking → text-suffix.
+      events.push(...this.settleTextPhases('native_takeover'));
 
       // 关闭可能已开的 text block（理论上 thinkingEnabled 时初始不会开 text，
       // 这里保险起见做检查）
@@ -1044,115 +1049,54 @@ export class StreamContext {
 
   /** Process content with thinking blocks */
   private processContentWithThinking(content: string): SseEvent[] {
-    // 已经走原生 reasoning 路径——上游显式区分了 reasoning vs assistant content,
-    // 不应再用 regex 从 assistantResponseEvent.content 里抠 `<thinking>` 标签,
-    // 否则会把模型正常输出里偶然出现的 `<thinking>` 串误判成 reasoning。
-    if (this.sawReasoningContent) {
-      return this.createTextDeltaEvents(content);
-    }
+    // No decoder means legacy framing can no longer apply: thinking was never
+    // enabled, native reasoning took over (any event counts, including a
+    // redacted one), or the decoder settled into plain text.
+    if (!this.legacyThinkingDecoder) return this.createTextDeltaEvents(content);
 
+    const events = this.processLegacyThinkingItems(this.legacyThinkingDecoder.feed(content));
+    if (this.legacyThinkingDecoder.isPassthrough) this.legacyThinkingDecoder = undefined;
+    return events;
+  }
+
+  /** Route decoder output while preserving Anthropic content-block ordering. */
+  private processLegacyThinkingItems(items: LegacyThinkingDecoderItem[]): SseEvent[] {
     const events: SseEvent[] = [];
-    this.thinkingBuffer += content;
 
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (!this.inThinkingBlock && !this.thinkingExtracted) {
-        // Look for <thinking> start tag
-        const startPos = findRealThinkingStartTag(this.thinkingBuffer);
-        if (startPos !== undefined) {
-          // Send content before <thinking> as text_delta
-          const beforeThinking = this.thinkingBuffer.slice(0, startPos);
-          if (beforeThinking?.trim()) {
-            events.push(...this.createTextDeltaEvents(beforeThinking));
-          }
-
-          // Enter thinking block
-          this.inThinkingBlock = true;
-          this.stripThinkingLeadingNewline = true;
-          this.thinkingBuffer = this.thinkingBuffer.slice(startPos + '<thinking>'.length);
-
-          // Create thinking block content_block_start
+    for (const item of items) {
+      switch (item.type) {
+        case 'thinking_start': {
+          this.thinkingExtracted = true;
           const thinkingIndex = this.stateManager.nextBlockIndex();
           this.thinkingBlockIndex = thinkingIndex;
-          const startEvents = this.stateManager.handleContentBlockStart(thinkingIndex, 'thinking', {
-            type: 'content_block_start',
-            index: thinkingIndex,
-            content_block: {
-              type: 'thinking',
-              thinking: '',
-            },
-          });
-          events.push(...startEvents);
-        } else {
-          // No <thinking> found, check if partial tag possible
-          const targetLen = Math.max(0, this.thinkingBuffer.length - '<thinking>'.length);
-          const safeLen = findCharBoundary(this.thinkingBuffer, targetLen);
-          if (safeLen > 0) {
-            const safeContent = this.thinkingBuffer.slice(0, safeLen);
-            // Skip pure whitespace to avoid creating text block before thinking
-            if (safeContent?.trim()) {
-              events.push(...this.createTextDeltaEvents(safeContent));
-              this.thinkingBuffer = this.thinkingBuffer.slice(safeLen);
-            }
-          }
+          events.push(
+            ...this.stateManager.handleContentBlockStart(thinkingIndex, 'thinking', {
+              type: 'content_block_start',
+              index: thinkingIndex,
+              content_block: { type: 'thinking', thinking: '' },
+            }),
+          );
           break;
         }
-      } else if (this.inThinkingBlock) {
-        // Strip <thinking> tag's trailing newline (may span chunks)
-        if (this.stripThinkingLeadingNewline) {
-          if (this.thinkingBuffer.startsWith('\n')) {
-            this.thinkingBuffer = this.thinkingBuffer.slice(1);
-            this.stripThinkingLeadingNewline = false;
-          } else if (this.thinkingBuffer.length > 0) {
-            this.stripThinkingLeadingNewline = false;
+        case 'thinking':
+          if (item.text && this.thinkingBlockIndex !== undefined) {
+            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, item.text));
           }
-          // If buffer empty, keep flag for next chunk
-        }
-
-        // In thinking block, look for </thinking> end tag
-        const endPos = findRealThinkingEndTag(this.thinkingBuffer);
-        if (endPos !== undefined) {
-          // Extract thinking content
-          const thinkingContent = this.thinkingBuffer.slice(0, endPos);
-          if (thinkingContent && this.thinkingBlockIndex !== undefined) {
-            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
-          }
-
-          // End thinking block
-          this.inThinkingBlock = false;
-          this.thinkingExtracted = true;
-
+          break;
+        case 'thinking_end':
+          // No need to set thinkingExtracted — the decoder cannot emit an end
+          // without the matching start that already set it.
           if (this.thinkingBlockIndex !== undefined) {
-            // Send empty thinking_delta then content_block_stop
+            // Preserve the historical empty terminal delta for downstream
+            // clients that use it as a final thinking flush signal.
             events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-            const stopEvent = this.stateManager.handleContentBlockStop(this.thinkingBlockIndex);
-            if (stopEvent) events.push(stopEvent);
-          }
-
-          // Strip `</thinking>\n\n`
-          this.thinkingBuffer = this.thinkingBuffer.slice(endPos + '</thinking>\n\n'.length);
-        } else {
-          // No end tag found, send safe portion as thinking_delta
-          // Reserve enough for `</thinking>\n\n` (13 bytes)
-          const targetLen = Math.max(0, this.thinkingBuffer.length - '</thinking>\n\n'.length);
-          const safeLen = findCharBoundary(this.thinkingBuffer, targetLen);
-          if (safeLen > 0) {
-            const safeContent = this.thinkingBuffer.slice(0, safeLen);
-            if (safeContent && this.thinkingBlockIndex !== undefined) {
-              events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, safeContent));
-            }
-            this.thinkingBuffer = this.thinkingBuffer.slice(safeLen);
+            const stop = this.stateManager.handleContentBlockStop(this.thinkingBlockIndex);
+            if (stop) events.push(stop);
           }
           break;
-        }
-      } else {
-        // Thinking already extracted, remaining content as text_delta
-        if (this.thinkingBuffer) {
-          const remaining = this.thinkingBuffer;
-          this.thinkingBuffer = '';
-          events.push(...this.createTextDeltaEvents(remaining));
-        }
-        break;
+        case 'text':
+          if (item.text) events.push(...this.createTextDeltaEvents(item.text));
+          break;
       }
     }
 
@@ -1163,8 +1107,8 @@ export class StreamContext {
    * Create text_delta events.
    *
    * 文本通道的统一入口：救援检测器开启时，所有文本先经过它——普通文本原样
-   * 透传，检出的泄漏工具调用块被转成真正的 tool_use block（复用
-   * processToolUse 的全部 block 管理与名字反映射）。
+   * 透传，检出的泄漏工具调用块被转成真正的 tool_use block（复用底层
+   * tool block 发射与名字反映射）。
    */
   createTextDeltaEvents(text: string): SseEvent[] {
     if (!this.toolCallDetector) return this.emitTextDeltaEventsRaw(text);
@@ -1178,13 +1122,13 @@ export class StreamContext {
       if (item.type === 'text') {
         if (item.text) events.push(...this.emitTextDeltaEventsRaw(item.text));
       } else {
-        // 合成一个完整的 ToolUse 事件走标准路径。name 是模型视角的名字
-        // （可能是缩短名），processToolUse 里会经 toolNameMap 反映射。
+        // 合成救援调用直接走无边界副作用的底层 emitter。若回调 public
+        // processToolUse，会重入 decoder/tool-detector 的 boundary flush。
         // 注：这段文本的 token 已在 processAssistantResponse 按原文估算过，
-        // processToolUse 会再按 input 长度累一次——输出估算轻微偏高，可接受
+        // emitToolUseBlock 会再按 input 长度累一次——输出估算轻微偏高，可接受
         // （usage 以上游 contextUsage / metering 为准）。
         events.push(
-          ...this.processToolUse({
+          ...this.emitToolUseBlock({
             kind: 'ToolUse',
             name: item.call.name,
             toolUseId: `toolu_${uuidv4().replace(/-/g, '')}`,
@@ -1262,54 +1206,60 @@ export class StreamContext {
   processToolUse(toolUse: Extract<Event, { kind: 'ToolUse' }>): SseEvent[] {
     const events: SseEvent[] = [];
 
-    this.stateManager.setHasToolUse(true);
-
     // 原生 reasoning 路径：tool_use 出现前先关 thinking block
     events.push(...this.closeReasoningBlockIfOpen());
 
-    // Handle boundary case: </thinking> at buffer end before tool_use
-    if (this.thinkingEnabled && this.inThinkingBlock) {
-      const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
-      if (endPos !== undefined) {
-        const thinkingContent = this.thinkingBuffer.slice(0, endPos);
-        if (thinkingContent && this.thinkingBlockIndex !== undefined) {
-          events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
-        }
+    // A real structured tool event is a strong out-of-band phase boundary.
+    events.push(...this.settleTextPhases('tool_boundary'));
 
-        // End thinking block
-        this.inThinkingBlock = false;
-        this.thinkingExtracted = true;
+    events.push(...this.emitToolUseBlock(toolUse));
+    return events;
+  }
 
-        if (this.thinkingBlockIndex !== undefined) {
-          events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-          const stopEvent = this.stateManager.handleContentBlockStop(this.thinkingBlockIndex);
-          if (stopEvent) events.push(stopEvent);
-        }
+  /**
+   * Settle both text-phase parsers, in the one order that keeps wire output
+   * correct: legacy decoder first, rescue detector second.
+   *
+   * The order is not arbitrary and must not be inverted. Settling the decoder
+   * releases buffered visible text, which then has to pass through rescue like
+   * any other text; flushing rescue first would strand that text after the
+   * block it belongs before. Every caller is a phase boundary — a structured
+   * tool event, native reasoning taking over, or end of stream — so keeping
+   * one function is what makes the ordering checkable rather than a rule
+   * restated at each site.
+   *
+   * Retiring the decoder afterwards is unconditional: `finish` is terminal, and
+   * `boundary()` leaves it in the plain-text state for every other reason, so
+   * it can no longer change a classification either way. Later text goes
+   * straight down the passthrough branch in `processContentWithThinking`.
+   */
+  private settleTextPhases(reason: LegacyThinkingBoundaryReason | 'finish'): SseEvent[] {
+    const events: SseEvent[] = [];
 
-        // Text after end tag (usually empty/whitespace)
-        // 工具边界的 flush 直接走 raw 发射（绕过救援检测器）：这里的文本紧贴
-        // tool_use block 之前发出，不可能是泄漏块的一部分；绕过也消除了
-        // 合成救援调用 → processToolUse → 再喂检测器的重入路径。
-        const afterPos = endPos + '</thinking>'.length;
-        const remaining = this.thinkingBuffer.slice(afterPos).trimStart();
-        this.thinkingBuffer = '';
-        if (remaining) {
-          events.push(...this.emitTextDeltaEventsRaw(remaining));
-        }
-      }
+    if (this.legacyThinkingDecoder) {
+      const decoder = this.legacyThinkingDecoder;
+      this.legacyThinkingDecoder = undefined;
+      events.push(
+        ...this.processLegacyThinkingItems(
+          reason === 'finish' ? decoder.finish() : decoder.boundary(reason),
+        ),
+      );
     }
 
-    // Flush pending thinking buffer text before tool_use block（raw，理由同上）
-    if (
-      this.thinkingEnabled &&
-      !this.inThinkingBlock &&
-      !this.thinkingExtracted &&
-      this.thinkingBuffer
-    ) {
-      const buffered = this.thinkingBuffer;
-      this.thinkingBuffer = '';
-      events.push(...this.emitTextDeltaEventsRaw(buffered));
+    // Synthetic calls produced by this flush use emitToolUseBlock and so
+    // cannot re-enter this method.
+    if (this.toolCallDetector) {
+      events.push(...this.processDetectorItems(this.toolCallDetector.flush()));
     }
+
+    return events;
+  }
+
+  /** Emit a tool block without touching legacy/native or rescue boundaries. */
+  private emitToolUseBlock(toolUse: Extract<Event, { kind: 'ToolUse' }>): SseEvent[] {
+    const events: SseEvent[] = [];
+
+    this.stateManager.setHasToolUse(true);
 
     // Get or allocate block index
     let blockIndex = this.toolBlockIndices.get(toolUse.toolUseId);
@@ -1380,62 +1330,20 @@ export class StreamContext {
     // stream 结束前先补关。
     events.push(...this.closeReasoningBlockIfOpen());
 
-    // Flush thinking_buffer remaining content
-    if (this.thinkingEnabled && this.thinkingBuffer) {
-      if (this.inThinkingBlock) {
-        // End-of-stream: check for </thinking> at buffer end
-        const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
-        if (endPos !== undefined) {
-          const thinkingContent = this.thinkingBuffer.slice(0, endPos);
-          if (thinkingContent && this.thinkingBlockIndex !== undefined) {
-            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
-          }
-
-          // Close thinking block
-          if (this.thinkingBlockIndex !== undefined) {
-            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-            const stopEvent = this.stateManager.handleContentBlockStop(this.thinkingBlockIndex);
-            if (stopEvent) events.push(stopEvent);
-          }
-
-          const afterPos = endPos + '</thinking>'.length;
-          const remaining = this.thinkingBuffer.slice(afterPos).trimStart();
-          this.thinkingBuffer = '';
-          this.inThinkingBlock = false;
-          this.thinkingExtracted = true;
-          if (remaining) {
-            events.push(...this.createTextDeltaEvents(remaining));
-          }
-        } else {
-          // Still in thinking block, send remaining as thinking_delta
-          if (this.thinkingBlockIndex !== undefined) {
-            events.push(
-              this.createThinkingDeltaEvent(this.thinkingBlockIndex, this.thinkingBuffer),
-            );
-            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-            const stopEvent = this.stateManager.handleContentBlockStop(this.thinkingBlockIndex);
-            if (stopEvent) events.push(stopEvent);
-          }
-        }
-      } else {
-        // Send remaining as text_delta
-        events.push(...this.createTextDeltaEvents(this.thinkingBuffer));
-      }
-      this.thinkingBuffer = '';
-    }
-
-    // 救援检测器收尾：流结束时仍在缓冲的候选块在这里定型——完整的泄漏块
-    // 转成 tool_use（真实泄漏几乎总是终止在流尾），非泄漏候选与结构悬空的
-    // 截断块都按文本原样吐回（永不丢弃，见 tool-call-text.ts 文件头）。
-    if (this.toolCallDetector) {
-      events.push(...this.processDetectorItems(this.toolCallDetector.flush()));
-    }
+    // Decoder first: an unclosed legacy block stays thinking and therefore can
+    // never be materialized as a leaked tool call. Then the rescue detector
+    // settles — 流结束时仍在缓冲的候选块在这里定型，完整的泄漏块转成 tool_use
+    //（真实泄漏几乎总是终止在流尾），非泄漏候选与结构悬空的截断块都按文本
+    // 原样吐回（永不丢弃，见 tool-call-text.ts 文件头）。
+    events.push(...this.settleTextPhases('finish'));
 
     // If only thinking was produced (no text, no tool_use),
     // set stop_reason to max_tokens and emit a placeholder text block.
-    // 包括两条 thinking 路径：旧的 `<thinking>` 标签扫描 + 新的原生 reasoningContentEvent。
-    const sawAnyThinking = this.thinkingBlockIndex !== undefined || this.sawReasoningContent;
-    if (this.thinkingEnabled && sawAnyThinking && !this.stateManager.hasNonThinkingBlocks()) {
+    if (
+      this.thinkingEnabled &&
+      this.thinkingExtracted &&
+      !this.stateManager.hasNonThinkingBlocks()
+    ) {
       this.stateManager.setStopReason('max_tokens');
       events.push(...this.createTextDeltaEvents(' '));
     }
@@ -1486,9 +1394,6 @@ export class StreamContext {
 
 // Test-only exports (not part of stable public API)
 export const __testing__ = {
-  findRealThinkingStartTag,
-  findRealThinkingEndTag,
-  findRealThinkingEndTagAtBufferEnd,
   estimateTokens: (text: string): number => estimateTokens(text),
 };
 

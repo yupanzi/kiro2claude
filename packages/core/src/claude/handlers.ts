@@ -175,9 +175,9 @@ export function createPostMessages(deps: PostMessagesDeps) {
       payload.tools,
     );
 
-    // 仅 GPT(加密 reasoning)关掉 legacy `<thinking>` 扫描:其 redacted reasoning 不置
-    // sawReasoningContent → 运行时无法关闭扫描,靠静态判定兜底。Claude 原生 reasoning
-    // (明文)不纳入——靠运行时信号关闭,且需 thinkingEnabled=true 维持 thinking→text 块顺序。
+    // 仅 GPT(加密 reasoning)从响应开始就关掉 legacy `<thinking>` 解码；运行时 native
+    // event 也会锁模式，但静态判定还能覆盖 redacted event 缺失/晚到。Claude 原生
+    // reasoning(明文)不纳入，且需 thinkingEnabled=true 维持 thinking→text 块顺序。
     const extractThinking =
       deps.extractThinking &&
       isThinkingEnabled(payload.thinking) &&

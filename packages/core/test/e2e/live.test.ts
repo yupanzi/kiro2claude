@@ -1218,10 +1218,10 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   //     converter.ts:513 prepends `<thinking_mode>enabled</thinking_mode>`
   //     `<max_thinking_length>N</max_thinking_length>` onto the system
   //     prompt so the upstream model knows to produce thinking-wrapped
-  //     output; the non-stream handler then calls
-  //     `extractThinkingFromCompleteText` (non-stream-handler.ts:180) to
-  //     split the raw `<thinking>...</thinking>\n\ntext` payload into
-  //     separate `content[]` blocks.
+  //     output; `reduceKiroResponse` then runs the raw
+  //     `<thinking>...</thinking>\n\ntext` payload through
+  //     `LegacyThinkingDecoder` — the same grammar the streaming path uses —
+  //     to split it into separate `content[]` blocks.
   //
   //     This test is the only e2e signal that the whole non-stream thinking
   //     path is wired up — unit tests can't prove that the real upstream
@@ -1271,7 +1271,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
       // Final answer must mention 15 (or its Chinese rendering)
       expect(textContent).toMatch(/15/);
       // thinking content should not still contain <thinking> tags (they must
-      // be stripped by extractThinkingFromCompleteText)
+      // be consumed as framing by LegacyThinkingDecoder)
       expect(thinkingContent).not.toMatch(/<thinking>|<\/thinking>/);
     },
     LIVE_TIMEOUT_MS,

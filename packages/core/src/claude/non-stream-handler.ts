@@ -241,8 +241,8 @@ export async function handleNonStreamRequest(
 
     // 原生 reasoning 路径优先：上游显式给出 ReasoningContent → 直接产 thinking block
     // （含 signature，可被下游用作 Anthropic multi-turn thinking continuation）。
-    // 与 `<thinking>` 标签扫描路径互斥：reasoningText 非空时跳过该扫描。
-    if (reasoningText) {
+    // 与 legacy `<thinking>` 解码路径互斥；signature-only 也是有效 native payload。
+    if (reasoningText || reasoningSignature) {
       thinkingDetected = true;
       const thinkingBlock: Record<string, unknown> = { type: 'thinking', thinking: reasoningText };
       if (reasoningSignature) thinkingBlock.signature = reasoningSignature;

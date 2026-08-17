@@ -28,7 +28,11 @@ import type { KiroProvider } from '../../src/kiro/provider.js';
 import { ProviderError } from '../../src/kiro/provider-error.js';
 import { HookBus } from '../../src/plugin-host/index.js';
 import { registerClaudeRoutes } from '../../src/routes/claude.js';
-import { buildAssistantResponseFrame, framesWithMetering } from '../helpers/event-stream.js';
+import {
+  buildAssistantResponseFrame,
+  buildReasoningContentFrame,
+  framesWithMetering,
+} from '../helpers/event-stream.js';
 import { generateMinimalPdfBytes } from '../helpers/fixtures.js';
 
 const API_KEY = 'sk-test-handlers';
@@ -269,6 +273,28 @@ describe('handlers: POST /claude/v1/messages - happy path', () => {
     expect(body.model).toBe('claude-sonnet-4-5-20250929');
     expect(body.content).toEqual([{ type: 'text', text: 'hi from kiro' }]);
     expect(body.stop_reason).toBe('end_turn');
+    expect(provider.callApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns a signature-only native thinking block instead of treating it as an empty 503', async () => {
+    const provider = makeStubProvider({
+      callApi: async () => makeAxiosResponse(buildReasoningContentFrame('', 'native-signature')),
+    });
+    app = await buildApp(provider);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: VALID_BODY,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      content: Array<{ type: string; thinking?: string; signature?: string }>;
+    };
+    expect(body.content).toEqual([
+      { type: 'thinking', thinking: '', signature: 'native-signature' },
+    ]);
     expect(provider.callApi).toHaveBeenCalledTimes(1);
   });
 

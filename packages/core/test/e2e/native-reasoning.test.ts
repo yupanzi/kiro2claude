@@ -532,7 +532,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
       expect(thinkingBlock?.signature).toBeUndefined();
       // 答案正确
       expect(textBlock?.text).toMatch(/12:33|12:30|2.*hour|33/i);
-      // thinking 内容不残留标签（被 extractThinkingFromCompleteText 剥掉）
+      // thinking 内容不残留标签（被 LegacyThinkingDecoder 当 framing 消费掉）
       expect(thinkingBlock?.thinking).not.toMatch(/<thinking>|<\/thinking>/);
     },
     LIVE_TIMEOUT_MS,

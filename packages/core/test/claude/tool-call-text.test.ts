@@ -20,6 +20,7 @@ import {
 } from '../../src/claude/tool-call-text.js';
 import type { MessagesRequest, Tool } from '../../src/claude/types.js';
 import { HookBus } from '../../src/plugin-host/index.js';
+import { collectThinkingText, expectThinkingStoppedBefore } from '../helpers/sse-blocks.js';
 
 /** 命名空间前缀，动态拼接（理由见文件头） */
 const NS_PREFIX = ['ant', 'ml'].join('');
@@ -475,6 +476,85 @@ function collectToolStarts(events: SseEvent[]): Array<Record<string, unknown>> {
 }
 
 describe('StreamContext 泄漏救援集成', () => {
+  it('legacy thinking 内的完整调用草稿不会被救援，且 thinking 在真实工具前关闭', async () => {
+    const ctx = new StreamContext('test-model', 1, true, new Map(), new HookBus(), REGISTRY);
+    const events: SseEvent[] = [...ctx.generateInitialEvents()];
+    events.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: `<thinking>\n${LEAK_EDIT}`,
+      }),
+    );
+    events.push(
+      ...ctx.processKiroEvent({
+        kind: 'ToolUse',
+        name: 'Read',
+        toolUseId: 'real-tool',
+        input: '{"file_path":"/tmp/real.txt"}',
+        isComplete: true,
+      }),
+    );
+    events.push(...(await ctx.generateFinalEvents()));
+
+    const toolStarts = collectToolStarts(events);
+    expect(toolStarts).toHaveLength(1);
+    expect(toolStarts[0].name).toBe('Read');
+    expect(collectText(events)).toBe('');
+
+    expectThinkingStoppedBefore(events, 'tool_use');
+  });
+
+  it('只救援句号结尾 thinking 闭合后的可见调用', async () => {
+    const ctx = new StreamContext('test-model', 1, true, new Map(), new HookBus(), REGISTRY);
+    const events: SseEvent[] = [...ctx.generateInitialEvents()];
+    events.push(
+      ...ctx.processKiroEvent({
+        kind: 'AssistantResponse',
+        content: `<thinking>plan.</thinking>\n\n${LEAK_EDIT}`,
+      }),
+    );
+    events.push(...(await ctx.generateFinalEvents()));
+
+    const toolStarts = collectToolStarts(events);
+    expect(toolStarts).toHaveLength(1);
+    expect(toolStarts[0].name).toBe('Edit');
+    expect(collectText(events)).toBe('');
+
+    expect(collectThinkingText(events)).toBe('plan.');
+  });
+
+  it('late native reasoning 前会先结算旧的救援候选，不重排文本', async () => {
+    const ctx = new StreamContext('test-model', 1, true, new Map(), new HookBus(), REGISTRY);
+    const events: SseEvent[] = [...ctx.generateInitialEvents()];
+    const pending = 'Visible prefix.\n<invoke name="Edit">\n<parameter name="file_path">/tmp/x';
+    events.push(...ctx.processKiroEvent({ kind: 'AssistantResponse', content: pending }));
+    events.push(
+      ...ctx.processKiroEvent({
+        kind: 'ReasoningContent',
+        text: 'late native reasoning',
+        signature: undefined,
+      }),
+    );
+    events.push(...(await ctx.generateFinalEvents()));
+
+    expect(collectText(events)).toBe(pending);
+    const nativeThinkingStart = events.findIndex(
+      (event) =>
+        event.event === 'content_block_start' &&
+        (event.data.content_block as Record<string, unknown>)?.type === 'thinking',
+    );
+    const lastTextDelta = events.reduce(
+      (last, event, index) =>
+        event.event === 'content_block_delta' &&
+        (event.data.delta as Record<string, unknown>)?.type === 'text_delta'
+          ? index
+          : last,
+      -1,
+    );
+    expect(lastTextDelta).toBeGreaterThanOrEqual(0);
+    expect(lastTextDelta).toBeLessThan(nativeThinkingStart);
+  });
+
   it('泄漏文本流式到达 → tool_use block + stop_reason=tool_use', async () => {
     const ctx = new StreamContext('test-model', 1, false, new Map(), new HookBus(), REGISTRY);
     const events: SseEvent[] = [...ctx.generateInitialEvents()];
