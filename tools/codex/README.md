@@ -10,18 +10,20 @@ Codex CLI **0.122+ 移除了 `wire_api = "chat"`**,只支持 **Responses API**(�
 
 ## ⚠ Codex 按模型名走两套请求形态
 
-抓包对比得到(**推翻了旧结论「只对识别的名字下发工具」**):
+抓包对比得到(⚠ 判别只看**字段在不在**,别按模型名分支):
 
 | 模型名 | Codex 行为 | 工具在哪 |
 |---|---|---|
 | `gpt-5.6-sol`(**认识**) | **code mode** | `input[0]` 的 `additional_tools` item;顶层 `tools` / `instructions` **都不存在** |
-| `gpt-5-codex` / `o3` / `sol`(不认识) | 打 `Model metadata not found` 警告后 fallback | 顶层 `tools`(10 个) |
+| `gpt-5-codex` / `o3` / `sol`(不认识) | 打 `Model metadata not found` 警告后 fallback | 顶层 `tools`(10 个,扁平,0.147 后不变) |
 
-code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wait` + `request_user_input` + `collaboration`(namespace)。**所有真实工具——`apply_patch` 写文件、`exec_command` 执行命令、`update_plan`、`view_image`——都不是独立 tool**,只写在 `exec` 那 10199 字符描述里的 TS 声明中;模型必须调 `exec` 传一段 JS(`await tools.apply_patch(...)`)才能干活。
+code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wait` + `request_user_input` + `collaboration`(namespace)。**所有真实工具——`apply_patch` 写文件、`exec_command` 执行命令、`update_plan`、`view_image`——都不是独立 tool**,只写在 `exec` 那约 10K 字符描述里的 TS 声明中;模型必须调 `exec` 传一段 JS(`await tools.apply_patch(...)`)才能干活。
 
-网关两套都支持(`core/src/openai/responses/converter.ts` 的 `collectTools`;freeform 工具包成单 `input` 字符串字段的 JSON 工具转发,响应侧还原成 `custom_tool_call`),所以 **harness 默认直接用真名 `gpt-5.6-sol`**。换 terra/luna 档位直接 `-m gpt-5.6-terra` 即可。
+**⚠ 0.147.0 起 code mode 的工具定义多包一层 namespace**(PR [#37022](https://github.com/openai/codex/pull/37022),无配置可回退):原顶层扁平的 `exec`/`wait`/`request_user_input` 折进 `{type:"namespace",name:"functions",tools:[…]}` 容器,子工具形状不变;`collaboration` namespace 照旧。同版本另一变化:`function_call_output.output` 变成 **content part 数组**(router 拒绝时才是字符串)。网关两者都已接住——展开规则与理由见 `core/src/openai/responses/converter.ts` 的 `expandDefaultNamespace` 头注释,**此处不复述**。
 
-> `namespace` 工具(`collaboration` / `multi_agent_v1`)**故意不转发**:实测 Codex 拒绝直调其子工具(`unsupported call: list_agents`,换 `collaboration.list_agents` 同样被拒),转发只会造出一批调不动的工具。
+网关两套形态都支持(`core/src/openai/responses/converter.ts` 的 `collectTools`;freeform 工具包成单 `input` 字符串字段的 JSON 工具转发,响应侧还原成 `custom_tool_call`),所以 **harness 默认直接用真名 `gpt-5.6-sol`**。换 terra/luna 档位直接 `-m gpt-5.6-terra` 即可。
+
+> 非默认 `namespace` 工具(`collaboration` / `multi_agent_v1`)**故意不转发**:实测其子工具裸名与 `collaboration.list_agents` 都被拒(`unsupported call: list_agents`)。规则与理由同上,见 `expandDefaultNamespace` 头注释。
 
 ## 前置条件
 
@@ -59,7 +61,7 @@ code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wa
 
 ## 实测结论(已跑通)
 
-> 抓包与下列验证跑在 Codex **0.144.4 / 0.146.0**,两版行为一致。此处是本仓唯一记录 Codex 版本号的地方——判别 code mode 只看**字段在不在**,代码与其它文档都不按版本分支。
+> 端到端验证跑在 Codex **0.144.4 / 0.146.0**(扁平工具形态);**0.147.0 / 0.148.0**(`functions` namespace 嵌套形态)用本地抓包/应答服务器验证:抓真实请求定格式、伪造 `custom_tool_call`/`function_call` 响应实测回程名字分发(裸名 `exec`/`wait` 被执行,`collaboration` 子工具被拒)。此处是本仓唯一记录**端到端验证过哪些 Codex 版本**的地方;别处(源码、测试、脚本与其它文档)出现的版本号只标注某个 wire 形态**何时**开始出现——判别 code mode 与 namespace 展开一律只看**字段在不在**,任何地方都不按版本走不同路径。
 
 - ✅ **对话**:`codex exec "..."` → 网关 `/openai/v1/responses` → gpt-5.6-sol → 正确回答。
 - ✅ **工具调用(fallback 形态)**:`gpt-5-codex` → Codex 发 10 个顶层工具 → 模型 function_call → 容器内真实执行(如 `/bin/bash -lc 'uname -s'` → `Linux`)→ 结果回填 → 模型最终答案(多轮 function_call 全通)。

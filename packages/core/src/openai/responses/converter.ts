@@ -9,7 +9,9 @@
  * ★ **code mode**(踩坑「Codex code mode」):Codex 对内部已知的模型名把工具挪进
  * `input` 的 `additional_tools` item,顶层 `tools` 与 `instructions` 双双消失。
  * 工具来源因此是**两处并集**(顶层 + additional_tools),判别只看字段在不在、
- * **不看模型名**。其中 `type:"custom"` 的 freeform 工具上游没有对应通道,包成
+ * **不看模型名**。新版 Codex 还会把工具再折进一层 `functions` namespace 容器,展开
+ * 规则见 `expandDefaultNamespace`——漏展开 = 零工具上送、模型永远不调工具。
+ * 其中 `type:"custom"` 的 freeform 工具上游没有对应通道,包成
  * 单 `input` 字符串字段的 JSON 工具转发(见 FREEFORM_TOOL_SCHEMA);它们的名字必须
  * 随返回值传到响应侧,否则编码器会把 custom 调用错编成 `function_call`。
  */
@@ -56,7 +58,7 @@ function isToolsCarrier(item: ResponsesInputItem): item is ResponsesInputItem & 
   return Array.isArray(it.tools) && it.content === undefined;
 }
 
-/** content parts → 纯文本(system/instructions 用)。 */
+/** content parts → 纯文本(system/instructions 与工具结果 `output` 共用)。 */
 function partsText(content: string | ResponsesContentPart[]): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -146,13 +148,6 @@ function convertInputItem(
     };
   }
 
-  if (item.type === 'function_call_output') {
-    return {
-      role: 'user',
-      content: [{ type: 'tool_result', tool_use_id: item.call_id, content: item.output }],
-    };
-  }
-
   // freeform 工具调用历史:`input` 是裸文本(非 JSON),按上送时的替身 schema 包回,
   // 使历史里的调用与本轮工具定义同形。非字符串 input 落 ''(镜像上面 function_call 对
   // arguments 的守卫):替身 schema 声明 `required:['input']`,漏进 undefined 会被
@@ -171,9 +166,10 @@ function convertInputItem(
     };
   }
 
-  // freeform 工具结果:output 实测是 content part 数组(function_call_output 是字符串),
-  // 用 partsText 归一成纯文本——直接塞数组会让下游拿到非法 tool_result content。
-  if (item.type === 'custom_tool_call_output') {
+  // 工具结果(function / freeform 同一分支):`output` 的两种 wire 形态见 types.ts
+  // `ResponsesToolOutputItem`;一律经 partsText 归一成纯文本——直接塞数组会让上游
+  // 拿到非法 tool_result content。
+  if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
     return {
       role: 'user',
       content: [
@@ -190,16 +186,38 @@ function convertInputItem(
 }
 
 /**
+ * 就地展开一层 `functions` namespace 容器(Codex 0.147+,踩坑「Codex code mode」)。
+ *
+ * 只认这一个名字:`functions` 是 OpenAI 工具协议的**默认命名空间**,实测其子工具仍按
+ * **裸名**回调(Codex 侧 `with_default_namespace()` 把「无 namespace」与 `"functions"`
+ * 归一,`functions.exec` 这种拼名反而不认),所以展开后名字、响应编码、历史 item 全都
+ * 不用动。**只能按名字白名单**:「是不是默认命名空间」在 wire 上没有字段可表达,不像
+ * 两套请求形态那样有结构可判。其余 namespace(collaboration 等)的子工具裸名与 `ns.名`
+ * 均被 Codex 拒绝(unsupported call),原样留给 convertTools 丢弃——不展开就没有死工具。
+ *
+ * ★ **一层、不递归**:真实 wire 恰好一层,而自嵌套的畸形请求走递归就等于开了一条
+ * 栈溢出→500 的通道。这里只摊平一遍,更深的 functions 容器原样落到 convertTools 按
+ * 未支持 type 丢弃。
+ */
+function expandDefaultNamespace(list: ResponsesTool[]): ResponsesTool[] {
+  return list.flatMap((t) => {
+    if (t?.type !== 'namespace' || t.name !== 'functions') return [t];
+    return Array.isArray(t.tools) ? t.tools : [];
+  });
+}
+
+/**
  * 汇总本次请求的工具来源:顶层 `tools`(标准形态)+ `input` 里所有
  * `additional_tools` item(code mode)。两者互斥出现,但按并集处理才不依赖模型名;
- * 同名以**先出现**者为准(顶层先扫,故顶层优先)。
+ * 同名以**先出现**者为准(顶层先扫,故顶层优先)。两处来源都先过
+ * `expandDefaultNamespace`,展开出的子工具与顶层工具共用同一套去重规则。
  */
 function collectTools(req: ResponsesRequest): ResponsesTool[] {
   const merged: ResponsesTool[] = [];
   const seen = new Set<string>();
   const take = (list: ResponsesTool[] | undefined): void => {
     if (!Array.isArray(list)) return;
-    for (const t of list) {
+    for (const t of expandDefaultNamespace(list)) {
       if (!t || typeof t !== 'object') continue;
       // 只按 name 去重:无名工具反正会被 convertTools 丢弃,不必为它们编 key。
       if (t.name) {
@@ -221,8 +239,8 @@ function collectTools(req: ResponsesRequest): ResponsesTool[] {
  * `custom_tool_call`)。
  *
  * 分派而非白名单:`function` 直转;`custom` 用替身 schema 包成 JSON 工具;
- * `namespace` **故意不展开**——实测 Codex 拒绝直调其子工具(`unsupported call: …`,
- * 无论用子工具名还是 `namespace.子工具名`),转发只会造出一批调不动的工具。
+ * `namespace` **不展开**(理由见 `expandDefaultNamespace`):`functions` 已在那里摊平,
+ * 落到这里的只剩其余 namespace 与畸形的第二层容器,一律按未支持 type 丢弃。
  */
 function convertTools(tools: ResponsesTool[]): { tools?: Tool[]; customToolNames: Set<string> } {
   const out: Tool[] = [];

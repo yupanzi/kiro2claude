@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { convertRequest } from '../../../src/claude/converter.js';
 import type { ContentBlock, Message } from '../../../src/claude/types.js';
 import { convertResponsesRequest } from '../../../src/openai/responses/converter.js';
-import type { ResponsesRequest } from '../../../src/openai/responses/types.js';
+import type { ResponsesRequest, ResponsesTool } from '../../../src/openai/responses/types.js';
 
 function base(overrides: Partial<ResponsesRequest> = {}): ResponsesRequest {
   return { model: 'gpt-5-codex', input: 'hi', ...overrides };
@@ -60,6 +60,30 @@ describe('convertResponsesRequest', () => {
     );
     const tr = blocks(toolMsg as Message).find((b) => b.type === 'tool_result');
     expect(tr).toMatchObject({ type: 'tool_result', tool_use_id: 'call_1', content: '20C' });
+  });
+
+  it('function_call_output 的 output 是 part 数组时归一成文本(0.147 code mode 实测形态)', () => {
+    const r = conv(
+      base({
+        input: [
+          { type: 'function_call', call_id: 'call_w', name: 'wait', arguments: '{}' },
+          {
+            type: 'function_call_output',
+            call_id: 'call_w',
+            output: [
+              { type: 'input_text', text: 'Script failed' },
+              { type: 'input_text', text: 'exec cell not found' },
+            ],
+          },
+        ],
+      }),
+    );
+    const toolMsg = r.messages.find(
+      (m) => m.role === 'user' && blocks(m).some((b) => b.type === 'tool_result'),
+    );
+    const tr = blocks(toolMsg as Message).find((b) => b.type === 'tool_result');
+    // 数组直塞会给上游非法 tool_result content;字符串形态(router 拒绝 / fallback)不受影响
+    expect(tr?.content).toBe('Script failed\nexec cell not found');
   });
 
   it('reasoning item 被忽略(GPT 加密不可复原)', () => {
@@ -166,7 +190,7 @@ describe('convertResponsesRequest — code mode', () => {
     expect(payload.tools?.[0]?.description).toContain('`input` string field');
   });
 
-  it('namespace / web_search 仍被忽略(Codex 拒绝直调 namespace 子工具)', () => {
+  it('非默认 namespace / web_search 仍被忽略(Codex 拒绝直调其子工具)', () => {
     const { payload } = convertResponsesRequest(
       base({
         model: 'gpt-5.6-sol',
@@ -187,6 +211,82 @@ describe('convertResponsesRequest — code mode', () => {
       }),
     );
     expect(payload.tools?.map((t) => t.name)).toEqual(['keep']);
+  });
+
+  it('functions namespace(默认命名空间)就地展开:custom 子工具照常登记(0.147+)', () => {
+    // 0.147.0 起 code mode 把 exec/wait 折进 functions 容器;实测子工具仍按裸名回调,
+    // 故只展开、不改名。漏展开的后果是零工具上送——模型永远拿不到工具。
+    const { payload, customToolNames } = convertResponsesRequest(
+      base({
+        model: 'gpt-5.6-sol',
+        input: [
+          {
+            type: 'additional_tools',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                description: '',
+                tools: [
+                  { type: 'custom', name: 'exec', description: 'Run JavaScript' },
+                  { type: 'function', name: 'wait', description: 'w', parameters: {} },
+                ],
+              },
+              {
+                type: 'namespace',
+                name: 'collaboration',
+                tools: [{ type: 'function', name: 'spawn_agent', parameters: {} }],
+              },
+            ],
+          },
+          { role: 'user', content: 'go' },
+        ],
+      }),
+    );
+    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait']);
+    expect(customToolNames).toEqual(new Set(['exec']));
+  });
+
+  it('functions namespace 只展开一层:内层容器按未支持 type 丢弃,不往下钻', () => {
+    // 只摊平一层:第 2 层容器原样落到 convertTools 按未支持 type 丢弃(为什么不递归 =
+    // 结构上堵死栈溢出通道,理由见 expandDefaultNamespace 头注释)。
+    const nested: ResponsesTool = {
+      type: 'namespace',
+      name: 'functions',
+      tools: [
+        {
+          type: 'namespace',
+          name: 'functions',
+          tools: [{ type: 'function', name: 'deep', parameters: {} }],
+        },
+      ],
+    };
+    const { payload } = convertResponsesRequest(
+      base({ input: [{ type: 'additional_tools', tools: [nested] }] }),
+    );
+    expect(payload.tools).toBeUndefined();
+  });
+
+  it('functions namespace 展开的子工具与顶层同名时,仍以先出现者(顶层)为准', () => {
+    const { payload } = convertResponsesRequest(
+      base({
+        tools: [{ type: 'function', name: 'dup', description: 'from-top', parameters: {} }],
+        input: [
+          {
+            type: 'additional_tools',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                tools: [{ type: 'function', name: 'dup', description: 'from-ns', parameters: {} }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(payload.tools?.map((t) => t.name)).toEqual(['dup']);
+    expect(payload.tools?.[0]?.description).toBe('from-top');
   });
 
   it('custom_tool_call → tool_use(裸文本包回 {input});custom_tool_call_output 数组 → tool_result 文本', () => {
@@ -224,7 +324,7 @@ describe('convertResponsesRequest — code mode', () => {
       (m) => m.role === 'user' && blocks(m).some((b) => b.type === 'tool_result'),
     );
     const tr = blocks(toolMsg as Message).find((b) => b.type === 'tool_result');
-    // output 是 part 数组(≠ function_call_output 的字符串),须归一成文本
+    // output 是 part 数组,须归一成文本(两种 output item 同形,共用同一条归一分支)
     expect(tr).toMatchObject({
       type: 'tool_result',
       tool_use_id: 'call_x',
@@ -285,7 +385,7 @@ describe('convertResponsesRequest — 真实 Codex code mode 抓包', () => {
     expect(fixture.instructions).toBeUndefined();
   });
 
-  it('4 个工具 → 上送 3 个(namespace 丢弃),freeform exec 被登记', () => {
+  it('4 个工具 → 上送 3 个(collaboration namespace 丢弃),freeform exec 被登记', () => {
     expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait', 'request_user_input']);
     expect(customToolNames).toEqual(new Set(['exec']));
   });
@@ -350,5 +450,51 @@ describe('convertResponsesRequest — 真实 Codex code mode 抓包', () => {
     expect(execDesc(undefined)).toMatch(/`input` string field\.$/);
     // 反向:cap 压到描述长度以下,说明确实会被切掉——证明这条断言真的在测截断
     expect(execDesc(REAL_FREEFORM_DESCRIPTION_LEN)).not.toMatch(/`input` string field\.$/);
+  });
+});
+
+// ============================================================================
+// 真实 wire fixture 之二:namespace 嵌套形态(抓包来源 Codex 0.147.0)。采集与脱敏方式
+// 同上一组,差异只有两处——function/custom 工具折进 `functions` 默认命名空间容器、
+// function_call_output 的 output 是 part 数组。上一组 fixture 不删:扁平形态仍需支持,
+// 判别只看结构、不看版本。
+// ============================================================================
+
+describe('convertResponsesRequest — 真实 Codex 0.147+ code mode 抓包(functions namespace)', () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL('../../fixtures/responses/codex-code-mode-namespaced-request.json', import.meta.url),
+      'utf8',
+    ),
+  ) as ResponsesRequest;
+  const { payload, customToolNames } = convertResponsesRequest(fixture);
+  const allBlocks = payload.messages.flatMap(blocks);
+
+  it('工具全嵌在 namespace 里:顶层无 tools,additional_tools 只有 namespace 条目', () => {
+    expect(fixture.tools).toBeUndefined();
+    const carrier = (fixture.input as { type?: string; tools?: { type: string }[] }[]).find(
+      (i) => i.type === 'additional_tools',
+    );
+    expect(carrier?.tools?.every((t) => t.type === 'namespace')).toBe(true);
+  });
+
+  it('functions namespace 展开、collaboration 丢弃,freeform exec 被登记', () => {
+    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait', 'request_user_input']);
+    expect(customToolNames).toEqual(new Set(['exec']));
+  });
+
+  it('custom_tool_call 往返照旧:裸名 exec,裸文本包回 {input}', () => {
+    const tu = allBlocks.find((b) => b.type === 'tool_use' && b.name === 'exec');
+    expect(tu?.input).toMatchObject({ input: expect.stringContaining('gateway-probe-ok') });
+  });
+
+  it('function_call_output 的 part 数组归一成 tool_result 文本', () => {
+    const trs = allBlocks.filter((b) => b.type === 'tool_result');
+    const waitResult = trs.find(
+      (b) => typeof b.content === 'string' && b.content.includes('Script error'),
+    );
+    expect(waitResult?.content).toBe(
+      'Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nexec cell nonexistent not found',
+    );
   });
 });

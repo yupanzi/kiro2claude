@@ -37,10 +37,20 @@ export interface ResponsesFunctionCallItem {
   arguments: string;
 }
 
-export interface ResponsesFunctionCallOutputItem {
-  type: 'function_call_output';
+/**
+ * 工具结果项的公共形状。★ `output` **两种形态并存**:code mode 下工具真实执行的结果是
+ * **content part 数组**,而 Codex router 拒绝调用(unsupported call)与 fallback 形态是
+ * **字符串**。两种 item 共用 converter.ts `convertInputItem` 的同一条归一路径(为什么
+ * 必须归一,见那里)。
+ */
+interface ResponsesToolOutputItem {
   call_id: string;
-  output: string;
+  output: string | ResponsesContentPart[];
+}
+
+/** function 工具的结果项。 */
+export interface ResponsesFunctionCallOutputItem extends ResponsesToolOutputItem {
+  type: 'function_call_output';
 }
 
 export interface ResponsesReasoningItem {
@@ -74,15 +84,9 @@ export interface ResponsesCustomToolCallItem {
   status?: string;
 }
 
-/**
- * freeform 工具的结果项。★ `output` 实测是 **content part 数组**
- * (`[{type:"input_text",text}]`),而 `function_call_output.output` 是**字符串**——
- * 两者不可互套,归一复用 converter 的 `partsText`。
- */
-export interface ResponsesCustomToolCallOutputItem {
+/** freeform(`type:"custom"`)工具的结果项,形态与 function 侧一致。 */
+export interface ResponsesCustomToolCallOutputItem extends ResponsesToolOutputItem {
   type: 'custom_tool_call_output';
-  call_id: string;
-  output: string | ResponsesContentPart[];
 }
 
 export type ResponsesInputItem =
@@ -99,6 +103,11 @@ export type ResponsesInputItem =
  *
  * `type` 实测有四种:`function`(标准)、`custom`(freeform,带 `format` 语法约束、
  * **无** `parameters`)、`namespace`(容器,子工具在 `tools`)、`web_search`(hosted)。
+ *
+ * ★ 新版 Codex 的 code mode 会把 function/custom 工具再折进一层名为 **`functions`** 的
+ * namespace 容器(`{type:'namespace',name:'functions',tools:[…]}`),子工具形状不变。
+ * 两套形态都要接得住;展不展开、为什么只展开这一个,见 converter.ts
+ * `expandDefaultNamespace`(唯一真相源)。
  */
 export interface ResponsesTool {
   type: string;
@@ -108,7 +117,7 @@ export interface ResponsesTool {
   strict?: boolean;
   /** freeform 工具的语法约束(实测 `{type:'grammar',syntax:'lark',definition}`)。上游无对应通道,丢弃。 */
   format?: { type?: string; syntax?: string; definition?: string };
-  /** `type:'namespace'` 的子工具。实测 Codex 拒绝直调,不展开(见 convertTools)。 */
+  /** `type:'namespace'` 的子工具。展开规则见 converter.ts `expandDefaultNamespace`。 */
   tools?: ResponsesTool[];
 }
 
