@@ -1,3 +1,10 @@
+## [1.5.3](https://github.com/yupanzi/kiro2claude/compare/v1.5.2...v1.5.3) (2026-08-20)
+
+
+### Bug Fixes
+
+* **openai:** 展开 Codex 默认 namespace 工具,归一工具结果 output ([b0c5972](https://github.com/yupanzi/kiro2claude/commit/b0c5972be53d160f38000261cc01550d858f0468))
+
 ## [1.5.2](https://github.com/yupanzi/kiro2claude/compare/v1.5.1...v1.5.2) (2026-08-17)
 
 
