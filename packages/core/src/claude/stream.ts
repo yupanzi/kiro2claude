@@ -514,6 +514,15 @@ export class SseStateManager {
     this.stopReason = reason;
   }
 
+  /**
+   * 只在**尚未显式定过**时落值——不覆盖 `model_context_window_exceeded` 这类更具体
+   * 的既有终态（`getStopReason()` 的 tool_use/end_turn 兜底不算「定过」）。
+   * 「别覆盖」的判断留在这里，调用方拿不到 `stopReason` 也就写不错顺序。
+   */
+  setStopReasonIfUnset(reason: string): void {
+    if (this.stopReason === undefined) this.stopReason = reason;
+  }
+
   /** Check if there are non-thinking content blocks */
   hasNonThinkingBlocks(): boolean {
     for (const block of this.activeBlocks.values()) {
@@ -688,6 +697,24 @@ export class StreamContext {
    * (isComplete=false) never sets this → still treated as empty and retried.
    */
   sawCompletedToolUse: boolean;
+  /**
+   * 已宣告但尚未收到 `isComplete` 的 tool_use block(按 block index)。终结段据此
+   * 落 `max_tokens`(见 `generateFinalEvents`)。
+   *
+   * 与 `sawCompletedToolUse` 必须分开:那个是「**有没有**任何调用完成」的全局布尔,
+   * 这里问「**这一个**收完没有」。一次响应里 A 完成、B 被截断是常见形态,全局布尔
+   * 为真,而残缺的 B 仍会毒到客户端。
+   */
+  private readonly incompleteToolBlocks = new Set<number>();
+  /**
+   * **网关自己**掐断了上游:客户端断连后主动 abort(`ABORT_UPSTREAM_ON_DISCONNECT`),
+   * 或 post-disconnect drain grace 到期我们 destroy 了 socket。两者都会让正在传输的
+   * tool_use 停在「无 isComplete」上——那是那行代码的必然结果,不是上游故障。
+   *
+   * 终结段据此把截断日志改成自伤归因(同「网关自己造成的结果不记 error」那条规范)。
+   * 不改 stop_reason:`max_tokens` 对残缺调用依然是正确终态,只是没人在读了。
+   */
+  gatewayTruncatedUpstream = false;
   toolBlockIndices: Map<string, number>;
   toolNameMap: Map<string, string>;
   thinkingEnabled: boolean;
@@ -1255,6 +1282,27 @@ export class StreamContext {
     return events;
   }
 
+  /**
+   * 「上游到目前为止产出过真实内容吗?」——**唯一定义点**。驱动 commit 触发、
+   * silent-failure 判空(它的否定)、截断 tool_use 的终态收窄。三种非空:
+   *   - `outputTokens > 0`     — text 或 tool-input 字节到达过
+   *   - `thinkingExtracted`    — 纯 reasoning 流(0 output token)不算静默
+   *   - `sawCompletedToolUse`  — **完整**的 tool_use,哪怕 input 为空(无必填参数的
+   *                              工具模型会用 `{}` 调)。非流式会把它 surface 成
+   *                              tool_use,流式不一致就让同一个请求分叉成
+   *                              「流式 503 vs 非流式 200」(2026-07)。
+   *
+   * ★ 截断的 tool 帧三项都不置位 → 算空 → 按瞬时静默流重试。**仅对「空壳帧」成立**:
+   * 已发过 input 分片的,分片长度计入 `outputTokens`,此处为真——两种截断形态由此
+   * 分开,见 `incompleteToolBlocks`。
+   *
+   * ⚠ 两个 transport 曾各自内联一份。**别再拷回去**:判空与 commit 是同一个谓词的
+   * 两面,多一处拼法就多一条静默分叉的通道。
+   */
+  hasContent(): boolean {
+    return this.outputTokens > 0 || this.thinkingExtracted || this.sawCompletedToolUse;
+  }
+
   /** Emit a tool block without touching legacy/native or rescue boundaries. */
   private emitToolUseBlock(toolUse: Extract<Event, { kind: 'ToolUse' }>): SseEvent[] {
     const events: SseEvent[] = [];
@@ -1306,8 +1354,12 @@ export class StreamContext {
     // pushes the tool_use on isComplete regardless of input.
     if (toolUse.isComplete) {
       this.sawCompletedToolUse = true;
+      this.incompleteToolBlocks.delete(blockIndex);
       const stopEvent = this.stateManager.handleContentBlockStop(blockIndex);
       if (stopEvent) events.push(stopEvent);
+    } else {
+      // 上游按帧递增 input,同一 block 会多次进这里;流结束时仍在集合里的 = 被截断。
+      this.incompleteToolBlocks.add(blockIndex);
     }
 
     return events;
@@ -1336,6 +1388,44 @@ export class StreamContext {
     //（真实泄漏几乎总是终止在流尾），非泄漏候选与结构悬空的截断块都按文本
     // 原样吐回（永不丢弃，见 tool-call-text.ts 文件头）。
     events.push(...this.settleTextPhases('finish'));
+
+    // ★ 截断的 tool_use 绝不能谎报成 `tool_use`(踩坑「截断 tool_use 谎报终态」)。
+    //
+    // 上游偶发「宣告 tool_use、发了几段 input 分片、却从未发 isComplete」就断流。
+    // 若此前已产出可见文本,流不判空 → 走正常终结段 → `closeOpenBlocks()` 补
+    // content_block_stop、stop_reason 兜底成 `tool_use`,客户端拿到「看似完整、实则
+    // JSON 残缺」的调用,解析必然失败(Claude Code 报 `InputValidationError: JSON
+    // parse failed`,用户侧表现为「首次调用某工具参数错误、重试就好」)。
+    //
+    // 被砍断的输出语义上就是 `max_tokens`,客户端见到它会走截断处理而非按完整调用
+    // 解析。与 mid-stream Exception 同一条红线:绝不静默截断成看似完整的 message_stop。
+    // 只改终态、不删已发出的 block —— start 与 delta 早已在线上,撤不回。
+    //
+    // ★ `hasContent()` 是**必要**守卫,不是保险:上游只发「有名字、零 input」的 tool
+    // 帧时三项都不置位 → hasContent() 为假 → stream-handler 靠 `stop_reason ===
+    // 'tool_use'` 认出它、单次定案不耗重试预算(踩坑「空流有界重试」)。此处一并改成
+    // max_tokens,那批请求就会重新开始烧预算。有 input 分片的截断才走这里。
+    if (this.incompleteToolBlocks.size > 0 && this.hasContent()) {
+      this.stateManager.setStopReasonIfUnset('max_tokens');
+      // ★ 归因必须分开:是**我们**掐断的上游时,这条不能算上游故障。运维拿
+      // `upstream truncated tool_use` 当「客户端报工具参数错误」的第一排查点
+      // (CLAUDE.md 速查表),自伤事件混进同一个 msg 会让那条 runbook 每次断连
+      // 都误报一次。故换 msg + 降级到 info,保留 self_inflicted 字段便于统计。
+      const fields = {
+        incomplete_tool_blocks: this.incompleteToolBlocks.size,
+        tool_names: [...this.seenToolUseNames],
+        saw_completed_tool_use: this.sawCompletedToolUse,
+        self_inflicted: this.gatewayTruncatedUpstream,
+      };
+      if (this.gatewayTruncatedUpstream) {
+        getLogger().info({
+          msg: 'tool_use truncated by gateway-initiated upstream cancel (client already gone)',
+          ...fields,
+        });
+      } else {
+        getLogger().warn({ msg: 'upstream truncated tool_use (no isComplete frame)', ...fields });
+      }
+    }
 
     // If only thinking was produced (no text, no tool_use),
     // set stop_reason to max_tokens and emit a placeholder text block.

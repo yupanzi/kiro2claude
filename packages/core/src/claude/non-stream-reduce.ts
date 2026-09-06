@@ -104,6 +104,14 @@ export function reduceKiroResponse(
   };
   const toolUses: Record<string, unknown>[] = [];
   let hasToolUse = false;
+  /**
+   * 已宣告但从未收到 `isComplete` 的 tool_use id —— 流式 `incompleteToolBlocks` 的
+   * 非流式拼写(红线:语法同源还不够,**终态判定也必须同源**)。
+   *
+   * 这边残缺调用会被直接丢弃(只在 isComplete 时 push),不会吐出残缺 JSON;但
+   * `hasToolUse` 在**宣告时**就置位,不修正则终态是 `tool_use` 却一个 block 都没有。
+   */
+  const incompleteToolIds = new Set<string>();
   let stopReason = 'end_turn';
   let contextInputTokens: number | undefined;
   let kiroMetering: KiroMeteringData | undefined;
@@ -114,6 +122,12 @@ export function reduceKiroResponse(
 
   // Collect tool call incremental JSON
   const toolJsonBuffers = new Map<string, string>();
+  /**
+   * 上游发过 tool-input 字节吗(含最终被截断的那些)。流式把这些字节计进
+   * `outputTokens`,于是 `StreamContext.hasContent()` 为真;非流式没有 token 计数,
+   * 用这个布尔补齐同一个谓词的对应项(见下面的 `hasContent`)。
+   */
+  let sawToolInputBytes = false;
   const eventCounts = new Map<string, number>();
   // 上游宣告过的 tool_use 名字(含没吐完参数的空壳帧)——空流诊断线索
   const announcedToolNames = new Set<string>();
@@ -172,6 +186,11 @@ export function reduceKiroResponse(
         let buffer = toolJsonBuffers.get(event.toolUseId) ?? '';
         buffer += event.input;
         toolJsonBuffers.set(event.toolUseId, buffer);
+        if (event.input) sawToolInputBytes = true;
+
+        // 上游按帧递增 input,同一 id 会多次进这里;归约结束时仍在集合里的 = 被截断。
+        if (event.isComplete) incompleteToolIds.delete(event.toolUseId);
+        else incompleteToolIds.add(event.toolUseId);
 
         // If complete tool call, add to list
         if (event.isComplete) {
@@ -316,8 +335,45 @@ export function reduceKiroResponse(
   // 再回 503，而流式回 200 + max_tokens。语法已经由 LegacyThinkingDecoder 统一，
   // 终态判定也必须同源。
   const hasSurfaceableThinking = !!(reasoningText || reasoningSignature || sawLegacyThinking);
+  /**
+   * `StreamContext.hasContent()` 的非流式拼写,三项一一对应(那边是唯一定义点,
+   * 这里只是同一个谓词在「没有 token 计数」的路径上的等价写法):
+   *   - `outputTokens > 0`    ↔ `textContent !== '' || sawToolInputBytes`
+   *   - `thinkingExtracted`   ↔ `hasSurfaceableThinking`
+   *   - `sawCompletedToolUse` ↔ `toolUses.length > 0`
+   * 截断终态**必须**用它收窄:少任何一项,同一份上游字节就会在流式/非流式分叉。
+   */
+  const hasContent =
+    textContent !== '' || sawToolInputBytes || hasSurfaceableThinking || toolUses.length > 0;
   if (stopReason === 'end_turn') {
-    if (hasToolUse) {
+    // ★ 截断的 tool_use 不能谎报 `tool_use`(与流式 `generateFinalEvents` 同源)。
+    // 残缺调用在上面已被丢弃,报 tool_use 会让客户端等一个不存在的工具调用。
+    // ⚠ `hasContent` 是必要守卫、且必须是**完整**的那一份:只发过「有名字、零 input」
+    // 空壳帧的纯截断三项皆假 → 留在判空路径(与流式「空壳帧 = 确定性空流」同源);
+    // 但凡有过文本 / input 分片 / thinking / 已完成调用,都要走这里。曾经这里只写
+    // `toolUses.length > 0`,于是「先说一段话再宣告工具然后断流」落进下面的
+    // `else if (hasToolUse)` → 终态 `tool_use` 却一个 block 都没有(OpenAI 侧更糟:
+    // `finish_reason:"tool_calls"` 而无 `tool_calls` 字段),而流式对同一份字节报
+    // `max_tokens`。
+    if (incompleteToolIds.size > 0 && hasContent) {
+      stopReason = 'max_tokens';
+      // 残缺调用已被丢弃 → 「只发过 input 分片、没有文本」的形态会产出 `content: []`。
+      // 与下面 thinking-only 分支同一处理:补一个无害占位符,别给客户端空 content。
+      const producesBlock = !!(
+        textContent ||
+        reasoningText ||
+        reasoningSignature ||
+        thinkingText ||
+        toolUses.length
+      );
+      if (!producesBlock) textContent = ' ';
+      log.warn({
+        msg: 'upstream truncated tool_use (no isComplete frame)',
+        incomplete_tool_calls: incompleteToolIds.size,
+        completed_tool_calls: toolUses.length,
+        tool_names: [...announcedToolNames],
+      });
+    } else if (hasToolUse) {
       stopReason = 'tool_use';
     } else if (thinkingEnabled && hasSurfaceableThinking && textContent === '') {
       stopReason = 'max_tokens';

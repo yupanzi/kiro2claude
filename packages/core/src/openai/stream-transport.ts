@@ -97,6 +97,9 @@ export async function runOpenAiStream<E extends StreamEncoder>(
         msg: 'openai sse upstream drain grace expired after disconnect — destroying socket',
       });
       graceDestroyed = true;
+      // 见 claude/stream-handler.ts 同处:自伤归因,别把我们 destroy socket 造成的
+      // 半截 tool_use 记成上游截断(StreamContext.gatewayTruncatedUpstream)。
+      ctx.gatewayTruncatedUpstream = true;
       try {
         upstreamData?.destroy?.();
       } catch {
@@ -135,8 +138,9 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   let buffered: string[] = [];
   let streamStart = apiStart;
 
-  const hasContent = (): boolean =>
-    ctx.outputTokens > 0 || ctx.thinkingExtracted || ctx.sawCompletedToolUse;
+  // 本地别名,与 claude/stream-handler.ts 同源。判据本体是 `StreamContext.hasContent()`
+  //(唯一定义点,见其头注释)——别把实现内联回来。
+  const hasContent = (): boolean => ctx.hasContent();
 
   const commit = (): void => {
     if (committed || aborted.value) return;

@@ -173,6 +173,9 @@ export async function handleStreamRequest(
     drainGraceTimer = setTimeout(() => {
       log.warn({ msg: 'sse upstream drain grace expired after disconnect — destroying socket' });
       graceDestroyed = true;
+      // 自伤归因:socket 是我们 destroy 的,正在传的 tool_use 停在「无 isComplete」
+      // 是必然结果,别记成上游截断(见 StreamContext.gatewayTruncatedUpstream)。
+      ctx.gatewayTruncatedUpstream = true;
       try {
         upstreamData?.destroy?.();
       } catch {
@@ -195,6 +198,8 @@ export async function handleStreamRequest(
       // 计费(实测断连即止,省下断连点之后的 credit)。代价:拿不到尾帧 Metering,
       // per-request 计费记账偏低。见 Config.abortUpstreamOnDisconnect。
       upstreamAbort.abort();
+      // 同上:abort 掐在 tool_use 中间是这行代码的必然结果,不是上游故障。
+      ctx.gatewayTruncatedUpstream = true;
     } else {
       // 默认:bound the remaining upstream drain instead of holding the socket
       // open until the 720s axios timeout —— drain 到 EOF 拿 Metering 如实计费。
@@ -228,22 +233,9 @@ export async function handleStreamRequest(
   let buffered: SseEvent[] = [];
   let streamStart = apiStart;
 
-  // "Has the upstream emitted any real content yet?" Drives both the commit
-  // trigger (flush on the first content frame) and the silent-failure check (a
-  // fully empty stream is its negation). One definition so the two can't drift.
-  // Three ways to be non-empty:
-  //   - outputTokens > 0     — text or tool-input bytes arrived
-  //   - thinkingExtracted    — a reasoning-only stream (0 output tokens) is not silent
-  //   - sawCompletedToolUse  — a COMPLETE tool_use, even with empty input (a
-  //                            no-required-args tool like browser_snapshot the
-  //                            model calls with `{}`). The non-stream path
-  //                            surfaces such a call as a tool_use, so the stream
-  //                            path must too — else the SAME request diverges into
-  //                            "stream 503 vs non-stream 200" (2026-07).
-  // A *truncated* tool frame (isComplete=false) sets none of these → still empty,
-  // retried like any transient silent stream.
-  const hasContent = (): boolean =>
-    ctx.outputTokens > 0 || ctx.thinkingExtracted || ctx.sawCompletedToolUse;
+  // 本地别名。判据本体是 `StreamContext.hasContent()`(唯一定义点,理由见其头注释)
+  // —— 两个 transport 曾各自内联一份逐字相同的实现,别再拷回来。
+  const hasContent = (): boolean => ctx.hasContent();
 
   // Commit: write headers, flush the buffered events, start the ping keep-alive.
   // Idempotent and a no-op once the client is gone. Before commit nothing
