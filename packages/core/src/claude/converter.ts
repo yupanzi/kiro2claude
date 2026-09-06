@@ -16,6 +16,7 @@ import type {
   UserInputMessageContext,
 } from '../kiro/model/requests/conversation.js';
 import {
+  attachToolUses,
   createAssistantMessage,
   createKiroImage,
   createUserInputMessage,
@@ -975,9 +976,7 @@ function convertAssistantMessage(
   }
 
   const assistant = createAssistantMessage(finalContent);
-  if (toolUses.length > 0) {
-    assistant.toolUses = toolUses;
-  }
+  attachToolUses(assistant, toolUses);
 
   return {
     kind: 'assistant',
@@ -1015,9 +1014,7 @@ function mergeAssistantMessages(
   const content = contentParts.length === 0 ? ' ' : contentParts.join('\n\n');
 
   const assistant = createAssistantMessage(content);
-  if (allToolUses.length > 0) {
-    assistant.toolUses = allToolUses;
-  }
+  attachToolUses(assistant, allToolUses);
 
   return {
     kind: 'assistant',
