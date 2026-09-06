@@ -427,12 +427,14 @@ export async function handleStreamRequest(
     // re-issuing. (Mirrors the non-stream silentFailure exclusions; without
     // this a deterministic empty would burn `emptyStreamRetries` extra calls.)
     const attemptStop = ctx.stateManager.getStopReason();
-    // 判空 + stop_reason==='tool_use' 等价于「上游宣告了 tool_use 却从未发出完整帧
-    // (isComplete=false)」= 截断 tool 帧。这是**内容绑定的确定性**失败:重发同一
-    // 请求,上游同样地再次截断(实测恢复率 0,每次重试白烧 credit)。与 max_tokens
-    // 同理,确定性终止不消耗重试预算。`!hasContent()` 是必要守卫 —— 有内容时同一
-    // stop_reason 是正常的工具调用,不能落进这个分支。
-    const truncatedToolUse = !hasContent() && attemptStop === 'tool_use';
+    // 「上游宣告了 tool_use 却从未发出完整帧(isComplete=false)」= 截断 tool 帧。这是
+    // **内容绑定的确定性**失败:重发同一请求,上游同样地再次截断(实测恢复率 0,每次
+    // 重试白烧 credit)。与 max_tokens 同理,确定性终止不消耗重试预算。`!hasContent()`
+    // 是必要守卫 —— 有内容的截断由终结段改判 max_tokens(那是另一种形态),不判空。
+    //
+    // 问 ctx 的事实、不问 `attemptStop === 'tool_use'`:后者只是空壳截断时终态恰好
+    // 兜底成 tool_use 的巧合,会把这里与 `generateFinalEvents` 的终态选择隐式绑死。
+    const truncatedToolUse = !hasContent() && ctx.hasIncompleteToolUse();
     // 上游显式 Error/Exception 帧。原先**一律**视为确定性终止、不重试,理由是「重试
     // 白烧 credit」—— 但那个理由只在上游**已经开工**时成立。实测另有一类:上游 1ms
     // 内零帧拒绝(event_counts 只有 `Exception:1`),没有任何 credit 可烧,重发几乎必然

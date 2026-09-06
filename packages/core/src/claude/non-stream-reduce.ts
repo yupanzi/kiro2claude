@@ -22,7 +22,12 @@ import {
   LegacyThinkingDecoder,
   type LegacyThinkingDecoderItem,
 } from './stream/legacy-thinking-decoder.js';
-import { assertNever, classifyUpstreamErrorEvent, type PendingUpstreamError } from './stream.js';
+import {
+  assertNever,
+  classifyUpstreamErrorEvent,
+  computeHasContent,
+  type PendingUpstreamError,
+} from './stream.js';
 import { extractToolCallsFromCompleteText, type ToolTextRegistry } from './tool-call-text.js';
 
 /** 一次上游响应归约后的完整结果。 */
@@ -335,16 +340,14 @@ export function reduceKiroResponse(
   // 再回 503，而流式回 200 + max_tokens。语法已经由 LegacyThinkingDecoder 统一，
   // 终态判定也必须同源。
   const hasSurfaceableThinking = !!(reasoningText || reasoningSignature || sawLegacyThinking);
-  /**
-   * `StreamContext.hasContent()` 的非流式拼写,三项一一对应(那边是唯一定义点,
-   * 这里只是同一个谓词在「没有 token 计数」的路径上的等价写法):
-   *   - `outputTokens > 0`    ↔ `textContent !== '' || sawToolInputBytes`
-   *   - `thinkingExtracted`   ↔ `hasSurfaceableThinking`
-   *   - `sawCompletedToolUse` ↔ `toolUses.length > 0`
-   * 截断终态**必须**用它收窄:少任何一项,同一份上游字节就会在流式/非流式分叉。
-   */
-  const hasContent =
-    textContent !== '' || sawToolInputBytes || hasSurfaceableThinking || toolUses.length > 0;
+  // 与流式同一个谓词(`computeHasContent`,定义在 stream.ts):这里只填「没有 token
+  // 计数」这条路径上的观测值。分项少一个就会让同一份上游字节在两条路径上分叉,故
+  // 分项集合是 `ContentPresence` 这个类型而非注释里的约定——加项时这里编译不过。
+  const hasContent = computeHasContent({
+    sawOutputBytes: textContent !== '' || sawToolInputBytes,
+    thinkingExtracted: hasSurfaceableThinking,
+    sawCompletedToolUse: toolUses.length > 0,
+  });
   if (stopReason === 'end_turn') {
     // ★ 截断的 tool_use 不能谎报 `tool_use`(与流式 `generateFinalEvents` 同源)。
     // 残缺调用在上面已被丢弃,报 tool_use 会让客户端等一个不存在的工具调用。

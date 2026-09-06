@@ -244,6 +244,38 @@ export function sawBillableWork(eventCounts: Record<string, number>): boolean {
 }
 
 /**
+ * 「上游产出过真实内容吗」的**分项集合**。流式与非流式各自只提供这三项的观测值,
+ * 谓词本身由 `computeHasContent` 独占——分项集合因此是类型,不是约定:加一项两边
+ * 的调用点都会编译不过,而不是等哪次线上分叉才发现有一侧忘了跟。
+ */
+export interface ContentPresence {
+  /** text 或 tool-input 字节到达过。流式看 `outputTokens`,非流式没有 token 计数,
+   * 用「文本非空 or 收到过 tool-input 分片」作等价项。 */
+  sawOutputBytes: boolean;
+  /** thinking 阶段开过(legacy 或可 surface 的原生帧)。纯 reasoning 流不算静默。 */
+  thinkingExtracted: boolean;
+  /** **完整**的 tool_use,哪怕 input 为空(无必填参数的工具模型会用 `{}` 调)。 */
+  sawCompletedToolUse: boolean;
+}
+
+/**
+ * 「上游到目前为止产出过真实内容吗?」——**唯一定义点**,流式与非流式共用。驱动
+ * commit 触发、silent-failure 判空(它的否定)、截断 tool_use 的终态收窄。
+ *
+ * ★ 截断的 tool 帧三项都不置位 → 算空 → 按瞬时静默流重试。**仅对「空壳帧」成立**:
+ * 已发过 input 分片的,分片长度计入产出侧 → 此处为真,两种截断形态由此分开
+ * (踩坑「截断 tool_use 谎报终态」)。
+ *
+ * ⚠ 两个 transport 与非流式 reducer 曾各自内联一份。**别再拷回去**:判空、commit
+ * 与终态是同一个谓词的三面,多一处拼法就多一条静默分叉的通道——流式/非流式对同一
+ * 份上游字节给出不同 status 的事故,这个仓库已经出过两次(2026-07 空 tool_use、
+ * 2026-08 空 thinking 块)。
+ */
+export function computeHasContent(p: ContentPresence): boolean {
+  return p.sawOutputBytes || p.thinkingExtracted || p.sawCompletedToolUse;
+}
+
+/**
  * 上游**已扣费、网关却记不了账**——即「开过工」但尾帧 Metering 没到。credit 只在
  * 流末尾那一帧里,拿不到就等于这笔消费上游算了、这边算不了:消费方(plugin-metering)
  * 因 `kiro.creditsUsed == null` 整笔跳过,累计用量于是系统性偏低且无人察觉。主因是
@@ -1282,25 +1314,26 @@ export class StreamContext {
     return events;
   }
 
-  /**
-   * 「上游到目前为止产出过真实内容吗?」——**唯一定义点**。驱动 commit 触发、
-   * silent-failure 判空(它的否定)、截断 tool_use 的终态收窄。三种非空:
-   *   - `outputTokens > 0`     — text 或 tool-input 字节到达过
-   *   - `thinkingExtracted`    — 纯 reasoning 流(0 output token)不算静默
-   *   - `sawCompletedToolUse`  — **完整**的 tool_use,哪怕 input 为空(无必填参数的
-   *                              工具模型会用 `{}` 调)。非流式会把它 surface 成
-   *                              tool_use,流式不一致就让同一个请求分叉成
-   *                              「流式 503 vs 非流式 200」(2026-07)。
-   *
-   * ★ 截断的 tool 帧三项都不置位 → 算空 → 按瞬时静默流重试。**仅对「空壳帧」成立**:
-   * 已发过 input 分片的,分片长度计入 `outputTokens`,此处为真——两种截断形态由此
-   * 分开,见 `incompleteToolBlocks`。
-   *
-   * ⚠ 两个 transport 曾各自内联一份。**别再拷回去**:判空与 commit 是同一个谓词的
-   * 两面,多一处拼法就多一条静默分叉的通道。
-   */
+  /** 流式侧的 `computeHasContent`(谓词与分项集合的定义在那边,这里只填观测值)。 */
   hasContent(): boolean {
-    return this.outputTokens > 0 || this.thinkingExtracted || this.sawCompletedToolUse;
+    return computeHasContent({
+      sawOutputBytes: this.outputTokens > 0,
+      thinkingExtracted: this.thinkingExtracted,
+      sawCompletedToolUse: this.sawCompletedToolUse,
+    });
+  }
+
+  /**
+   * 有没有「宣告了却从未收到 `isComplete`」的 tool_use。**上游截断这件事的直接事实**,
+   * 给 stream-handler 判定确定性空流用。
+   *
+   * 它曾被 `stop_reason === 'tool_use'` 代替:空壳截断时终态恰好兜底成 `tool_use`,
+   * 于是两个模块被一条字符串巧合绑住——`generateFinalEvents` 一旦把这类终态改掉,
+   * handler 那边就静默失去识别能力、那批请求重新开始烧重试预算,而两处代码谁也看不出
+   * 依赖关系。问事实,别问终态。
+   */
+  hasIncompleteToolUse(): boolean {
+    return this.incompleteToolBlocks.size > 0;
   }
 
   /** Emit a tool block without touching legacy/native or rescue boundaries. */
@@ -1402,10 +1435,11 @@ export class StreamContext {
     // 只改终态、不删已发出的 block —— start 与 delta 早已在线上,撤不回。
     //
     // ★ `hasContent()` 是**必要**守卫,不是保险:上游只发「有名字、零 input」的 tool
-    // 帧时三项都不置位 → hasContent() 为假 → stream-handler 靠 `stop_reason ===
-    // 'tool_use'` 认出它、单次定案不耗重试预算(踩坑「空流有界重试」)。此处一并改成
-    // max_tokens,那批请求就会重新开始烧预算。有 input 分片的截断才走这里。
-    if (this.incompleteToolBlocks.size > 0 && this.hasContent()) {
+    // 帧时三项都不置位 → hasContent() 为假 → 那是确定性空流,由 stream-handler 单次
+    // 定案、不耗重试预算(踩坑「空流有界重试」)。它问的是 `hasIncompleteToolUse()`
+    // 这个事实,不再依赖此处把终态留在 `tool_use`;但两种截断形态的**分工**不变:
+    // 有 input 分片的才走这里改 max_tokens。
+    if (this.hasIncompleteToolUse() && this.hasContent()) {
       this.stateManager.setStopReasonIfUnset('max_tokens');
       // ★ 归因必须分开:是**我们**掐断的上游时,这条不能算上游故障。运维拿
       // `upstream truncated tool_use` 当「客户端报工具参数错误」的第一排查点
