@@ -353,11 +353,16 @@ function redactUrl(p) {
   return p.replace(/profileArn=[^&]+/g, 'profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A000000000000%3Aprofile%2FREDACTED');
 }
 
+// 重试三件套：值随 attempt 变，抓包时点不同就抓到不同的值，进 fixture 只会制造无谓
+// 的 diff churn 并诱人「照 fixture 改代码」。owner 与格式证据在 `applyRetryHeaders`
+// （packages/core/src/kiro/retry-executor.ts）——加成员时两处同改。
+const RETRY_HEADERS = new Set(['amz-sdk-invocation-id', 'amz-sdk-request', 'x-kiro-attempt']);
+
 function redactHeaders(h) {
   const out = {};
   for (const [k, v] of Object.entries(h)) {
     if (k === 'authorization' || k === 'host' || k === 'content-length') continue;
-    if (k === 'amz-sdk-invocation-id' || k === 'amz-sdk-request') continue;
+    if (RETRY_HEADERS.has(k)) continue;
     if (k === 'x-amzn-codewhisperer-optout') {
       // 项目隐私硬约束：始终 opt-out，绝不让对话数据被上游用于训练 / 服务改进。
       // 无论抓包机的 `kiro-cli settings telemetry.enabled` 是什么，一律归一化为 'true'。

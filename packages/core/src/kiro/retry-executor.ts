@@ -55,6 +55,7 @@
  */
 
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import { v4 as uuidv4 } from 'uuid';
 
 import { getLogger } from '../shared/logger.js';
 import type { KiroCredentials } from './model/credentials.js';
@@ -89,6 +90,46 @@ export interface RetryableRequest {
   buildHost(credentials: KiroCredentials): string;
 }
 
+/**
+ * kiro-cli 声明的最大 attempt 数。2.21.1 实测两条头都写 `max=3`,形态是 3 轮外层
+ * × 3 次内层:**外层**换新 invocation-id、attempt 归 1,内层共用同一个 id 递增。
+ * 网关这边空流重试(`stream-handler.ts`)每次重走 `execute()` = 外层;`execute()`
+ * 内部的 401 force-refresh = 内层。
+ */
+const KIRO_MAX_ATTEMPTS = 3;
+
+/** attempt 的截止时刻偏移(实测 = 发出时刻 + 1h),让服务端判断重试是否还值得处理。 */
+const SDK_TTL_MS = 3_600_000;
+
+/** `YYYYMMDDTHHMMSSZ`(ISO8601 basic,UTC):从 `toISOString()` 去掉 `-` `:` 与毫秒。 */
+const ISO_BASIC_STRIP = /[-:]|\.\d{3}/g;
+
+/**
+ * 注入 kiro-cli 的重试三件套。**唯一 owner**——别搬回 `provider.ts` 的 `buildHeaders`:
+ * 那里每次调用生成新 uuid,上游看到的每次重试都成了「attempt=1 的全新请求」。
+ *
+ * 2.21.1 实测形态(`scripts/capture-kiro-cli.sh` 抓包):
+ * ```
+ * amz-sdk-invocation-id: <uuid>                      # 同一逻辑调用的所有 attempt 共用
+ * amz-sdk-request:       attempt=1; max=3            # 首次
+ * amz-sdk-request:       ttl=20260906T054900Z; attempt=2; max=3   # 第 2 次起多出 ttl
+ * x-kiro-attempt:        2;max=3                     # 2.21.1 新增的 Kiro 自定义头
+ * ```
+ */
+function applyRetryHeaders(
+  headers: Record<string, string>,
+  invocationId: string,
+  attempt: number,
+): void {
+  headers['amz-sdk-invocation-id'] = invocationId;
+  const ttl =
+    attempt > 1
+      ? `ttl=${new Date(Date.now() + SDK_TTL_MS).toISOString().replace(ISO_BASIC_STRIP, '')}; `
+      : '';
+  headers['amz-sdk-request'] = `${ttl}attempt=${attempt}; max=${KIRO_MAX_ATTEMPTS}`;
+  headers['x-kiro-attempt'] = `${attempt};max=${KIRO_MAX_ATTEMPTS}`;
+}
+
 export class RetryExecutor {
   private tokenManager: SingleTokenManager;
   private client: AxiosInstance;
@@ -113,6 +154,9 @@ export class RetryExecutor {
   async execute(req: RetryableRequest): Promise<AxiosResponse> {
     const log = getLogger();
     let forceRefreshed = false;
+    // 一次 execute() = 上游眼中的一次逻辑调用:共用 invocation-id、attempt 递增。
+    const invocationId = uuidv4();
+    let attempt = 0;
 
     while (true) {
       const ctx = await this.tokenManager.acquireContext();
@@ -120,6 +164,7 @@ export class RetryExecutor {
       const url = req.buildUrl(ctx.credentials);
       const host = req.buildHost(ctx.credentials);
       const headers = req.buildHeaders(ctx.credentials, ctx.token, host);
+      applyRetryHeaders(headers, invocationId, ++attempt);
       const body = req.transformBody(req.body, ctx.credentials);
 
       log.debug({ msg: 'calling Kiro API', url, type: req.label });

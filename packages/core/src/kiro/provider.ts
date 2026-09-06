@@ -22,7 +22,6 @@
 
 import https from 'node:https';
 import axios, { type AxiosInstance, type AxiosResponse } from 'axios';
-import { v4 as uuidv4 } from 'uuid';
 
 import {
   getKiroClientProfile,
@@ -172,7 +171,13 @@ export class KiroProvider {
 // Header builders —— 统一走 kiro-cli client profile
 // ============================================================================
 
-/** 主 API (`GenerateAssistantResponse`) 的 headers 构造 */
+/**
+ * 主 API (`GenerateAssistantResponse`) 的 headers 构造。
+ *
+ * ⚠ 重试三件套(`amz-sdk-invocation-id` / `amz-sdk-request` / `x-kiro-attempt`)
+ * **不在这里**——它们由 `RetryExecutor` 统一注入,因为只有它知道当前是第几次
+ * attempt。见 `applyRetryHeaders`。
+ */
 function buildGenerateAssistantResponseHeaders(
   token: string,
   host: string,
@@ -184,8 +189,6 @@ function buildGenerateAssistantResponseHeaders(
     'user-agent': renderUserAgent(profile, 'codewhispererstreaming'),
     'x-amz-user-agent': renderXAmzUserAgent(profile, 'codewhispererstreaming'),
     host,
-    'amz-sdk-invocation-id': uuidv4(),
-    'amz-sdk-request': 'attempt=1; max=3',
     Authorization: `Bearer ${token}`,
   };
 }
@@ -202,14 +205,13 @@ function buildMcpHeaders(
   host: string,
 ): Record<string, string> {
   const profile = getKiroClientProfile();
+  // 重试三件套同样交给 RetryExecutor 注入（见 buildGenerateAssistantResponseHeaders）。
   const headers: Record<string, string> = {
     ...profile.staticHeaders,
     'x-amz-target': requireAmzTarget(profile, 'invokeMcp'),
     'user-agent': renderUserAgent(profile, 'codewhispererstreaming'),
     'x-amz-user-agent': renderXAmzUserAgent(profile, 'codewhispererstreaming'),
     host,
-    'amz-sdk-invocation-id': uuidv4(),
-    'amz-sdk-request': 'attempt=1; max=3',
     Authorization: `Bearer ${token}`,
   };
 
