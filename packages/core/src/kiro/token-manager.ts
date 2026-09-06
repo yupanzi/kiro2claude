@@ -25,6 +25,7 @@ import {
 } from './model/credentials.js';
 import type { TokenRefreshRequest, TokenRefreshResponse } from './model/token-refresh.js';
 import type { UsageLimitsResponse } from './model/usage-limits.js';
+import { applyRetryHeaders } from './retry-executor.js';
 import {
   reloadFromSqlite,
   type SqliteCredentialSource,
@@ -167,14 +168,18 @@ export async function refreshToken(
     grantType: 'refresh_token',
   };
 
+  const refreshHeaders: Record<string, string> = {
+    'content-type': 'application/json',
+    host: `oidc.${region}.amazonaws.com`,
+    Connection: 'close',
+  };
+  // OIDC 是**另一个服务**(AWS SSO OIDC,不是 Kiro):`max` 实测为 4、且不发 Kiro 自定义
+  // 头,两处理应不同。共用的只是 AWS SDK 通用的 `amz-sdk-*` 语法——共用 formatter 正是
+  // 为了让「差异只在参数里」,而不是靠两份手写字面量各自记住格式。
+  applyRetryHeaders(refreshHeaders, uuidv4(), 1, { maxAttempts: 4, kiroAttemptHeader: false });
+
   const response = await client.post(refreshUrl, body, {
-    headers: {
-      'content-type': 'application/json',
-      host: `oidc.${region}.amazonaws.com`,
-      'amz-sdk-invocation-id': uuidv4(),
-      'amz-sdk-request': 'attempt=1; max=4',
-      Connection: 'close',
-    },
+    headers: refreshHeaders,
     validateStatus: () => true,
   });
 
@@ -270,10 +275,16 @@ export async function getUsageLimits(
     'user-agent': renderUserAgent(profile, 'codewhispererruntime'),
     'x-amz-user-agent': renderXAmzUserAgent(profile, 'codewhispererruntime'),
     host,
-    'amz-sdk-invocation-id': uuidv4(),
-    'amz-sdk-request': 'attempt=1; max=1',
     Authorization: `Bearer ${token}`,
   };
+  // 单次调用(不重试),但格式仍走 `applyRetryHeaders` —— 这里曾手写 `attempt=1; max=1`
+  // 字面量,于是同一份 wire 语法散在两处、改一处就漂移。⚠ 本端点没有 `x-kiro-attempt`
+  // 的抓包证据,故不发:补一个未经实测的头等于凭空改画像。
+  // 该路径**故意**不走 RetryExecutor:它抛 ProviderError,而 `/kiro/usage` 与
+  // plugin capability 都按 KiroHttpError 分流(见 routes/kiro.ts translateUsageError),
+  // 且 executor 的 body 分类器是按 messages 端点的错误体设计的。要统一得连错误语义
+  // 一起迁,那是独立的一次改动,不是这里顺手能带的。
+  applyRetryHeaders(headers, uuidv4(), 1, { maxAttempts: 1, kiroAttemptHeader: false });
 
   // kiro-cli 把 profileArn / isEmailRequired 同时放在 query string 和 body 里
   // （双写模式，和 ListAvailableModels 一致）。body 里不需要 origin / resourceType。

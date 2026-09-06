@@ -10,12 +10,21 @@
  * 抓包依据见 `applyRetryHeaders` 头注释(`kiro/retry-executor.ts`)。
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { AxiosInstance } from 'axios';
 import { validate as isUuid, version as uuidVersion } from 'uuid';
 import { describe, expect, it, vi } from 'vitest';
 import type { KiroCredentials } from '../../src/kiro/model/credentials.js';
-import { type RetryableRequest, RetryExecutor } from '../../src/kiro/retry-executor.js';
+import {
+  applyRetryHeaders,
+  type RetryableRequest,
+  RetryExecutor,
+} from '../../src/kiro/retry-executor.js';
 import type { SingleTokenManager } from '../../src/kiro/token-manager.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CREDENTIALS = { accessToken: 'tok', region: 'us-east-1' } as unknown as KiroCredentials;
 
@@ -98,5 +107,35 @@ describe('kiro-cli 重试头', () => {
 
     await executor.execute(req);
     expect(sent[0]['amz-sdk-request']).toBeDefined();
+  });
+});
+
+describe('不走 executor 的端点:差异只在参数里', () => {
+  it('单次调用端点 max 可覆盖、Kiro 自定义头可关（getUsageLimits 的形态）', () => {
+    const headers: Record<string, string> = {};
+    applyRetryHeaders(headers, 'inv-1', 1, { maxAttempts: 1, kiroAttemptHeader: false });
+
+    expect(headers['amz-sdk-request']).toBe('attempt=1; max=1');
+    // 没有该端点的抓包证据 → 不发,别顺手补一个未经实测的头
+    expect(headers['x-kiro-attempt']).toBeUndefined();
+  });
+
+  it('OIDC refresh 是另一个服务:max=4,同一个 formatter', () => {
+    const headers: Record<string, string> = {};
+    applyRetryHeaders(headers, 'inv-2', 1, { maxAttempts: 4, kiroAttemptHeader: false });
+
+    expect(headers['amz-sdk-request']).toBe('attempt=1; max=4');
+    expect(headers['x-kiro-attempt']).toBeUndefined();
+  });
+
+  it('token-manager 不再手写重试头字面量（格式只有一个 owner）', () => {
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '../../src/kiro/token-manager.ts'),
+      'utf-8',
+    );
+    // 手写 `'amz-sdk-request': 'attempt=1; max=N'` 是这次收敛掉的形态:两处各记一遍
+    // 格式,上游改语法(如 2.21.1 加 ttl)时必然只改到一处。
+    expect(src).not.toMatch(/['"]amz-sdk-request['"]\s*:/);
+    expect(src).toMatch(/applyRetryHeaders\(/);
   });
 });

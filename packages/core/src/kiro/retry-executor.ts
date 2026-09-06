@@ -104,9 +104,25 @@ const SDK_TTL_MS = 3_600_000;
 /** `YYYYMMDDTHHMMSSZ`(ISO8601 basic,UTC):从 `toISOString()` 去掉 `-` `:` 与毫秒。 */
 const ISO_BASIC_STRIP = /[-:]|\.\d{3}/g;
 
+/** 调用方与默认形态不同的地方(单次调用的端点、不发 Kiro 自定义头的端点)。 */
+export interface RetryHeaderOptions {
+  /** 声明给上游的最大 attempt 数。默认 `KIRO_MAX_ATTEMPTS`。 */
+  maxAttempts?: number;
+  /**
+   * 是否发 `x-kiro-attempt`。默认发。⚠ 置 false 不是风格选择:那是 Kiro 自定义头,
+   * 只在**抓到过**的端点上发——没有抓包证据就加,等于凭空改变伪装画像。
+   */
+  kiroAttemptHeader?: boolean;
+}
+
 /**
- * 注入 kiro-cli 的重试三件套。**唯一 owner**——别搬回 `provider.ts` 的 `buildHeaders`:
- * 那里每次调用生成新 uuid,上游看到的每次重试都成了「attempt=1 的全新请求」。
+ * 注入 kiro-cli 的重试头。**格式的唯一 owner**:`attempt=N; max=M` 的拼法、第 2 次
+ * 起才出现的 `ttl=`、以及 `x-kiro-attempt` 的分隔符差异(`;` 无空格)全在这里,别在
+ * 调用点手写字面量——那正是这个函数出现之前的形态,同一份 wire 语法散在三处。
+ *
+ * ⚠ 更别搬回 `provider.ts` 的 `buildHeaders`:那里每次调用生成新 uuid,上游看到的
+ * 每次重试都成了「attempt=1 的全新请求」。invocation-id 的生命周期属于**调用方**
+ * (一次 `execute()` = 一次逻辑调用),所以它是参数而不是本函数生成的。
  *
  * 2.21.1 实测形态(`scripts/capture-kiro-cli.sh` 抓包):
  * ```
@@ -116,18 +132,20 @@ const ISO_BASIC_STRIP = /[-:]|\.\d{3}/g;
  * x-kiro-attempt:        2;max=3                     # 2.21.1 新增的 Kiro 自定义头
  * ```
  */
-function applyRetryHeaders(
+export function applyRetryHeaders(
   headers: Record<string, string>,
   invocationId: string,
   attempt: number,
+  opts: RetryHeaderOptions = {},
 ): void {
+  const max = opts.maxAttempts ?? KIRO_MAX_ATTEMPTS;
   headers['amz-sdk-invocation-id'] = invocationId;
   const ttl =
     attempt > 1
       ? `ttl=${new Date(Date.now() + SDK_TTL_MS).toISOString().replace(ISO_BASIC_STRIP, '')}; `
       : '';
-  headers['amz-sdk-request'] = `${ttl}attempt=${attempt}; max=${KIRO_MAX_ATTEMPTS}`;
-  headers['x-kiro-attempt'] = `${attempt};max=${KIRO_MAX_ATTEMPTS}`;
+  headers['amz-sdk-request'] = `${ttl}attempt=${attempt}; max=${max}`;
+  if (opts.kiroAttemptHeader !== false) headers['x-kiro-attempt'] = `${attempt};max=${max}`;
 }
 
 export class RetryExecutor {
