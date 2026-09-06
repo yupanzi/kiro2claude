@@ -1,3 +1,12 @@
+## [1.5.4](https://github.com/yupanzi/kiro2claude/compare/v1.5.3...v1.5.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* **core:** 截断的 tool_use 改判 max_tokens,不再谎报完整调用 ([962e52f](https://github.com/yupanzi/kiro2claude/commit/962e52f9e24137a778338cc5b7441d9545d90e2d))
+* **kiro:** assistant 历史补 messageId,按 toolUseId 确定性派生 ([80aa9f0](https://github.com/yupanzi/kiro2claude/commit/80aa9f0d44499dbcfb077843d9718a779d3700bd))
+* **kiro:** 重试头改由 RetryExecutor 注入,升 kiro-cli 画像到 2.21.1 ([219ba8b](https://github.com/yupanzi/kiro2claude/commit/219ba8bd0b9a5525f2ceca3f2951ff81a66ac1db))
+
 ## [1.5.3](https://github.com/yupanzi/kiro2claude/compare/v1.5.2...v1.5.3) (2026-08-20)
 
 
