@@ -25,6 +25,14 @@ code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wa
 
 > 非默认 `namespace` 工具(`collaboration` / `multi_agent_v1`)**故意不转发**:实测其子工具裸名与 `collaboration.list_agents` 都被拒(`unsupported call: list_agents`)。规则与理由同上,见 `expandDefaultNamespace` 头注释。
 
+## ⚠ subagent(`spawn_agent`)经本网关用不了,且**不要**试着放开
+
+`collaboration` namespace 里的六个工具(`spawn_agent` / `list_agents` / `send_message` / `wait_agent` / `followup_task` / `interrupt_agent`)就是 Codex 的 subagent 能力。经 kiro2claude(以及任何自定义 `model_provider`)**不可用**,现象是模型直接答「工具不可用」。
+
+0.153.4 上把它们展开转发试过了,**结论是展开更糟**:工具能上送、模型也会调,但 Codex 自己的 tool router 一律回 `unsupported call`,模型随即**无限重试**(实测单轮 110+ 次上游请求,`exec` 与交互 TUI 两种模式都复现),每次都真实计费。三种命名(裸名 / `collaboration.spawn_agent` / `collaboration__spawn_agent`)、`--enable multi_agent_v2`、自定义 `features.multi_agent_v2.tool_namespace` 全试过,无一奏效。
+
+根因在客户端:V1/V2 collaboration 工具的 handler 对自定义 provider 根本不注册(上游 issue [openai/codex#36957](https://github.com/openai/codex/issues/36957);`codex debug models` 可见 `gpt-5.6-sol` 的 `multi_agent_version="v2"`,而 `codex features list` 里 `multi_agent_v2` 默认 `false`)。**网关侧无解**,等 Codex 官方放开。
+
 ## 前置条件
 
 - Docker Desktop / Engine
@@ -61,7 +69,7 @@ code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wa
 
 ## 实测结论(已跑通)
 
-> 端到端验证跑在 Codex **0.144.4 / 0.146.0**(扁平工具形态);**0.147.0 / 0.148.0**(`functions` namespace 嵌套形态)用本地抓包/应答服务器验证:抓真实请求定格式、伪造 `custom_tool_call`/`function_call` 响应实测回程名字分发(裸名 `exec`/`wait` 被执行,`collaboration` 子工具被拒)。此处是本仓唯一记录**端到端验证过哪些 Codex 版本**的地方;别处(源码、测试、脚本与其它文档)出现的版本号只标注某个 wire 形态**何时**开始出现——判别 code mode 与 namespace 展开一律只看**字段在不在**,任何地方都不按版本走不同路径。
+> 端到端验证跑在 Codex **0.144.4 / 0.146.0**(扁平工具形态)与 **0.153.4**(`functions` + `collaboration` 双 namespace 形态,`exec` / 交互 TUI 两条路径都跑过真实会话);**0.147.0 / 0.148.0**(`functions` namespace 嵌套形态)用本地抓包/应答服务器验证:抓真实请求定格式、伪造 `custom_tool_call`/`function_call` 响应实测回程名字分发(裸名 `exec`/`wait` 被执行,`collaboration` 子工具被拒)。此处是本仓唯一记录**端到端验证过哪些 Codex 版本**的地方;别处(源码、测试、脚本与其它文档)出现的版本号只标注某个 wire 形态**何时**开始出现——判别 code mode 与 namespace 展开一律只看**字段在不在**,任何地方都不按版本走不同路径。
 
 - ✅ **对话**:`codex exec "..."` → 网关 `/openai/v1/responses` → gpt-5.6-sol → 正确回答。
 - ✅ **工具调用(fallback 形态)**:`gpt-5-codex` → Codex 发 10 个顶层工具 → 模型 function_call → 容器内真实执行(如 `/bin/bash -lc 'uname -s'` → `Linux`)→ 结果回填 → 模型最终答案(多轮 function_call 全通)。

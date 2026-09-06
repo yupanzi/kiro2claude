@@ -192,8 +192,19 @@ function convertInputItem(
  * **裸名**回调(Codex 侧 `with_default_namespace()` 把「无 namespace」与 `"functions"`
  * 归一,`functions.exec` 这种拼名反而不认),所以展开后名字、响应编码、历史 item 全都
  * 不用动。**只能按名字白名单**:「是不是默认命名空间」在 wire 上没有字段可表达,不像
- * 两套请求形态那样有结构可判。其余 namespace(collaboration 等)的子工具裸名与 `ns.名`
- * 均被 Codex 拒绝(unsupported call),原样留给 convertTools 丢弃——不展开就没有死工具。
+ * 两套请求形态那样有结构可判。
+ *
+ * ★ **其余 namespace(subagent 的 `collaboration`)绝不展开——展开是净亏**。0.153.4
+ * 实测:六个 subagent 工具(`spawn_agent` / `list_agents` / `send_message` /
+ * `wait_agent` / `followup_task` / `interrupt_agent`)展开后**能**上送、模型**也会**调,
+ * 但 Codex 自己的 tool router 一律回 `unsupported call`。三种命名(裸名 / `ns.名` /
+ * `ns__名`)、`--enable multi_agent_v2`、自定义 `features.multi_agent_v2.tool_namespace`
+ * 全试过(namespace 名在 wire 上确实跟着变,证明 v2 路径生效,router 依旧不认)。
+ *
+ * 根因在客户端而非命名:collaboration handler 对**自定义 model_provider** 根本不注册
+ * (上游 issue openai/codex#36957)。代价实打实:模型拿到永远失败的工具会**无限重试**
+ * (实测单轮 110+ 次上游请求,exec 与 TUI 两种模式都复现),每次都真实计费。「不展开」
+ * 才是唯一能让模型早早放弃、如实回答「工具不可用」的形态——别再试着靠改名绕过。
  *
  * ★ **一层、不递归**:真实 wire 恰好一层,而自嵌套的畸形请求走递归就等于开了一条
  * 栈溢出→500 的通道。这里只摊平一遍,更深的 functions 容器原样落到 convertTools 按
