@@ -18,6 +18,15 @@ packages/   ★ 全部 MIT
 ├── plugin-derived/       反演 Kiro credit → Anthropic token,注入 usage.kiro_derived
 └── examples/echo-plugin/ 公开示范 plugin
 
+packages/core/test/manual/ 手工工具(非 CI,vitest 不收;打真实上游会计费)
+                          `kiro-cli-probe.ts`          反向驱动真实 kiro-cli:伪造 event-stream 让它
+                                                       真的执行某个工具、或注入错误码看重试策略
+                          `_harness.mjs`               三个检测器共用:env / 发请求 / 解 SSE / 号段校验 /
+                                                       **两套协议不变量** / 汇总退出码。新检测器从这里
+                                                       拿,别再各写一份缩水的不变量集
+                          `protocol-integrity.mjs`     双协议流式完整性:确定性序列 + 协议不变量
+                          `backpressure-integrity.mjs` 慢客户端背压下终结段/内容是否完整
+                          `concurrency-integrity.mjs`  并发下的区间隔离(串扰检测)
 tools/claude-code/        Claude Code CLI 的 Docker harness(人工点验 + headless 回归,非 runtime)
 tools/codex/              Codex CLI 的 Docker harness(Responses 端点点验,非 runtime)
 docker/Dockerfile         单一发布镜像(core + 两个内置插件)
@@ -115,6 +124,8 @@ flowchart LR
 | `usage` 字段如何被 plugin 注入 | plugin 用 `event.addExtension(...)` / `event.overrideStandardField(...)`;core 不输出特定 plugin 字段 |
 | plugin 能读到哪些 `kiro.*` meta 键 | 实现 = `buildKiroUsageFinishEvent`(`claude/stream.ts`)的 meta 字面量;文档两份(`plugin-api/src/types.ts` 的 `getMeta` 头注释 + [PLUGIN-DEVELOPMENT.md](./docs/PLUGIN-DEVELOPMENT.md)「Meta 键」表)。三方由 `test/static/usage-meta-contract.test.ts` 钉死,**加键必须同改三处**。⚠ 键恒在、值可为 `undefined`,别用 `listMetaKeys().includes()` 判可用性 |
 | 上游已扣费但网关没记上账 | `isMeteringLost`(`claude/stream.ts`)= 判据唯一定义点;plugin 侧读 `kiro.meteringMissing` meta,运维侧读四条终态路径日志的 `metering_lost`。★ 用它估规模前先读其头注释的两条口径偏差(abort 配置下**多报**、判空/重试路径**漏报**)|
+| 怀疑流式丢包 / 内容不全 | 别靠肉眼看输出。`test/manual/` 三个检测器各打一类:`protocol-integrity.mjs`(确定性序列 + **协议不变量**:block start/stop 配对、`message_delta` 恰一次、Responses `sequence_number` 无洞、done 回填 == delta 累积)、`backpressure-integrity.mjs`(**慢客户端**,专打踩坑「write 背压不是断连」——那个 bug 只在缓冲被大量字节填满时出现,快客户端永远碰不到)、`concurrency-integrity.mjs`(并发下各请求输出**互不重叠的号段**,混入外区间数字即串扰)。2026-09 全量实测 0 失败 |
+| Responses 的字节量约为 Claude 的 10× | 同一段内容实测:Claude 15KB/118 事件 vs Responses 155KB/906 事件。**不是丢包也不是编码 bug**,拆开是两项:上游 GPT 的 delta 分片更碎(事件数 ~7.7×)+ Responses 每事件字段更多(`item_id`/`output_index`/`content_index`/`sequence_number`,每事件 171B vs 131B,~1.3×)。运维含义:同样内容 Responses 更吃带宽与写缓冲,背压也更早出现(慢读实测 26.6s vs 13.1s) |
 | 孤儿 tool_use(无配对 tool_result)怎么处理 | `synthesizeMissingToolResults`(`claude/converter.ts`)**补** isError tool_result,不再删 tool_use——删了模型会失忆并原地重复调用。挂载位置规则、幂等性(`orphanedIds.delete`)、对 `collectHistoryToolNames` 的连带效应全在其头注释 |
 | GPT 反演为何 credit 锚定(不做 token 分解)| `plugin-derived/src/derive.ts` `gptCreditAnchoredBreakdown` + 踩坑「GPT credit 锚定」 |
 | `/api/*` 怎么剥 plugin 扩展 | `index.ts` 的 `/api/*` register 处 + `buildClaudeUsagePayload`(`claude/stream.ts`)|
@@ -124,6 +135,9 @@ flowchart LR
 | 上游中途 Exception / mid-response 截断 | 踩坑「上游杀卡住的流」(判别子是 token/s,不是总时长)+ `logFields.disconnect_source` |
 | 怎么发版 / 版本号从哪来 | [CONTRIBUTING.md](./CONTRIBUTING.md)「版本与发布」+ `.releaserc.json`(semantic-release 全自动,唯一手动的是 plugin 契约版本)|
 | commit message 写多长 / 哪些字段不能写进历史 | [CONTRIBUTING.md](./CONTRIBUTING.md)「提交规范」的「篇幅」+「脱敏」两节 + `.gitmessage` 模板 |
+| kiro-cli 自己怎么处理 5xx / 429 / 400 | 2.21.1 实测(探针 `packages/core/test/manual/kiro-cli-probe.ts`,注入状态码):**500/502/503 → 共 9 次**(SDK 内层 attempt 1→2→3,带抖动退避 ~150–1800ms;应用层外层再来 3 轮,间隔 ~2.1s→4.6s);**429 → 3 次**,**不走内层重试**(attempt 恒为 1),间隔**严格等于 `Retry-After`**(实测 7007/7009ms);**400 → 不重试**。⚠ 网关**一次都不重试**、原样透传(架构决策见 `retry-executor.ts` 头注释 + 踩坑「跨模型对照」)——即 kiro-cli 有 9 次机会而网关只有 1 次,瞬时 5xx 上二者体感差距全在于此。要改先读那两处,别只看这一行 |
+| web_search / web_fetch 分别在哪执行 | 2.21.1 实测:`web_search` → **走上游 `InvokeMCP`**(`x-amz-target: AmazonCodeWhispererStreamingService.InvokeMCP`,body 是 JSON-RPC `tools/call` + `{name:'web_search',arguments:{query}}`,带 `x-amzn-kiro-profile-arn` 头),所以网关代为执行是对的(`claude/websearch.ts`);`web_fetch` → **零上游请求**,客户端本地直接抓 —— 是客户端职责,网关**不该**实现。⚠ kiro-cli 把两者都当**普通工具**上送给模型,网关侧的触发判据是「工具只有一个且名为 `web_search`」(Claude Code 的独立子请求路径),两者形态不同 |
+| 图片经 tool_result 回传时的 wire | 2.21.1 实测(`fs_read` 的 `Image` mode + `image_paths`):图片**提升到 message-level `images: [{format:'png', source:{bytes:<base64>}}]`**,`toolResults[].content` 原位只留一句占位文本 `"See images data supplied"`。项目的提升逻辑一致(`converter.ts` `extractToolResultContent` + 挂载点),仅占位文案不同(`[image attached to this message]`)——语义等价,实测两者上游都收 |
 | kiro-cli fixture 怎么升版本 | 跑 `scripts/capture-kiro-cli.sh`(头注释 = 前置条件与副作用)→ commit `fixtures/`;版本号由 `.releaserc.json` 的 `publishCmd` 用 `jq` 从 fixture 派生,故须走能触发发版的 commit type |
 
 ## 不可违反的规范
