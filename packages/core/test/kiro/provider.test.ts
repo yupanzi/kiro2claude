@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { KiroProvider } from '../../src/kiro/provider.js';
+import { buildUpstreamAgentOptions, KiroProvider } from '../../src/kiro/provider.js';
 
 describe('KiroProvider.isMonthlyRequestLimit', () => {
   it('test_is_monthly_request_limit_detects_reason', () => {
@@ -48,5 +48,18 @@ describe('KiroProvider.injectProfileArn', () => {
     const result = KiroProvider.injectProfileArn(body, 'arn:test');
     // On parse failure, return as-is
     expect(result).toBe('not-valid-json');
+  });
+});
+
+describe('buildUpstreamAgentOptions', () => {
+  it('derives maxFreeSockets from maxSockets instead of a fixed smaller cap', () => {
+    // 写死一个更小的 free 上限，高峰过后多出来的热连接会被关掉，下一波重做 TLS
+    // 握手；Node 默认 256 同理会在大池子上隐式截断。两处都靠这条断言挡住。
+    expect(buildUpstreamAgentOptions(100)).toEqual({
+      keepAlive: true,
+      maxSockets: 100,
+      maxFreeSockets: 100,
+    });
+    expect(buildUpstreamAgentOptions(1000).maxFreeSockets).toBe(1000);
   });
 });

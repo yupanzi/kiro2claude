@@ -213,6 +213,15 @@ export const envSchema = z.object({
   // 部分也一并计上)。开启后断连即 abort 上游 socket,省下断连点之后的 credit;
   // 代价:拿不到尾帧 Metering,per-request 计费记账会偏低。高危,默认关。
   KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT: boolField(false),
+  // 上游 HTTPS 连接池最大并发 socket 数。默认 100。SSE 是长连接(一个流全程占住
+  // 一个 socket),所以这实际是「最大并发上游会话数」,不是瞬时并发。超出后在
+  // Node Agent 队列里**静默排队**(无日志、不计重试预算,却计入 axios 720s timeout)。
+  // ⚠ 调大不提高上游额度——真正的墙是 429(网关不重试、原样透传);仅在确认瓶颈
+  // 是本地排队时才放宽。范围 1..1000。详见 Config.upstreamMaxSockets。
+  KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS: intField('KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS', 100, {
+    min: 1,
+    max: 1000,
+  }),
   // 泄漏工具调用文本救援:上游偶发把模型的工具调用当纯文本发下来。开启后
   // 响应侧把泄漏块解析回真 tool_use、请求侧剥掉历史里的泄漏块(去污染)。
   // 详见 Config.toolCallTextRescue 与 claude/tool-call-text.ts。
@@ -261,6 +270,7 @@ export function envToConfig(env: ParsedEnv): Config {
     rejectUnsupportedDocuments: env.KIRO2CLAUDE_REJECT_UNSUPPORTED_DOCUMENTS,
     toolDescriptionMaxLen: env.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN,
     abortUpstreamOnDisconnect: env.KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT,
+    upstreamMaxSockets: env.KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS,
     toolCallTextRescue: env.KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE,
     autoCaptureProfile: env.KIRO2CLAUDE_AUTO_CAPTURE_PROFILE,
     kiroCliBin: env.KIRO2CLAUDE_CLI_BIN,

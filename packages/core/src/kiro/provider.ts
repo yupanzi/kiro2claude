@@ -41,6 +41,17 @@ import {
 import type { SingleTokenManager } from './token-manager.js';
 
 /**
+ * 上游连接池参数 —— **唯一**构造点，与 `Config.upstreamMaxSockets` 同源。
+ *
+ * `maxFreeSockets` 跟着 `maxSockets` 走、不写死一个更小的值：一个**更低**的 free
+ * 上限是唯一会主动关掉已建好热连接的机制，高峰过后被关掉的连接下一波要重做 TLS
+ * 握手。（也不能省略：Node 默认 256，`maxSockets` 超过它就会又变成隐式截断。）
+ */
+export function buildUpstreamAgentOptions(maxSockets: number): https.AgentOptions {
+  return { keepAlive: true, maxSockets, maxFreeSockets: maxSockets };
+}
+
+/**
  * Kiro API Provider —— 与上游 Kiro / CodeWhisperer API 通信的核心组件。
  */
 export class KiroProvider {
@@ -52,11 +63,9 @@ export class KiroProvider {
 
   constructor(tokenManager: SingleTokenManager) {
     this.tokenManager = tokenManager;
-    const httpsAgent = new https.Agent({
-      keepAlive: true,
-      maxSockets: 50,
-      maxFreeSockets: 10,
-    });
+    const httpsAgent = new https.Agent(
+      buildUpstreamAgentOptions(tokenManager.config().upstreamMaxSockets),
+    );
     this.client = axios.create({ timeout: 720_000, httpsAgent });
     this.executor = new RetryExecutor(tokenManager, this.client);
   }

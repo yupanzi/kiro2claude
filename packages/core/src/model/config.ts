@@ -63,6 +63,14 @@ export interface Config {
    */
   abortUpstreamOnDisconnect: boolean;
   /**
+   * 上游 HTTPS 连接池(messages / MCP 共用的 provider 客户端)的最大并发 socket
+   * 数。默认 100。SSE 是长连接,一个进行中的流**全程**占住一个 socket,所以这是
+   * 「最大并发上游会话数」而非「瞬时并发」。超出后请求在 Node Agent 队列里**静默
+   * 排队**——无日志、不计入重试预算,却已计入 axios 的 720s timeout。
+   * 由 `KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS` 配置;调优取舍见 `.env.example`。
+   */
+  upstreamMaxSockets: number;
+  /**
    * 泄漏工具调用文本救援（默认 `true`）。上游偶发把模型的工具调用当**纯文本**
    * 从 assistantResponseEvent 发下来（而非结构化 toolUseEvent），下游看到的
    * 就是一段 `<invoke name="Edit">...` 标记文本，工具调用等于丢失；且泄漏文本

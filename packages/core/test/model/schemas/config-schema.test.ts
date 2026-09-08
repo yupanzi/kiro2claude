@@ -135,6 +135,42 @@ describe('envSchema - KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN', () => {
   });
 });
 
+describe('envSchema - KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS', () => {
+  it('defaults to 100 and maps to config.upstreamMaxSockets', () => {
+    const result = envSchema.safeParse(MINIMAL_ENV);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS).toBe(100);
+      expect(envToConfig(result.data).upstreamMaxSockets).toBe(100);
+    }
+  });
+
+  it('accepts the bounds 1 and 1000', () => {
+    for (const [raw, parsed] of [
+      ['1', 1],
+      ['1000', 1000],
+    ] as const) {
+      const result = envSchema.safeParse({
+        ...MINIMAL_ENV,
+        KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS: raw,
+      });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS).toBe(parsed);
+    }
+  });
+
+  it('rejects 0 — an unusable pool would deadlock every upstream call', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS: '0',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(formatEnvError(result.error)).toMatch(/KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS out of range/);
+    }
+  });
+});
+
 describe('envSchema - KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT', () => {
   it('defaults to false and maps to config.abortUpstreamOnDisconnect', () => {
     const result = envSchema.safeParse(MINIMAL_ENV);
