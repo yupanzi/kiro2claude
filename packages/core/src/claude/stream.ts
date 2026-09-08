@@ -20,6 +20,7 @@ import {
   ToolCallTextDetector,
   type ToolTextRegistry,
 } from './tool-call-text.js';
+import { parseCompletedToolInput, ToolUseSequence } from './tool-use-sequence.js';
 
 // ============================================================================
 // Claude usage wire format
@@ -264,7 +265,7 @@ export interface ContentPresence {
  *
  * ★ 截断的 tool 帧三项都不置位 → 算空 → 按瞬时静默流重试。**仅对「空壳帧」成立**:
  * 已发过 input 分片的,分片长度计入产出侧 → 此处为真,两种截断形态由此分开
- * (踩坑「截断 tool_use 谎报终态」)。
+ * (踩坑「截断 tool_use 必须阻止残缺调用到达客户端」)。
  *
  * ⚠ 两个 transport 与非流式 reducer 曾各自内联一份。**别再拷回去**:判空、commit
  * 与终态是同一个谓词的三面,多一处拼法就多一条静默分叉的通道——流式/非流式对同一
@@ -318,6 +319,26 @@ export interface PendingUpstreamError {
   message: string;
   /** Transient → retryable 503; otherwise fatal 502. */
   retryable: boolean;
+  /** Proven body corruption/read failure is never an empty-response retry. */
+  bodyReadFailed: boolean;
+}
+
+/** Shared classification for proven body-read/decode failures in both reducers. */
+export function streamReadError(error: unknown): PendingUpstreamError {
+  return {
+    code: 'StreamReadError',
+    message: String(error),
+    retryable: false,
+    bodyReadFailed: true,
+  };
+}
+
+/** Only an explicit rejection before any work can use the empty-response retry budget. */
+export function canRetryZeroWorkRejection(
+  error: PendingUpstreamError,
+  eventCounts: Record<string, number>,
+): boolean {
+  return !error.bodyReadFailed && !sawBillableWork(eventCounts);
 }
 
 /**
@@ -340,12 +361,14 @@ export function classifyUpstreamErrorEvent(
       code: event.exceptionType,
       message: event.message,
       retryable: RETRYABLE_UPSTREAM_ERROR_CODES.has(event.exceptionType),
+      bodyReadFailed: false,
     };
   }
   return {
     code: event.errorCode,
     message: event.errorMessage,
     retryable: RETRYABLE_UPSTREAM_ERROR_CODES.has(event.errorCode),
+    bodyReadFailed: false,
   };
 }
 
@@ -712,6 +735,8 @@ export class SseStateManager {
 // ============================================================================
 
 export class StreamContext {
+  /** An eagerly opened empty text block is not an assistant answer. */
+  private sawVisibleText = false;
   stateManager: SseStateManager;
   model: string;
   messageId: string;
@@ -726,18 +751,18 @@ export class StreamContext {
    * real content. `hasContent()` reads it so a complete empty-input tool call is
    * NOT misclassified as a silent empty stream (which would retry then bogus-503,
    * while the non-stream path returns 200). A *truncated* tool frame
-   * (isComplete=false) never sets this → still treated as empty and retried.
+   * (isComplete=false) never sets this; a zero-input shell remains deterministic empty.
    */
   sawCompletedToolUse: boolean;
   /**
-   * 已宣告但尚未收到 `isComplete` 的 tool_use block(按 block index)。终结段据此
-   * 落 `max_tokens`(见 `generateFinalEvents`)。
-   *
-   * 与 `sawCompletedToolUse` 必须分开:那个是「**有没有**任何调用完成」的全局布尔,
-   * 这里问「**这一个**收完没有」。一次响应里 A 完成、B 被截断是常见形态,全局布尔
-   * 为真,而残缺的 B 仍会毒到客户端。
+   * Tool input is buffered by call id until isComplete. Claude Code parses and
+   * executes completed blocks before looking at the final stop_reason, so merely
+   * changing it to max_tokens still exposes truncated JSON as an executable call.
+   * No block index/start/delta is emitted for a pending call. Text keeps streaming;
+   * input bytes still count towards usage and deterministic-truncation detection.
    */
-  private readonly incompleteToolBlocks = new Set<number>();
+  private readonly pendingToolCalls = new Map<string, { name: string; chunks: string[] }>();
+  private readonly toolUseSequence = new ToolUseSequence();
   /**
    * **网关自己**掐断了上游:客户端断连后主动 abort(`ABORT_UPSTREAM_ON_DISCONNECT`),
    * 或 post-disconnect drain grace 到期我们 destroy 了 socket。两者都会让正在传输的
@@ -747,6 +772,16 @@ export class StreamContext {
    * 不改 stop_reason:`max_tokens` 对残缺调用依然是正确终态,只是没人在读了。
    */
   gatewayTruncatedUpstream = false;
+  /**
+   * 上游发过 `metadataEvent`(生成**正常收尾**的标记,见 `kiro/model/events/base.ts`
+   * 该 case 的头注释)。它是「说完了」与「说到一半干净 EOF」之间**唯一**可判的信号:
+   * EOF 落在帧边界时没有残留半帧、`assertComplete()` 天然通过,而客户端把 `end_turn`
+   * 当任务完成 —— 实测真实 Claude Code 对一个 12 步任务只做 4 步就 `exit 0`。
+   * 终结段据此把「有内容、无错误、却没见过尾帧」收窄成 `max_tokens`,让客户端续接
+   * (Responses 映射为 `incomplete`)。只在 `hasContent()` 为真时施加:零内容仍归
+   * 判空路径。
+   */
+  private sawMetadata = false;
   toolBlockIndices: Map<string, number>;
   toolNameMap: Map<string, string>;
   thinkingEnabled: boolean;
@@ -813,9 +848,9 @@ export class StreamContext {
    */
   private pendingUpstreamError: PendingUpstreamError | undefined;
   /**
-   * 上游出现过的未识别 event-type 字符串(去重)。前向兼容诊断:当前良性
-   * metadata 帧会稳定出现;上游若新增*带内容的* event-type,会在「完成」日志的
-   * `unknown_event_types` 字段冒出来,而非无声落入 Unknown 被丢。
+   * 上游出现过的未识别 event-type 字符串(去重)。前向兼容诊断:上游若新增
+   * *带内容的* event-type,会在「完成」日志的 `unknown_event_types` 字段冒出来,
+   * 而非无声落入 Unknown 被丢。(`metadataEvent` 已是已知事件,见 `sawMetadata`。)
    */
   readonly unknownEventTypes = new Set<string>();
 
@@ -826,6 +861,7 @@ export class StreamContext {
     toolNameMap: Map<string, string>,
     hookBus: HookBus,
     rescueRegistry?: ToolTextRegistry,
+    private readonly allowRawToolInputs?: ReadonlySet<string>,
   ) {
     this.stateManager = new SseStateManager();
     this.model = model;
@@ -909,7 +945,7 @@ export class StreamContext {
   }
 
   /**
-   * 本次 attempt 收到过的上游 Error/Exception 帧(非 ContentLength);undefined
+   * 本次 attempt 的上游 Error/Exception 帧(非 ContentLength)或读流/解码异常;undefined
    * 表示没有。纯读——`ctx` 每 attempt 重建、读后即弃,无需清空。两处消费:重试
    * 循环 break 条件(显式上游错误是确定性终止、不当空流重试,免白烧 credit),
    * 以及终结段决定向客户端明确报错(而非静默截断)。
@@ -918,9 +954,39 @@ export class StreamContext {
     return this.pendingUpstreamError;
   }
 
+  /**
+   * A failed body read is a failed response, even if earlier frames contained
+   * useful text. Route it through the same terminal error path as an explicit
+   * upstream error; logging alone would turn a reset socket into end_turn.
+   * Preserve any more specific error frame received before the socket failed.
+   */
+  recordStreamReadError(error: unknown): void {
+    this.pendingUpstreamError ??= streamReadError(error);
+    this.pendingUpstreamError.bodyReadFailed = true;
+  }
+
+  private recordUpstreamError(error: PendingUpstreamError | undefined): void {
+    if (!error) return;
+    error.bodyReadFailed ||= this.pendingUpstreamError?.bodyReadFailed ?? false;
+    this.pendingUpstreamError = error;
+  }
+
   /** Process Kiro event and convert to Claude SSE events */
   processKiroEvent(event: Event): SseEvent[] {
     this.eventCounts.set(event.kind, (this.eventCounts.get(event.kind) ?? 0) + 1);
+
+    // Once a frame/stream or explicit upstream error proves this response failed,
+    // recovery is for accounting only. Joining later text/thinking to the valid
+    // prefix would conceal the missing span, just as completing a damaged tool
+    // would conceal missing arguments. Still drain metadata and error frames.
+    if (
+      this.pendingUpstreamError &&
+      (event.kind === 'AssistantResponse' ||
+        event.kind === 'ReasoningContent' ||
+        event.kind === 'ToolUse')
+    ) {
+      return [];
+    }
 
     switch (event.kind) {
       case 'AssistantResponse':
@@ -958,7 +1024,7 @@ export class StreamContext {
         });
         // 记下待发错误(含 retryable 分类),由 handler 终结段按 committed 状态明确
         // 报错(in-band error 或 502/503),不再 `return []` 静默截断成 message_stop。
-        this.pendingUpstreamError = classifyUpstreamErrorEvent(event);
+        this.recordUpstreamError(classifyUpstreamErrorEvent(event));
         return [];
 
       case 'Exception': {
@@ -969,10 +1035,16 @@ export class StreamContext {
         if (classified === undefined) {
           this.stateManager.setStopReason('max_tokens');
         } else {
-          this.pendingUpstreamError = classified;
+          this.recordUpstreamError(classified);
         }
         return [];
       }
+
+      case 'Metadata':
+        // 只取「出现过」;它的 stopReason 不可信(带工具时也报 END_TURN),终态照旧
+        // 由网关推断。错误路径也要吃到它:pendingUpstreamError 的过滤只拦内容帧。
+        this.sawMetadata = true;
+        return [];
 
       case 'Unknown':
         // 未识别 event-type:记下类型名供「完成」日志观测(前向兼容),payload
@@ -1208,6 +1280,7 @@ export class StreamContext {
    */
   private emitTextDeltaEventsRaw(text: string): SseEvent[] {
     const events: SseEvent[] = [];
+    if (text) this.sawVisibleText = true;
 
     // If current text_block_index points to a closed block, discard and create new
     if (this.textBlockIndex !== undefined) {
@@ -1314,6 +1387,11 @@ export class StreamContext {
     return events;
   }
 
+  /** 上游是否发过生成正常收尾的 `metadataEvent`(见 `sawMetadata` 字段注释)。 */
+  sawUpstreamMetadata(): boolean {
+    return this.sawMetadata;
+  }
+
   /** 流式侧的 `computeHasContent`(谓词与分项集合的定义在那边,这里只填观测值)。 */
   hasContent(): boolean {
     return computeHasContent({
@@ -1333,14 +1411,35 @@ export class StreamContext {
    * 依赖关系。问事实,别问终态。
    */
   hasIncompleteToolUse(): boolean {
-    return this.incompleteToolBlocks.size > 0;
+    return this.pendingToolCalls.size > 0;
   }
 
   /** Emit a tool block without touching legacy/native or rescue boundaries. */
   private emitToolUseBlock(toolUse: Extract<Event, { kind: 'ToolUse' }>): SseEvent[] {
     const events: SseEvent[] = [];
+    this.toolUseSequence.observe(toolUse);
 
     this.stateManager.setHasToolUse(true);
+
+    const originalName = this.toolNameMap.get(toolUse.name) ?? toolUse.name;
+    this.seenToolUseNames.add(originalName);
+    let pending = this.pendingToolCalls.get(toolUse.toolUseId);
+    if (!pending) {
+      pending = { name: originalName, chunks: [] };
+      this.pendingToolCalls.set(toolUse.toolUseId, pending);
+    }
+    if (toolUse.input) {
+      this.outputTokens += Math.floor((toolUse.input.length + 3) / 4);
+      pending.chunks.push(toolUse.input);
+    }
+    if (!toolUse.isComplete) return events;
+    const input = pending.chunks.join('');
+    this.pendingToolCalls.delete(toolUse.toolUseId);
+    // Recovery may find a completion frame after dropping a corrupt input frame.
+    // Such a call is no longer trustworthy, even though isComplete arrived.
+    if (this.pendingUpstreamError) return events;
+    parseCompletedToolInput(input, this.allowRawToolInputs?.has(pending.name));
+    this.sawCompletedToolUse = true;
 
     // Get or allocate block index
     let blockIndex = this.toolBlockIndices.get(toolUse.toolUseId);
@@ -1349,10 +1448,6 @@ export class StreamContext {
       this.toolBlockIndices.set(toolUse.toolUseId, blockIndex);
     }
 
-    // Restore original tool name if mapped
-    const originalName = this.toolNameMap.get(toolUse.name) ?? toolUse.name;
-    this.seenToolUseNames.add(originalName);
-
     // Send content_block_start
     const startEvents = this.stateManager.handleContentBlockStart(blockIndex, 'tool_use', {
       type: 'content_block_start',
@@ -1360,40 +1455,27 @@ export class StreamContext {
       content_block: {
         type: 'tool_use',
         id: toolUse.toolUseId,
-        name: originalName,
+        name: pending.name,
         input: {},
       },
     });
     events.push(...startEvents);
 
-    // Send input increments
-    if (toolUse.input) {
-      this.outputTokens += Math.floor((toolUse.input.length + 3) / 4);
-
+    // Emit the exact accumulated input only after its completion frame arrived.
+    if (input) {
       const deltaEvent = this.stateManager.handleContentBlockDelta(blockIndex, {
         type: 'content_block_delta',
         index: blockIndex,
         delta: {
           type: 'input_json_delta',
-          partial_json: toolUse.input,
+          partial_json: input,
         },
       });
       if (deltaEvent) events.push(deltaEvent);
     }
 
-    // If complete tool call, send content_block_stop. Mark that a *complete*
-    // tool_use was produced so hasContent() counts it as content even when the
-    // input object is empty (no-args tool) — matches the non-stream path, which
-    // pushes the tool_use on isComplete regardless of input.
-    if (toolUse.isComplete) {
-      this.sawCompletedToolUse = true;
-      this.incompleteToolBlocks.delete(blockIndex);
-      const stopEvent = this.stateManager.handleContentBlockStop(blockIndex);
-      if (stopEvent) events.push(stopEvent);
-    } else {
-      // 上游按帧递增 input,同一 block 会多次进这里;流结束时仍在集合里的 = 被截断。
-      this.incompleteToolBlocks.add(blockIndex);
-    }
+    const stopEvent = this.stateManager.handleContentBlockStop(blockIndex);
+    if (stopEvent) events.push(stopEvent);
 
     return events;
   }
@@ -1422,17 +1504,18 @@ export class StreamContext {
     // 原样吐回（永不丢弃，见 tool-call-text.ts 文件头）。
     events.push(...this.settleTextPhases('finish'));
 
-    // ★ 截断的 tool_use 绝不能谎报成 `tool_use`(踩坑「截断 tool_use 谎报终态」)。
+    // ★ 截断的 tool_use 绝不能谎报成 `tool_use`
+    // (踩坑「截断 tool_use 必须阻止残缺调用到达客户端」)。
     //
     // 上游偶发「宣告 tool_use、发了几段 input 分片、却从未发 isComplete」就断流。
-    // 若此前已产出可见文本,流不判空 → 走正常终结段 → `closeOpenBlocks()` 补
+    // 旧实现中,若此前已产出可见文本,流不判空 → 走正常终结段 → `closeOpenBlocks()` 补
     // content_block_stop、stop_reason 兜底成 `tool_use`,客户端拿到「看似完整、实则
     // JSON 残缺」的调用,解析必然失败(Claude Code 报 `InputValidationError: JSON
     // parse failed`,用户侧表现为「首次调用某工具参数错误、重试就好」)。
     //
-    // 被砍断的输出语义上就是 `max_tokens`,客户端见到它会走截断处理而非按完整调用
-    // 解析。与 mid-stream Exception 同一条红线:绝不静默截断成看似完整的 message_stop。
-    // 只改终态、不删已发出的 block —— start 与 delta 早已在线上,撤不回。
+    // Buffered calls without isComplete never reach the wire. max_tokens describes
+    // the incomplete response; by itself it cannot prevent clients executing a
+    // malformed block before inspecting the terminal (verified with Claude Code).
     //
     // ★ `hasContent()` 是**必要**守卫,不是保险:上游只发「有名字、零 input」的 tool
     // 帧时三项都不置位 → hasContent() 为假 → 那是确定性空流,由 stream-handler 单次
@@ -1446,7 +1529,7 @@ export class StreamContext {
       // (CLAUDE.md 速查表),自伤事件混进同一个 msg 会让那条 runbook 每次断连
       // 都误报一次。故换 msg + 降级到 info,保留 self_inflicted 字段便于统计。
       const fields = {
-        incomplete_tool_blocks: this.incompleteToolBlocks.size,
+        incomplete_tool_blocks: this.pendingToolCalls.size,
         tool_names: [...this.seenToolUseNames],
         saw_completed_tool_use: this.sawCompletedToolUse,
         self_inflicted: this.gatewayTruncatedUpstream,
@@ -1461,14 +1544,40 @@ export class StreamContext {
       }
     }
 
-    // If only thinking was produced (no text, no tool_use),
-    // set stop_reason to max_tokens and emit a placeholder text block.
+    // ★ 有内容、无错误、却从未见 `metadataEvent` = 正文在帧边界干净 EOF(见 `sawMetadata`
+    // 字段注释)。放在截断 tool_use 之后、thinking-only 占位之前:前者已定 max_tokens
+    // 时这里是幂等的;后者依赖这里先定终态,才能给「只有 thinking 就断了」补占位文本。
+    // 错误路径不进来:显式错误帧 / 读流损坏走 in-band error 终结,与「说到一半」是两回事。
+    if (!this.sawMetadata && !this.pendingUpstreamError && this.hasContent()) {
+      this.stateManager.setStopReasonIfUnset('max_tokens');
+      const fields = {
+        stop_reason: this.stateManager.getStopReason(),
+        saw_visible_text: this.sawVisibleText,
+        saw_completed_tool_use: this.sawCompletedToolUse,
+        self_inflicted: this.gatewayTruncatedUpstream,
+      };
+      // 自伤归因同截断 tool_use:是我们掐断的上游就不算上游故障、降 info。
+      if (this.gatewayTruncatedUpstream) {
+        getLogger().info({
+          msg: 'stream ended without metadata frame after gateway-initiated upstream cancel',
+          ...fields,
+        });
+      } else {
+        getLogger().warn({
+          msg: 'upstream stream ended without metadata frame (clean EOF mid-response)',
+          ...fields,
+        });
+      }
+    }
+
+    // Thinking-only or discarded-tool-only output needs a harmless visible
+    // placeholder; preserve any explicit context-window terminal.
     if (
-      this.thinkingEnabled &&
-      this.thinkingExtracted &&
-      !this.stateManager.hasNonThinkingBlocks()
+      (this.thinkingExtracted || (this.hasIncompleteToolUse() && this.hasContent())) &&
+      !this.sawVisibleText &&
+      !this.sawCompletedToolUse
     ) {
-      this.stateManager.setStopReason('max_tokens');
+      this.stateManager.setStopReasonIfUnset('max_tokens');
       events.push(...this.createTextDeltaEvents(' '));
     }
 

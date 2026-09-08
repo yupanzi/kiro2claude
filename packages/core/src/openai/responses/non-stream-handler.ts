@@ -10,6 +10,7 @@ import type { ToolTextRegistry } from '../../claude/tool-call-text.js';
 import type { KiroProvider } from '../../kiro/provider.js';
 import type { HookBus } from '../../plugin-host/index.js';
 import { runOpenAiNonStream } from '../non-stream-transport.js';
+import type { ResponsesToolCodec } from './converter.js';
 import { buildResponsesObject } from './response-nonstream.js';
 
 export async function handleResponsesNonStreamRequest(
@@ -24,7 +25,7 @@ export async function handleResponsesNonStreamRequest(
   createdAt: number,
   emptyStreamRetries = 0,
   rescueRegistry: ToolTextRegistry | undefined,
-  customToolNames: ReadonlySet<string>,
+  codec: ResponsesToolCodec,
 ): Promise<MessageHandlerResult> {
   return runOpenAiNonStream(
     provider,
@@ -45,7 +46,9 @@ export async function handleResponsesNonStreamRequest(
         outputTokens: outputTok,
         createdAt,
         extensions,
-        customToolNames,
+        customToolNames: codec.customToolNames,
+        toolNamespaces: codec.toolNamespaces,
       }),
+    codec.customToolNames,
   );
 }

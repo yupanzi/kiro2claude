@@ -59,6 +59,18 @@ export function buildMeteringFrame(metering: KiroMeteringData): Buffer {
   );
 }
 
+/**
+ * Build the upstream's normal-completion marker frame. Real responses always end
+ * with metadataEvent → contextUsageEvent → meteringEvent (351/352 audited); a
+ * fixture that omits it models a clean EOF mid-response, not a finished reply.
+ */
+export function buildMetadataFrame(stopReason: string | undefined = 'END_TURN'): Buffer {
+  return encodeEventStreamFrame(
+    { ':message-type': 'event', ':event-type': 'metadataEvent' },
+    Buffer.from(JSON.stringify(stopReason === undefined ? {} : { stopReason }), 'utf-8'),
+  );
+}
+
 /** Build an AssistantResponse frame with the given text. */
 export function buildAssistantResponseFrame(content: string): Buffer {
   return encodeEventStreamFrame(
@@ -74,7 +86,7 @@ export function buildAssistantResponseFrame(content: string): Buffer {
  * metering frame exercises the usage/credits path.
  */
 export function framesWithMetering(metering: KiroMeteringData, content = 'hi'): Buffer[] {
-  return [buildAssistantResponseFrame(content), buildMeteringFrame(metering)];
+  return [buildAssistantResponseFrame(content), buildMetadataFrame(), buildMeteringFrame(metering)];
 }
 
 /**

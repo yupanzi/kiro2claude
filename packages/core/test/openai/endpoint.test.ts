@@ -15,6 +15,7 @@ import { HookBus } from '../../src/plugin-host/index.js';
 import { registerOpenAiRoutes } from '../../src/routes/openai.js';
 import { getRequestContext, requestContextStorage } from '../../src/shared/request-context.js';
 import {
+  buildMetadataFrame,
   buildMeteringFrame,
   buildToolUseFrame,
   framesWithMetering,
@@ -197,6 +198,7 @@ describe('/openai/v1 endpoint', () => {
   it('工具调用:非流式 message.tool_calls', async () => {
     const frames = [
       buildToolUseFrame('get_weather', 'call_0', '{"city":"Tokyo"}', true),
+      buildMetadataFrame(),
       buildMeteringFrame(METERING),
     ];
     app = await buildApp(frames);
@@ -218,6 +220,7 @@ describe('/openai/v1 endpoint', () => {
   it('工具调用:流式 tool_calls 增量', async () => {
     const frames = [
       buildToolUseFrame('get_weather', 'call_0', '{"city":"Tokyo"}', true),
+      buildMetadataFrame(),
       buildMeteringFrame(METERING),
     ];
     app = await buildApp(frames);

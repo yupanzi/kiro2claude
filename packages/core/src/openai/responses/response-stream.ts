@@ -27,12 +27,14 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { SseEvent } from '../../claude/stream.js';
 import { NO_FREEFORM_TOOLS, unwrapFreeformArgs } from '../freeform-tool.js';
+import { responsesIncompleteDetails } from './response-nonstream.js';
 import type {
   ResponsesObject,
   ResponsesOutputItem,
   ResponsesReasoningOutputItemOut,
   ResponsesUsage,
 } from './types.js';
+import { NO_TOOL_NAMESPACES } from './types.js';
 
 type MessageItem = {
   kind: 'message';
@@ -77,10 +79,28 @@ export class ResponsesEventEncoder {
   private outputIndex = 0;
   private current: CurrentItem | undefined;
   private readonly completedItems: ResponsesOutputItem[] = [];
+  private stopReason = 'end_turn';
 
-  constructor(model: string, customToolNames: ReadonlySet<string> = NO_FREEFORM_TOOLS) {
+  private readonly toolNamespaces: ReadonlyMap<string, string>;
+
+  constructor(
+    model: string,
+    customToolNames: ReadonlySet<string> = NO_FREEFORM_TOOLS,
+    toolNamespaces: ReadonlyMap<string, string> = NO_TOOL_NAMESPACES,
+  ) {
     this.model = model;
     this.customToolNames = customToolNames;
+    this.toolNamespaces = toolNamespaces;
+  }
+
+  /**
+   * 工具调用所属 namespace。客户端 router **按它分发**:`collaboration` 的六个 subagent
+   * 工具少了这个字段就一律 `unsupported call`(理由见 converter.ts `expandNamespaces`)。
+   * 默认 `functions` 命名空间的工具按裸名回调,不在表里 → 不写字段,保持原样。
+   */
+  private namespaceFields(name: string): { namespace?: string } {
+    const namespace = this.toolNamespaces.get(name);
+    return namespace ? { namespace } : {};
   }
 
   /** 把事件对象序列化成一行 SSE(带自增 sequence_number)。 */
@@ -151,7 +171,13 @@ export class ResponsesEventEncoder {
       case 'content_block_stop':
         return this.closeIfCurrent(ev.data.index as number);
 
-      // message_delta / message_stop / ping:completion 由 handler 调 finalize() 收口
+      case 'message_delta': {
+        const delta = ev.data.delta as { stop_reason?: string } | undefined;
+        if (delta?.stop_reason) this.stopReason = delta.stop_reason;
+        return [];
+      }
+
+      // message_stop / ping:completion 由 handler 调 finalize() 收口
       default:
         return [];
     }
@@ -284,6 +310,7 @@ export class ResponsesEventEncoder {
               type: 'function_call',
               call_id: callId,
               name,
+              ...this.namespaceFields(name),
               arguments: '',
               status: 'in_progress',
             },
@@ -433,6 +460,7 @@ export class ResponsesEventEncoder {
         type: 'function_call',
         call_id: cur.callId,
         name: cur.name,
+        ...this.namespaceFields(cur.name),
         arguments: cur.args,
         status: 'completed',
       },
@@ -464,12 +492,14 @@ export class ResponsesEventEncoder {
     return out;
   }
 
-  /** 收口:关掉残留 open item,发 response.completed(带完整 output + usage)。 */
+  /** 收口:发 completed/incomplete,保留实际已接收的 output 与 usage。 */
   finalize(usage: ResponsesUsage): string[] {
     const out = this.closeCurrent();
-    const resp = this.responseObject('completed');
+    const incompleteDetails = responsesIncompleteDetails(this.stopReason);
+    const resp = this.responseObject(incompleteDetails ? 'incomplete' : 'completed');
+    resp.incomplete_details = incompleteDetails;
     resp.usage = usage;
-    out.push(this.line({ type: 'response.completed', response: resp }));
+    out.push(this.line({ type: `response.${resp.status}`, response: resp }));
     return out;
   }
 

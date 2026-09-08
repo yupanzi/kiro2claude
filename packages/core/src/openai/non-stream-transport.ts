@@ -16,6 +16,7 @@ import {
 } from '../claude/non-stream-reduce.js';
 import {
   buildKiroUsageFinishEvent,
+  canRetryZeroWorkRejection,
   isMeteringLost,
   type PluginUsageExtensions,
   resolvePluginUsageExtensions,
@@ -58,6 +59,7 @@ export async function runOpenAiNonStream(
     completionTokens: number,
     extensions: PluginUsageExtensions | undefined,
   ) => unknown,
+  allowRawToolInputs?: ReadonlySet<string>,
 ): Promise<MessageHandlerResult> {
   const log = getLogger();
   const apiStart = Date.now();
@@ -101,12 +103,22 @@ export async function runOpenAiNonStream(
       thinkingEnabled,
       toolNameMap,
       rescueRegistry,
+      allowRawToolInputs,
     );
     const finalInputTokens = reduced.contextInputTokens ?? inputTokens;
     // hook 与终态日志各取一次,物化一份避免重复 Object.fromEntries。
     const eventCounts = Object.fromEntries(reduced.eventCounts);
 
     if (reduced.upstreamError) {
+      if (
+        canRetryZeroWorkRejection(reduced.upstreamError, eventCounts) &&
+        attempt < maxAttempts &&
+        !aborted.value
+      ) {
+        emptyAttempts++;
+        log.warn({ msg: 'openai non-stream: zero-frame rejection, retrying', attempt });
+        continue;
+      }
       if (reduced.kiroMetering) {
         const hookEvent = buildKiroUsageFinishEvent({
           model,
@@ -133,14 +145,20 @@ export async function runOpenAiNonStream(
 
     if (reduced.silentFailure) {
       emptyAttempts++;
-      if (attempt < maxAttempts && !aborted.value) {
+      const truncatedToolUse = reduced.stopReason === 'tool_use';
+      if (attempt < maxAttempts && !aborted.value && !truncatedToolUse) {
         log.warn({ msg: 'openai non-stream: empty response, retrying', attempt });
         continue;
       }
       log.warn({ msg: 'openai non-stream: empty response', empty_attempts: emptyAttempts });
       reply
         .status(503)
-        .send(createOpenAiError(selectEmptyUpstreamMessage(emptyAttempts), 'overloaded_error'));
+        .send(
+          createOpenAiError(
+            selectEmptyUpstreamMessage(emptyAttempts, truncatedToolUse),
+            'overloaded_error',
+          ),
+        );
       return { emptyResponse: true, emptyAttempts };
     }
 

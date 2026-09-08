@@ -334,7 +334,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
 
   it('client disconnects before metering frame: drains to it, runs hook once with credit, stops writing', async () => {
     const metering = { unit: 'credit', unitPlural: 'credits', usage: 0.0048 };
-    const [assistantFrame, meteringFrame] = framesWithMetering(metering);
+    const [assistantFrame, ...tailFrames] = framesWithMetering(metering);
 
     // `reachedGate` fires once the assistant frame has been consumed; `gate`
     // holds the tail metering frame until the test simulates a disconnect.
@@ -351,7 +351,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
       yield assistantFrame; // outputTokens > 0; forwarded while client connected
       reachedGate(); // first frame consumed → about to pause
       await gatePromise; // hold the tail until the test disconnects the client
-      yield meteringFrame; // arrives AFTER disconnect → only the drain captures it
+      yield* tailFrames; // arrives AFTER disconnect → only the drain captures it
     }
 
     const provider = makeStubProvider({
@@ -380,7 +380,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
     // 销毁 socket → 读流抛错;stub 如实模拟(abort 后抛错而非续吐尾帧)。断言 abort 的
     // 真实后果:hook 仍恰好一次(用 abort 前的部分数据),但尾帧 metering 未被捕获
     // (credits=undefined,对照 drain 测试的 0.0048)——#20「省 credit、记账偏低」的证据。
-    const [assistantFrame, meteringFrame] = framesWithMetering({
+    const [assistantFrame, ...tailFrames] = framesWithMetering({
       unit: 'credit',
       unitPlural: 'credits',
       usage: 0.0048,
@@ -397,7 +397,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
           await gate.wait;
           // abort 已触发 → 模拟 axios 销毁 socket 使读流中断,而非像 drain 那样续吐尾帧。
           if (signal?.aborted) throw new Error('simulated upstream socket teardown on abort');
-          yield meteringFrame;
+          yield* tailFrames;
         }
         return makeStreamResponse(signalAwareStream());
       },
@@ -437,7 +437,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
   it('does NOT abort the upstream signal on disconnect by default (drains the tail for billing)', async () => {
     // 对照:默认(abortUpstreamOnDisconnect=false)时断连走 drain,signal 不 abort,
     // 尾帧 metering 仍被捕获(credits=0.0048,对照上面 abort 测试的 undefined)。
-    const [assistantFrame, meteringFrame] = framesWithMetering({
+    const [assistantFrame, ...tailFrames] = framesWithMetering({
       unit: 'credit',
       unitPlural: 'credits',
       usage: 0.0048,
@@ -452,7 +452,7 @@ describe('handlers stream: client disconnect drains upstream for billing', () =>
           yield assistantFrame;
           gate.reach();
           await gate.wait;
-          yield meteringFrame;
+          yield* tailFrames;
         }
         return makeStreamResponse(gatedStream());
       },

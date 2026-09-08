@@ -30,6 +30,7 @@ import { HookBus } from '../../src/plugin-host/index.js';
 import { registerClaudeRoutes } from '../../src/routes/claude.js';
 import {
   buildAssistantResponseFrame,
+  buildMetadataFrame,
   buildReasoningContentFrame,
   framesWithMetering,
 } from '../helpers/event-stream.js';
@@ -249,7 +250,10 @@ describe('handlers: POST /claude/v1/messages - happy path', () => {
 
   it('returns 200 with assistant content when upstream emits assistantResponseEvent', async () => {
     const provider = makeStubProvider({
-      callApi: async () => makeAxiosResponse(buildAssistantResponseFrame('hi from kiro')),
+      callApi: async () =>
+        makeAxiosResponse(
+          Buffer.concat([buildAssistantResponseFrame('hi from kiro'), buildMetadataFrame()]),
+        ),
     });
     app = await buildApp(provider);
     const response = await app.inject({
@@ -276,7 +280,7 @@ describe('handlers: POST /claude/v1/messages - happy path', () => {
     expect(provider.callApi).toHaveBeenCalledTimes(1);
   });
 
-  it('returns a signature-only native thinking block instead of treating it as an empty 503', async () => {
+  it('keeps signature-only native thinking but marks the response incomplete', async () => {
     const provider = makeStubProvider({
       callApi: async () => makeAxiosResponse(buildReasoningContentFrame('', 'native-signature')),
     });
@@ -290,11 +294,14 @@ describe('handlers: POST /claude/v1/messages - happy path', () => {
 
     expect(response.statusCode).toBe(200);
     const body = response.json() as {
-      content: Array<{ type: string; thinking?: string; signature?: string }>;
+      content: Array<{ type: string; thinking?: string; signature?: string; text?: string }>;
+      stop_reason: string;
     };
     expect(body.content).toEqual([
       { type: 'thinking', thinking: '', signature: 'native-signature' },
+      { type: 'text', text: ' ' },
     ]);
+    expect(body.stop_reason).toBe('max_tokens');
     expect(provider.callApi).toHaveBeenCalledTimes(1);
   });
 

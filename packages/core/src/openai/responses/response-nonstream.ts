@@ -12,6 +12,16 @@ import { type ReducedAttempt, reducedReasoning } from '../../claude/non-stream-r
 import { mergeUsageExtensions, type PluginUsageExtensions } from '../../claude/stream.js';
 import { NO_FREEFORM_TOOLS, unwrapFreeformInput } from '../freeform-tool.js';
 import type { ResponsesObject, ResponsesOutputItem, ResponsesUsage } from './types.js';
+import { NO_TOOL_NAMESPACES } from './types.js';
+
+/** Both output exhaustion and context exhaustion use the Responses token-limit reason. */
+export function responsesIncompleteDetails(
+  stopReason: string,
+): ResponsesObject['incomplete_details'] {
+  return stopReason === 'max_tokens' || stopReason === 'model_context_window_exceeded'
+    ? { reason: 'max_output_tokens' }
+    : null;
+}
 
 export function buildResponsesUsage(
   inputTokens: number,
@@ -36,6 +46,8 @@ export function buildResponsesObject(args: {
   extensions?: PluginUsageExtensions;
   /** freeform 工具名(请求侧收集);命中者产 custom_tool_call 而非 function_call。 */
   customToolNames?: ReadonlySet<string>;
+  /** 工具名 → namespace(请求侧收集);流式侧同一分派见 response-stream.ts。 */
+  toolNamespaces?: ReadonlyMap<string, string>;
 }): ResponsesObject {
   const {
     reduced,
@@ -45,9 +57,11 @@ export function buildResponsesObject(args: {
     createdAt,
     extensions,
     customToolNames = NO_FREEFORM_TOOLS,
+    toolNamespaces = NO_TOOL_NAMESPACES,
   } = args;
 
   const output: ResponsesOutputItem[] = [];
+  const incompleteDetails = responsesIncompleteDetails(reduced.stopReason);
 
   // reasoning 先于 message/function_call(协议顺序)。Claude 明文思维链经 summary 通道
   // surface;GPT 加密 reasoning 使 reasoningText 保持空 → 不产 item(与流式惰性开对齐)。
@@ -88,6 +102,8 @@ export function buildResponsesObject(args: {
             ...base,
             id: `fc_${uid}`,
             type: 'function_call',
+            // 客户端 router 按 namespace 分发,少了它 subagent 调用一律 unsupported。
+            ...(toolNamespaces.get(name) ? { namespace: toolNamespaces.get(name) } : {}),
             arguments: JSON.stringify(tu.input ?? {}),
           },
     );
@@ -97,12 +113,12 @@ export function buildResponsesObject(args: {
     id: `resp_${uuidv4().replace(/-/g, '')}`,
     object: 'response',
     created_at: createdAt,
-    status: 'completed',
+    status: incompleteDetails ? 'incomplete' : 'completed',
     model,
     output,
     usage: buildResponsesUsage(inputTokens, outputTokens, extensions),
     error: null,
-    incomplete_details: null,
+    incomplete_details: incompleteDetails,
     metadata: {},
   };
 }

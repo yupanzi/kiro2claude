@@ -23,8 +23,8 @@ import { reduceKiroResponse } from './non-stream-reduce.js';
 import {
   buildClaudeUsagePayload,
   buildKiroUsageFinishEvent,
+  canRetryZeroWorkRejection,
   isMeteringLost,
-  sawBillableWork,
   selectEmptyUpstreamMessage,
   upstreamErrorWire,
 } from './stream.js';
@@ -143,7 +143,11 @@ export async function handleNonStreamRequest(
       // 恢复且无成本可烧 → 走与空响应相同的有界重试。上游**已开工**才是确定性终止,
       // 那时重发只会再烧一遍。与流式路径 deterministicUpstreamError 对称;判据用
       // sawBillableWork 而非「有无 toolUses/文本」(GPT 加密 reasoning 不可见但计费)。
-      if (!sawBillableWork(finalEventCounts) && attempt < maxAttempts && !aborted.value) {
+      if (
+        canRetryZeroWorkRejection(upstreamError, finalEventCounts) &&
+        attempt < maxAttempts &&
+        !aborted.value
+      ) {
         emptyAttempts++;
         log.warn({
           msg: 'upstream rejected with zero frames (non-stream), retrying',

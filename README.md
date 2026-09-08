@@ -19,7 +19,7 @@
 - **插件化,全 MIT**——计量、credit 反演都是插件,经 [`@kiro2claude/plugin-api`](./packages/plugin-api/) 契约接入;写自己的插件不用碰 core。
 - **零配置文件**——纯环境变量,复用 kiro-cli 的 SQLite 凭据,token 到期自动刷新。
 
-此外 Vision、流式 SSE、WebSearch(`web_search_20250305` → Kiro MCP)、`count_tokens` 开箱即用。
+此外支持 Vision、流式 SSE 和 `count_tokens`。Messages 接口还支持 hosted WebSearch(`web_search_20250305` → Kiro MCP),流式与非流式均保留结构化搜索结果及来源 URL。
 
 ## 架构
 
@@ -125,6 +125,18 @@ pnpm run ci      # biome ci + typecheck + test
 ```
 
 pnpm workspace,Node ≥ 22 / TypeScript / ES Modules。husky pre-commit 强制 `biome check + typecheck + vitest`,`pnpm install` 后自动生效;提交遵循 [Conventional Commits](https://www.conventionalcommits.org/),细节见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+## 已知限制
+
+网关只能修上游 wire 与协议翻译层的问题;下面这些在链路里仍然存在,单测全绿不等于会话无损:
+
+- **continuation 文案偶发进正文**:请求以 assistant 结尾时(prefill 或上轮中断的续接),Kiro 只接受 user 作为当前消息,网关把该 assistant 内容留在历史并追加一句续写指令。实测 7 次里 2 次模型把指令句尾复述进可见输出。相比修复前(prefill 场景 3/3 破损)是净改进,但不到 100%,也不是字节级 prefill。
+- **客户端省略的历史无法还原**:上轮的 thinking、被自动压缩掉的内容不再随请求发来时,网关没有跨请求存储,不擅自复活。Claude Code 自动压缩(实测约第 50 个请求触发)保留主线任务与未完成项,但会丢部分 API 签名、返回结构、错误码拼写等细节。
+- **GPT 加密 reasoning 不可见**:上游只给加密 blob,没有可重放的输入字段,网关不伪装成明文。
+- **错误前已输出的文字留在客户端历史**:上游中途报错时,之前已流出的正文客户端已经收到并保存;保留原文不等于它经过验证。
+- **Claude Code 2.1.263 的 Unicode 转义改写(客户端侧)**:工具参数里字面的 `\u0000` / `\u000a` JSON 转义序列会被 CLI 还原成真实 NUL / LF,导致 Bash 参数校验失败、Write 写坏源码。绕过网关直连 Anthropic 同样复现,整块 / 7 字符 / 逐字符 / `\u005c` 等价编码四种分片方式无一幸免。网关不做双重转义、不改写工具命令。零上游复现:`packages/core/test/manual/claude-unicode-input-probe.mjs`。
+
+已修复且有守卫的那些(帧边界 EOF 当成功、截断 tool_use 到达客户端、坏帧后拼接正文、孤儿 tool_result、空流当正常完成等)见 [CLAUDE.md](./CLAUDE.md) 踩坑「流式传输」组;真实 CLI 复跑入口在 `packages/core/test/manual/`。
 
 ## 文档
 

@@ -23,7 +23,7 @@ import { getLogger } from '../../shared/logger.js';
 import { getRequestContext } from '../../shared/request-context.js';
 import { countAllTokens } from '../../token.js';
 import { createOpenAiError } from '../types.js';
-import { convertResponsesRequest } from './converter.js';
+import { convertResponsesRequest, type ResponsesToolCodec } from './converter.js';
 import { handleResponsesNonStreamRequest } from './non-stream-handler.js';
 import { handleResponsesStreamRequest } from './stream-handler.js';
 import type { ResponsesRequest } from './types.js';
@@ -50,9 +50,9 @@ export function createPostResponses(deps: PostMessagesDeps) {
     // additional_tools 里),读顶层会把这类请求恒记成 0,而「工具全丢」只在这个字段上可见。
     // 转换抛错时也不能把这行吞掉(那正是最需要它的时候),故兜住异常补记再抛。
     let payload: MessagesRequest;
-    let customToolNames: ReadonlySet<string>;
+    let codec: ResponsesToolCodec;
     try {
-      ({ payload, customToolNames } = convertResponsesRequest(oaiReq));
+      ({ payload, codec } = convertResponsesRequest(oaiReq));
     } catch (e) {
       log.info({
         msg: 'POST /openai/v1/responses',
@@ -70,7 +70,8 @@ export function createPostResponses(deps: PostMessagesDeps) {
       stream,
       input_type: Array.isArray(oaiReq.input) ? `items[${oaiReq.input.length}]` : 'string',
       tool_count: payload.tools?.length ?? 0,
-      custom_tool_count: customToolNames.size,
+      custom_tool_count: codec.customToolNames.size,
+      namespaced_tool_count: codec.toolNamespaces.size,
       reasoning_effort: oaiReq.reasoning?.effort,
     });
 
@@ -140,7 +141,7 @@ export function createPostResponses(deps: PostMessagesDeps) {
         reply,
         deps.emptyStreamRetries,
         rescueRegistry,
-        customToolNames,
+        codec,
       );
     } else {
       result = await handleResponsesNonStreamRequest(
@@ -155,7 +156,7 @@ export function createPostResponses(deps: PostMessagesDeps) {
         Math.floor(Date.now() / 1000),
         deps.emptyStreamRetries,
         rescueRegistry,
-        customToolNames,
+        codec,
       );
     }
 

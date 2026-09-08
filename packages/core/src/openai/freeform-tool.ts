@@ -57,11 +57,12 @@ function readFreeformField(value: unknown): string | undefined {
 }
 
 /**
- * 替身对象 → 裸文本。取不到字符串就给空串:非流式侧 reducer 在参数 JSON 解析失败时把
- * buffer 丢成 `{}`(`claude/non-stream-reduce.ts`),原文到不了这里,没有可回退的东西。
- * 流式侧还留着原始累积串,故另走 `unwrapFreeformArgs`。
+ * 替身对象或完整原始参数串 → 裸文本。非流式 reducer 对显式允许 raw input 的
+ * 工具保留原串,由同一个 unwrapFreeformArgs 解释 wrapper/raw fallback;共享归约层
+ * 不认识替身字段。历史对象形态仍兼容,缺字符串字段时保持空串回退。
  */
 export function unwrapFreeformInput(value: unknown): string {
+  if (typeof value === 'string') return unwrapFreeformArgs(value);
   return readFreeformField(value) ?? '';
 }
 

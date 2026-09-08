@@ -471,28 +471,35 @@ export class SingleTokenManager {
   /**
    * 执行一次 token 刷新；刷新失败时带一次 stale-token 重试。
    *
-   * 第一次刷新若返回 400/401，通常意味着 kiro-cli 通过再次登录旋转了
-   * refresh_token。此时从 SQLite 重读一次最新凭据再试。必须在持有
-   * `_refreshLock` 时调用。
+   * 第一次刷新若返回 400/401(包括 invalid_grant)，可能是 kiro-cli 再次登录
+   * 旋转了凭据。从 SQLite 重读一次；永久失败只能用确已更新的凭据恢复，不能
+   * 重试同一个失效 refresh token。必须在持有 `_refreshLock` 时调用，且验证
+   * 成功前不得替换内存凭据或持久化源。
    */
   private async doRefresh(): Promise<void> {
     let newCreds: KiroCredentials;
+    let newSource = this._source;
     try {
       newCreds = await refreshToken(this._credentials, this._config);
     } catch (e: unknown) {
       if (this.shouldRetryFromSqlite(e)) {
         getLogger().warn({ msg: 'token refresh failed, reloading from SQLite', error: String(e) });
-        newCreds = await this.reloadAndRetryRefresh();
+        ({ credentials: newCreds, source: newSource } = await this.reloadAndRetryRefresh(e));
       } else {
         throw e;
       }
     }
 
-    if (isTokenExpired(newCreds)) {
+    if (
+      typeof newCreds.accessToken !== 'string' ||
+      !newCreds.accessToken ||
+      isTokenExpired(newCreds)
+    ) {
       throw new Error('Refreshed token is still invalid or expired');
     }
 
     this._credentials = { ...newCreds };
+    this._source = newSource;
     this.persistRefreshedCredentials();
   }
 
@@ -501,25 +508,51 @@ export class SingleTokenManager {
    *
    * 400/401 通常意味着 refresh token 在 OIDC 端已经被作废——常见于另一
    * 台机器或本机的 kiro-cli 在此期间重新走了一次 device flow 刷新出了
-   * 新的 refresh token。400 + invalid_grant 会先被 `RefreshTokenInvalidError`
-   * 截获，永远不会走到这里，所以此处只剩下"用 SQLite 里的最新值再试一次"
-   * 这条恢复路径。
+   * 新的 refresh token。`RefreshTokenInvalidError` 只说明内存中的 token 失效，
+   * 不代表 SQLite 里的新登录也失效；是否允许重试由重读后的凭据变化决定。
    */
   private shouldRetryFromSqlite(error: unknown): boolean {
-    return error instanceof KiroHttpError && (error.status === 400 || error.status === 401);
+    return (
+      error instanceof RefreshTokenInvalidError ||
+      (error instanceof KiroHttpError && (error.status === 400 || error.status === 401))
+    );
   }
 
-  /** 从 SQLite 重读凭据并再试一次刷新 */
-  private async reloadAndRetryRefresh(): Promise<KiroCredentials> {
+  /** 从 SQLite 重读一次；返回候选凭据，由 doRefresh 验证后统一提交。 */
+  private async reloadAndRetryRefresh(
+    originalError: unknown,
+  ): Promise<{ credentials: KiroCredentials; source: SqliteCredentialSource }> {
     const result = reloadFromSqlite(this._source);
-    if (!result) throw new Error('SQLite reload found no credentials');
+    if (!result) {
+      if (originalError instanceof RefreshTokenInvalidError) throw originalError;
+      throw new Error('SQLite reload found no credentials');
+    }
 
-    // 更新内存中的凭据和持久化源
-    this._credentials = { ...result.credentials };
-    this._source = result.source;
+    if (originalError instanceof RefreshTokenInvalidError) {
+      const candidate = result.credentials;
+      // 本机新登录的 bearer 可直接使用；相同 bearer 即使 expiry 被改新，也不能
+      // 当作恢复成功(forceRefreshToken 可能正是在处理这个 bearer 的 401)。
+      if (
+        typeof candidate.accessToken === 'string' &&
+        candidate.accessToken.length > 0 &&
+        candidate.accessToken !== this._credentials.accessToken &&
+        !isTokenExpired(candidate) &&
+        !isTokenExpiringSoon(candidate)
+      ) {
+        return result;
+      }
 
-    // 用重读出来的新凭据再试一次刷新
-    return await refreshToken(this._credentials, this._config);
+      const refreshChanged =
+        candidate.refreshToken !== this._credentials.refreshToken ||
+        candidate.clientId !== this._credentials.clientId ||
+        candidate.clientSecret !== this._credentials.clientSecret ||
+        credentialEffectiveAuthRegion(candidate, this._config) !==
+          credentialEffectiveAuthRegion(this._credentials, this._config);
+      if (!refreshChanged) throw originalError;
+    }
+
+    // 至多一次重试，不递归；OIDC 再失败时保留原内存与 SQLite，等待后续真正的新登录。
+    return { ...result, credentials: await refreshToken(result.credentials, this._config) };
   }
 
   /**

@@ -15,6 +15,7 @@ import type { FastifyReply } from 'fastify';
 import type { MessageHandlerResult } from '../claude/empty-capture.js';
 import {
   awaitDrain,
+  canRetryZeroWorkRejection,
   isMeteringLost,
   type SseEvent,
   StreamContext,
@@ -72,6 +73,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   reply: FastifyReply,
   emptyStreamRetries = 0,
   rescueRegistry?: ToolTextRegistry,
+  allowRawToolInputs?: ReadonlySet<string>,
 ): Promise<MessageHandlerResult> {
   const log = getLogger();
   const apiStart = Date.now();
@@ -133,6 +135,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     toolNameMap,
     hookBus,
     rescueRegistry,
+    allowRawToolInputs,
   );
   let encoder = protocol.makeEncoder(model);
   let buffered: string[] = [];
@@ -184,6 +187,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
 
   const maxAttempts = 1 + Math.max(0, emptyStreamRetries);
   let emptyAttempts = 0;
+  let deterministicEmpty = false;
 
   for (let attempt = 1; ; attempt++) {
     if (aborted.value) break;
@@ -209,6 +213,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
       toolNameMap,
       hookBus,
       rescueRegistry,
+      allowRawToolInputs,
     );
     encoder = protocol.makeEncoder(model);
     buffered = [];
@@ -238,24 +243,29 @@ export async function runOpenAiStream<E extends StreamEncoder>(
           decoder.feed(buf);
         } catch (e) {
           log.warn({ msg: 'buffer overflow in decoder (openai)', error: String(e) });
+          ctx.recordStreamReadError(e);
         }
         for (const result of decoder.drainAll()) {
           if (!('frame' in result)) {
             log.warn({ msg: 'event decode failed (openai)', error: String(result.error) });
+            ctx.recordStreamReadError(result.error);
             continue;
           }
           let sseEvents: SseEvent[];
           try {
             sseEvents = ctx.processKiroEvent(eventFromFrame(result.frame));
-          } catch {
+          } catch (e) {
+            ctx.recordStreamReadError(e);
             continue;
           }
           emit(sseEvents);
-          if (!committed && !aborted.value && hasContent()) commit();
+          if (!committed && !aborted.value && hasContent() && !ctx.getPendingUpstreamError())
+            commit();
           // 见 claude/stream-handler.ts 同位置:读得慢就等,别把背压当断连。
           if (committed && !aborted.value) await awaitDrain(reply.raw);
         }
       }
+      if (!ctx.getPendingUpstreamError()?.bodyReadFailed) decoder.assertComplete();
     } catch (e) {
       if (graceDestroyed) {
         log.info({
@@ -264,6 +274,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
         });
       } else {
         log.error({ msg: 'error reading response stream (openai)', error: String(e) });
+        ctx.recordStreamReadError(e);
       }
     } finally {
       draining = false;
@@ -275,12 +286,23 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     }
 
     const attemptStop = ctx.stateManager.getStopReason();
+    // Keep the Claude retry policy: a tool shell is deterministic, whereas an
+    // explicit rejection before any billable work can recover on another try.
+    const truncatedToolUse = !hasContent() && ctx.hasIncompleteToolUse();
+    const pendingError = ctx.getPendingUpstreamError();
+    const deterministicUpstreamError =
+      pendingError && !canRetryZeroWorkRejection(pendingError, ctx.getEventCounts());
     if (
       hasContent() ||
       attemptStop === 'max_tokens' ||
       attemptStop === 'model_context_window_exceeded' ||
-      ctx.getPendingUpstreamError() !== undefined
+      truncatedToolUse ||
+      deterministicUpstreamError
     ) {
+      if (truncatedToolUse) {
+        emptyAttempts++;
+        deterministicEmpty = true;
+      }
       break;
     }
 
@@ -297,7 +319,11 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   if (commitTimer) clearTimeout(commitTimer);
   if (drainGraceTimer) clearTimeout(drainGraceTimer);
 
-  const silentFailure = !hasContent();
+  const terminalStop = ctx.stateManager.getStopReason();
+  const silentFailure =
+    !hasContent() &&
+    terminalStop !== 'max_tokens' &&
+    terminalStop !== 'model_context_window_exceeded';
   const logFields = {
     model,
     output_tokens: ctx.outputTokens,
@@ -319,6 +345,8 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   const upstreamError = ctx.getPendingUpstreamError();
   if (upstreamError) {
     const { status, errorType, message } = upstreamErrorWire(upstreamError.retryable);
+    const closeEvents =
+      committed || ctx.kiroMeteringRaw ? await ctx.generateFinalEvents(false) : [];
     if (!committed) {
       if (!aborted.value) {
         log.warn({
@@ -338,11 +366,8 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     // generateFinalEvents(false) 跑计费 hook(恰好一次)+ 关掉仍打开的 block
     // (content_block_stop 等)。这些关块事件**必须**过 encoder 写出:Responses
     // 编码器据此给 open output item 补 output_item.done,否则 Codex 收到悬空
-    // in_progress item(踩坑「Codex 只说 Responses」)。镜像 claude/stream-handler.ts 的同路径。chat
-    // 编码器对 content_block_stop 仅在「打开着的无参数工具块」补一个合法 `{}` 增量
-    // (见 response-stream.ts 空输入工具兜底),其余情形不产 chunk——即把可能截断的
-    // 半截工具参数补成合法 JSON 再收尾,输出仍有效。
-    const closeEvents = await ctx.generateFinalEvents(false);
+    // in_progress item(踩坑「Codex 只说 Responses」)。镜像 claude/stream-handler.ts。
+    // 未完成工具仍在 StreamContext 内缓存,从未发出 start,这里也不会替其补 stop。
     if (!aborted.value) {
       for (const ev of closeEvents) {
         let broke = false;
@@ -362,7 +387,7 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   }
 
   if (silentFailure) {
-    const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts);
+    const emptyMessage = selectEmptyUpstreamMessage(emptyAttempts, deterministicEmpty);
     if (!committed) {
       if (!aborted.value) {
         log.warn({ msg: 'openai: upstream empty stream, sending 503', ...logFields });
@@ -382,8 +407,10 @@ export async function runOpenAiStream<E extends StreamEncoder>(
   }
 
   // 正常终结:generateFinalEvents 跑计费 hook(恰好一次),其 SseEvent 过 encoder,
-  // 再由 protocol.finalTerminal 追加协议终止行(chat: usage+[DONE];responses: completed)。
+  // 再由 protocol.finalTerminal 追加协议终止行(chat: usage+[DONE];responses: completed/incomplete)。
+  if (!committed && !aborted.value) commit();
   const finalEvents = await ctx.generateFinalEvents();
+  if (pingInterval) clearInterval(pingInterval);
   if (committed && !aborted.value) {
     for (const ev of finalEvents) {
       let broke = false;
@@ -400,7 +427,12 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     }
   }
 
-  log.info({ msg: 'openai stream completed', ...logFields });
+  // 同 claude/stream-handler.ts:记终结段之后的 stop_reason,别记快照。
+  log.info({
+    msg: 'openai stream completed',
+    ...logFields,
+    stop_reason: ctx.stateManager.getStopReason(),
+  });
   if (committed) safeEnd(reply.raw);
   return { emptyResponse: false, emptyAttempts };
 }

@@ -45,6 +45,7 @@ import http from 'node:http';
 import {
   buildAssistantResponseFrame,
   buildContextUsageFrame,
+  buildMetadataFrame,
   buildMeteringFrame,
   buildToolUseFrame,
 } from '../helpers/event-stream.js';
@@ -84,6 +85,12 @@ const PROBE_HEADERS: Record<string, string> = process.env.PROBE_RESP_HEADERS
   ? JSON.parse(process.env.PROBE_RESP_HEADERS)
   : {};
 const PROBE_BODY = process.env.PROBE_RESP_BODY ?? '{"message":"probe"}';
+/**
+ * 伪造流的收尾形态。`full`(默认)= 真实上游的完整尾段 metadata → contextUsage →
+ * metering;`text-eof` = 只发正文就 EOF(帧边界干净截断,无任何尾帧),用来观察
+ * kiro-cli 自己把这种流当「说完了」还是当故障(重试 / 报错)。
+ */
+const PROBE_STREAM_SHAPE = process.env.PROBE_STREAM_SHAPE ?? 'full';
 
 fs.mkdirSync(DIR, { recursive: true });
 const records: unknown[] = [];
@@ -101,6 +108,8 @@ function fakeStream(): Buffer {
   } else {
     frames.push(buildAssistantResponseFrame('探针回复。'));
   }
+  if (PROBE_STREAM_SHAPE === 'text-eof') return Buffer.concat(frames);
+  frames.push(buildMetadataFrame());
   frames.push(buildContextUsageFrame(5));
   frames.push(metering());
   return Buffer.concat(frames);
@@ -177,6 +186,6 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   process.stdout.write(
-    `probe listening on ${PORT} (tool=${PROBE_TOOL || '-'} status=${PROBE_STATUS})\n`,
+    `probe listening on ${PORT} (tool=${PROBE_TOOL || '-'} status=${PROBE_STATUS} shape=${PROBE_STREAM_SHAPE})\n`,
   );
 });

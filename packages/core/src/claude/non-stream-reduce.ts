@@ -27,8 +27,10 @@ import {
   classifyUpstreamErrorEvent,
   computeHasContent,
   type PendingUpstreamError,
+  streamReadError,
 } from './stream.js';
 import { extractToolCallsFromCompleteText, type ToolTextRegistry } from './tool-call-text.js';
+import { parseCompletedToolInput, ToolUseSequence } from './tool-use-sequence.js';
 
 /** 一次上游响应归约后的完整结果。 */
 export interface ReducedAttempt {
@@ -74,15 +76,18 @@ export function reduceKiroResponse(
   thinkingEnabled: boolean,
   toolNameMap: Map<string, string>,
   rescueRegistry: ToolTextRegistry | undefined,
+  allowRawToolInputs?: ReadonlySet<string>,
 ): ReducedAttempt {
   const log = getLogger();
 
   // Parse event stream
   const decoder = new EventStreamDecoder();
+  let decodeError: PendingUpstreamError | undefined;
   try {
     decoder.feed(bodyBytes);
   } catch (e) {
     log.warn({ msg: 'buffer overflow in decoder', error: String(e) });
+    decodeError = streamReadError(e);
   }
 
   let textContent = '';
@@ -108,9 +113,10 @@ export function reduceKiroResponse(
     }
   };
   const toolUses: Record<string, unknown>[] = [];
+  const toolUseSequence = new ToolUseSequence();
   let hasToolUse = false;
   /**
-   * 已宣告但从未收到 `isComplete` 的 tool_use id —— 流式 `incompleteToolBlocks` 的
+   * 已宣告但从未收到 `isComplete` 的 tool_use id —— 流式 `pendingToolCalls` 的
    * 非流式拼写(红线:语法同源还不够,**终态判定也必须同源**)。
    *
    * 这边残缺调用会被直接丢弃(只在 isComplete 时 push),不会吐出残缺 JSON;但
@@ -118,6 +124,8 @@ export function reduceKiroResponse(
    */
   const incompleteToolIds = new Set<string>();
   let stopReason = 'end_turn';
+  /** 上游发过 `metadataEvent`(生成正常收尾的标记;与流式 `sawMetadata` 同源)。 */
+  let sawMetadata = false;
   let contextInputTokens: number | undefined;
   let kiroMetering: KiroMeteringData | undefined;
   // kiro-cli 2.6.0+ 原生 reasoning 累积。任意 native event 都会锁定该路径，
@@ -145,17 +153,30 @@ export function reduceKiroResponse(
   for (const result of decoder.drainAll()) {
     if (!('frame' in result)) {
       log.warn({ msg: 'event decode failed', error: String(result.error) });
+      decodeError ??= streamReadError(result.error);
       continue;
     }
 
     let event: Event;
     try {
       event = eventFromFrame(result.frame);
-    } catch {
+    } catch (e) {
+      decodeError ??= streamReadError(e);
       continue;
     }
 
     eventCounts.set(event.kind, (eventCounts.get(event.kind) ?? 0) + 1);
+
+    // Recovery after proven damage is only for metering/diagnostics, never for
+    // joining generated content across the lost span or an explicit error.
+    if (
+      (decodeError || upstreamError) &&
+      (event.kind === 'AssistantResponse' ||
+        event.kind === 'ReasoningContent' ||
+        event.kind === 'ToolUse')
+    ) {
+      continue;
+    }
 
     switch (event.kind) {
       case 'AssistantResponse':
@@ -179,6 +200,12 @@ export function reduceKiroResponse(
         break;
 
       case 'ToolUse': {
+        try {
+          toolUseSequence.observe(event);
+        } catch (e) {
+          decodeError ??= streamReadError(e);
+          break;
+        }
         // A structured tool event ends the legacy thinking phase even when the
         // model omitted its close marker. Repeated incremental frames are safe:
         // after the first boundary the decoder is permanently in text mode.
@@ -199,23 +226,14 @@ export function reduceKiroResponse(
 
         // If complete tool call, add to list
         if (event.isComplete) {
-          let input: unknown;
-          if (!buffer) {
-            input = {};
-          } else {
-            try {
-              input = JSON.parse(buffer);
-            } catch (e) {
-              log.warn({
-                msg: 'tool input JSON parse failed',
-                tool_use_id: event.toolUseId,
-                error: String(e),
-              });
-              input = {};
-            }
-          }
-
           const originalName = toolNameMap.get(event.name) ?? event.name;
+          let input: Record<string, unknown> | string;
+          try {
+            input = parseCompletedToolInput(buffer, allowRawToolInputs?.has(originalName));
+          } catch (e) {
+            decodeError ??= streamReadError(e);
+            break;
+          }
 
           toolUses.push({
             type: 'tool_use',
@@ -273,6 +291,11 @@ export function reduceKiroResponse(
         break;
       }
 
+      case 'Metadata':
+        // 只取「出现过」;stopReason 不可信(带工具时也报 END_TURN),见 base.ts 该 case。
+        sawMetadata = true;
+        break;
+
       case 'Unknown':
         unknownEventTypes.add(event.eventType);
         break;
@@ -282,6 +305,16 @@ export function reduceKiroResponse(
         assertNever(event);
     }
   }
+
+  if (!decodeError) {
+    try {
+      decoder.assertComplete();
+    } catch (e) {
+      decodeError = streamReadError(e);
+    }
+  }
+  upstreamError ??= decodeError;
+  if (decodeError && upstreamError) upstreamError.bodyReadFailed = true;
 
   // Resolve the native-vs-legacy mode only after all frames are known. This is
   // what makes a late native event authoritative in the non-stream path.
@@ -376,9 +409,20 @@ export function reduceKiroResponse(
         completed_tool_calls: toolUses.length,
         tool_names: [...announcedToolNames],
       });
+    } else if (!sawMetadata && hasContent && upstreamError === undefined) {
+      // ★ 正文在帧边界干净 EOF(与流式 `generateFinalEvents` 同源,理由见 stream.ts
+      // `sawMetadata` 字段注释)。必须排在 `hasToolUse` 之前:已完成的调用若后面还有
+      // 没到的兄弟调用,报 `tool_use` 会让客户端只执行一半就当轮次结束。
+      stopReason = 'max_tokens';
+      if (textContent === '' && toolUses.length === 0) textContent = ' ';
+      log.warn({
+        msg: 'upstream response ended without metadata frame (clean EOF mid-response)',
+        saw_visible_text: textContent.trim() !== '',
+        completed_tool_calls: toolUses.length,
+      });
     } else if (hasToolUse) {
       stopReason = 'tool_use';
-    } else if (thinkingEnabled && hasSurfaceableThinking && textContent === '') {
+    } else if (hasSurfaceableThinking && textContent === '') {
       stopReason = 'max_tokens';
       textContent = ' ';
     }

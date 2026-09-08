@@ -31,6 +31,7 @@ import { registerClaudeRoutes } from '../../src/routes/claude.js';
 import {
   buildAssistantResponseFrame,
   buildContextUsageFrame,
+  buildMetadataFrame,
   buildMeteringFrame,
   buildToolUseFrame,
   encodeEventStreamFrame,
@@ -503,6 +504,7 @@ describe('empty-stream retry: non-streaming path', () => {
               '',
               true,
             ),
+            buildMetadataFrame(),
             buildMeteringFrame({ unit: 'credit', unitPlural: 'credits', usage: 0.294 }),
           ]),
       ],

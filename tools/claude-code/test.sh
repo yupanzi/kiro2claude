@@ -7,7 +7,7 @@
 #   - 非流式 JSON 输出
 #   - stream-json + verbose 流式
 #   - 工具使用 (--allowedTools Read + 挂载 workspace)
-#   - 多模型矩阵 (opus-4.7 / opus-4.6 / sonnet-4.6)
+#   - 多模型矩阵 (opus-5 / opus-4.7 / opus-4.6 / sonnet-4.6)
 # 加一个 00-version sanity check 验证镜像版本号一致。
 #
 # 用法见 ./test.sh --help
@@ -144,10 +144,16 @@ CONTAINER_BASE_URL=""
 NETWORK_ARGS=()
 
 probe_gateway() {
-    local probe_target
+    local probe_target origin
     if [[ -n "$BASE_URL" ]]; then
-        # 用户传 -u: 宿主机视角用 127.0.0.1 替换 host.docker.internal 以确保 probe 通
-        probe_target="${BASE_URL/host.docker.internal/127.0.0.1}/health"
+        # API base 通常带 /claude；健康检查固定在同一 origin 的 /health。
+        # 只调整宿主机 probe，容器里的 ANTHROPIC_BASE_URL 保留用户原值。
+        if [[ "$BASE_URL" =~ ^(https?://[^/?#]+) ]]; then
+            origin="${BASH_REMATCH[1]}"
+        else
+            fatal "网关 base URL 必须以 http:// 或 https:// 开头"
+        fi
+        probe_target="${origin/host.docker.internal/127.0.0.1}/health"
     else
         probe_target="http://127.0.0.1:${PROBE_PORT}/health"
     fi
@@ -373,7 +379,7 @@ case_01_ping() {
     out=$(run_in_container "$name" stderr_file -- \
         "$TEST_IMAGE_TAG" \
         -p "Reply with the single word PONG and nothing else." \
-        --output-format json --model claude-opus-4.6) || rc=$?
+        --output-format json --model claude-opus-5) || rc=$?
 
     end_ts=$(date +%s); dur=$((end_ts - start_ts))
 
@@ -401,7 +407,7 @@ case_02_stream() {
         "$TEST_IMAGE_TAG" \
         -p "Count from 1 to 3, one number per line, no extra prose." \
         --output-format stream-json --verbose --include-partial-messages \
-        --model claude-opus-4.6) || rc=$?
+        --model claude-opus-5) || rc=$?
 
     end_ts=$(date +%s); dur=$((end_ts - start_ts))
 
@@ -484,7 +490,7 @@ case_03_tool_use() {
         "$TEST_IMAGE_TAG" \
         -p "Read the file secret.txt in the current directory and output ONLY its content verbatim, no other words, no punctuation." \
         --allowedTools "Read" \
-        --output-format json --model claude-opus-4.6 \
+        --output-format json --model claude-opus-5 \
         2>"$stderr_file") || rc=$?
 
     end_ts=$(date +%s); dur=$((end_ts - start_ts))
@@ -530,7 +536,7 @@ case_04_models() {
     if [[ -n "$MODEL" ]]; then
         models=("$MODEL")
     else
-        models=("claude-opus-4.7" "claude-opus-4.6" "claude-sonnet-4.6")
+        models=("claude-opus-5" "claude-opus-4.7" "claude-opus-4.6" "claude-sonnet-4.6")
     fi
 
     local all_ok=true

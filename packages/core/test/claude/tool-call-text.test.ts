@@ -565,6 +565,7 @@ describe('StreamContext 泄漏救援集成', () => {
         ...ctx.processKiroEvent({ kind: 'AssistantResponse', content: full.slice(i, i + 40) }),
       );
     }
+    events.push(...ctx.processKiroEvent({ kind: 'Metadata', stopReason: 'END_TURN' }));
     events.push(...(await ctx.generateFinalEvents()));
 
     const toolStarts = collectToolStarts(events);

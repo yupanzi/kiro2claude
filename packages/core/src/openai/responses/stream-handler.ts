@@ -13,6 +13,7 @@ import type { ToolTextRegistry } from '../../claude/tool-call-text.js';
 import type { KiroProvider } from '../../kiro/provider.js';
 import type { HookBus } from '../../plugin-host/index.js';
 import { type OpenAiStreamProtocol, runOpenAiStream } from '../stream-transport.js';
+import type { ResponsesToolCodec } from './converter.js';
 import { buildResponsesUsage } from './response-nonstream.js';
 import { ResponsesEventEncoder } from './response-stream.js';
 
@@ -27,12 +28,12 @@ export async function handleResponsesStreamRequest(
   reply: FastifyReply,
   emptyStreamRetries = 0,
   rescueRegistry: ToolTextRegistry | undefined,
-  customToolNames: ReadonlySet<string>,
+  codec: ResponsesToolCodec,
 ): Promise<MessageHandlerResult> {
   const protocol: OpenAiStreamProtocol<ResponsesEventEncoder> = {
-    // customToolNames 走闭包注入:它是 responses 协议特有的,而 runOpenAiStream 的签名
+    // codec 走闭包注入:它是 responses 协议特有的,而 runOpenAiStream 的签名
     // 由 chat 端点共用。
-    makeEncoder: (m) => new ResponsesEventEncoder(m, customToolNames),
+    makeEncoder: (m) => new ResponsesEventEncoder(m, codec.customToolNames, codec.toolNamespaces),
     finalTerminal: (encoder, ctx) =>
       encoder.finalize(
         buildResponsesUsage(
@@ -56,5 +57,8 @@ export async function handleResponsesStreamRequest(
     reply,
     emptyStreamRetries,
     rescueRegistry,
+    // transport 只需要 raw-input allowlist(freeform 工具的裸文本参数),namespace 是
+    // 编码器的事、已随 makeEncoder 闭包注入。
+    codec.customToolNames,
   );
 }

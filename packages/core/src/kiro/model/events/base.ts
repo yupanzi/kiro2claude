@@ -8,6 +8,7 @@ export type EventType =
   | 'Metering'
   | 'ContextUsage'
   | 'ReasoningContent'
+  | 'Metadata'
   | 'Unknown';
 
 /** 从事件类型字符串解析 */
@@ -23,6 +24,8 @@ export function parseEventType(s: string): EventType {
       return 'ContextUsage';
     case 'reasoningContentEvent':
       return 'ReasoningContent';
+    case 'metadataEvent':
+      return 'Metadata';
     default:
       return 'Unknown';
   }
@@ -44,25 +47,59 @@ export function eventFromFrame(frame: Frame): Event {
   }
 }
 
+/** Known events consume object fields; unknown events remain opaque below. */
+function eventPayload(frame: Frame): Record<string, unknown> {
+  const payload = frame.payloadAsJson<unknown>();
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Invalid event payload: expected an object');
+  }
+  return payload as Record<string, unknown>;
+}
+
+/** Preserve absent/null defaults, but never coerce a populated wire field. */
+function optionalString(payload: Record<string, unknown>, field: string): string | undefined {
+  const value = payload[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw new Error(`Invalid event field: ${field} must be a string`);
+  return value;
+}
+
+function optionalNumber(payload: Record<string, unknown>, field: string): number | undefined {
+  const value = payload[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`Invalid event field: ${field} must be a finite number`);
+  }
+  return value;
+}
+
 function parseEvent(frame: Frame): Event {
   const eventTypeStr = frame.eventType() ?? 'unknown';
   const eventType = parseEventType(eventTypeStr);
 
   switch (eventType) {
     case 'AssistantResponse': {
-      const payload = frame.payloadAsJson<{ content?: string }>();
+      const payload = eventPayload(frame);
       return {
         kind: 'AssistantResponse',
-        content: payload.content ?? '',
+        content: optionalString(payload, 'content') ?? '',
       };
     }
     case 'ToolUse': {
-      const payload = frame.payloadAsJson<{
-        name: string;
-        toolUseId: string;
-        input?: string;
-        stop?: boolean;
-      }>();
+      const payload = eventPayload(frame);
+      // Type assertions do not validate wire data. In particular, a string
+      // "false" is truthy and would release unfinished input as an executable
+      // tool call; an object input would become "[object Object]" when joined.
+      if (
+        typeof payload?.name !== 'string' ||
+        !payload.name.trim() ||
+        typeof payload.toolUseId !== 'string' ||
+        !payload.toolUseId.trim() ||
+        (payload.input !== undefined && typeof payload.input !== 'string') ||
+        (payload.stop !== undefined && typeof payload.stop !== 'boolean')
+      ) {
+        throw new Error('Invalid toolUseEvent fields');
+      }
       return {
         kind: 'ToolUse',
         name: payload.name,
@@ -72,21 +109,21 @@ function parseEvent(frame: Frame): Event {
       };
     }
     case 'Metering': {
-      const raw = frame.payloadAsJson<Record<string, unknown>>();
+      const raw = eventPayload(frame);
       getLogger().debug({ msg: 'raw meteringEvent payload', metering_raw: raw });
       return {
         ...raw,
         kind: 'Metering' as const,
-        unit: typeof raw.unit === 'string' ? raw.unit : '',
-        unitPlural: typeof raw.unitPlural === 'string' ? raw.unitPlural : '',
-        usage: typeof raw.usage === 'number' ? raw.usage : 0,
+        unit: optionalString(raw, 'unit') ?? '',
+        unitPlural: optionalString(raw, 'unitPlural') ?? '',
+        usage: optionalNumber(raw, 'usage') ?? 0,
       };
     }
     case 'ContextUsage': {
-      const payload = frame.payloadAsJson<{ contextUsagePercentage?: number }>();
+      const payload = eventPayload(frame);
       return {
         kind: 'ContextUsage',
-        contextUsagePercentage: payload.contextUsagePercentage ?? 0,
+        contextUsagePercentage: optionalNumber(payload, 'contextUsagePercentage') ?? 0,
       };
     }
     case 'ReasoningContent': {
@@ -96,18 +133,22 @@ function parseEvent(frame: Frame): Event {
       //   - GPT-5.6: { "redactedContent": "<base64 加密 blob>" }（无 text/signature）——
       //     隐藏思维链,内容加密不可读。显式建模 redactedContent 而非落进 text ?? ''
       //     的空串黑洞,让它可观测；下游 stream.ts 的守卫据「无 text 无 signature」丢弃。
-      const payload = frame.payloadAsJson<{
-        text?: string;
-        signature?: string;
-        redactedContent?: string;
-      }>();
+      const payload = eventPayload(frame);
       return {
         kind: 'ReasoningContent',
-        text: payload.text ?? '',
-        signature: typeof payload.signature === 'string' ? payload.signature : undefined,
-        redactedContent:
-          typeof payload.redactedContent === 'string' ? payload.redactedContent : undefined,
+        text: optionalString(payload, 'text') ?? '',
+        signature: optionalString(payload, 'signature'),
+        redactedContent: optionalString(payload, 'redactedContent'),
       };
+    }
+    case 'Metadata': {
+      // 上游生成**正常收尾**的标记帧。2026-09 对 352 条真实响应(Claude + GPT-5.6,
+      // 流式/工具/纯文本)的帧审计:351 条全部以 metadataEvent → contextUsageEvent →
+      // meteringEvent 收尾,唯一缺它的那条是 reasoning 中途干净 EOF。故消费方只取
+      // 「出现过」这一事实来判「说完了 / 说到一半断了」;`stopReason` 本身不可信——
+      // 带工具调用的响应里它同样报 END_TURN(124/325),终态仍由网关自行推断。
+      const payload = eventPayload(frame);
+      return { kind: 'Metadata', stopReason: optionalString(payload, 'stopReason') };
     }
     case 'Unknown':
       return {
@@ -157,6 +198,7 @@ export type Event =
       /** GPT-5.6 加密隐藏思维链(base64)；Claude 明文 reasoning 时不带此字段。 */
       redactedContent?: string;
     }
+  | { kind: 'Metadata'; stopReason: string | undefined }
   | { kind: 'Unknown'; eventType: string; payload: Buffer }
   | { kind: 'Error'; errorCode: string; errorMessage: string }
   | { kind: 'Exception'; exceptionType: string; message: string };

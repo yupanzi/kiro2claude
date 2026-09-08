@@ -26,6 +26,23 @@ function reduced(overrides: Partial<ReducedAttempt> = {}): ReducedAttempt {
 }
 
 describe('buildResponsesObject', () => {
+  it.each([
+    'max_tokens',
+    'model_context_window_exceeded',
+  ])('%s stays incomplete instead of becoming a successful response', (stopReason) => {
+    const r = buildResponsesObject({
+      reduced: reduced({ stopReason, textContent: 'partial answer' }),
+      model: 'claude-opus-4-6',
+      inputTokens: 10,
+      outputTokens: 3,
+      createdAt: 1,
+    });
+    expect(r.status).toBe('incomplete');
+    expect(r.incomplete_details).toEqual({ reason: 'max_output_tokens' });
+    expect(r.output[0]).toMatchObject({ content: [{ text: 'partial answer' }] });
+    expect(r.usage?.total_tokens).toBe(13);
+  });
+
   it('文本 → message output item + usage', () => {
     const r = buildResponsesObject({
       reduced: reduced({ textContent: 'pong' }),

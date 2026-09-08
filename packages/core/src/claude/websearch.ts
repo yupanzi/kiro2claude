@@ -9,8 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import type { KiroProvider } from '../kiro/provider.js';
 import { getLogger } from '../shared/logger.js';
 import { getRequestContext } from '../shared/request-context.js';
+import { mapProviderError } from './error-mapper.js';
 import { createSseEvent, type SseEvent, safeEnd, safeWrite, sseEventToString } from './stream.js';
-import { createErrorResponse, type MessagesRequest } from './types.js';
+import { type ContentBlock, createErrorResponse, type MessagesRequest } from './types.js';
 
 // ============================================================================
 // MCP types
@@ -117,39 +118,29 @@ export function formatPageAgeUTC(publishedDate: number): string | null {
 /**
  * Check if request is a pure WebSearch request.
  *
- * Condition: tools has exactly one item, and its name is "web_search"
+ * Only an explicitly hosted WebSearch tool can bypass model inference.
+ * A client-defined function with the same name must remain a client tool.
  */
 export function hasWebSearchTool(req: MessagesRequest): boolean {
-  return !!req.tools && req.tools.length === 1 && req.tools[0].name === 'web_search';
+  const tool = req.tools?.length === 1 ? req.tools[0] : undefined;
+  return tool?.name === 'web_search' && /^web_search_\d{8}$/.test(tool.type ?? '');
 }
 
-/**
- * Extract search query from messages.
- *
- * Reads the first message's first content block and strips
- * "Perform a web search for the query: " prefix.
- */
+/** Extract the latest user query; preceding turns must not change the search target. */
 export function extractSearchQuery(req: MessagesRequest): string | undefined {
-  const firstMsg = req.messages?.[0];
-  if (!firstMsg) return undefined;
-
-  let text: string | undefined;
-
-  if (typeof firstMsg.content === 'string') {
-    text = firstMsg.content;
-  } else if (Array.isArray(firstMsg.content)) {
-    const firstBlock = firstMsg.content[0] as Record<string, unknown> | undefined;
-    if (firstBlock?.type === 'text' && typeof firstBlock.text === 'string') {
-      text = firstBlock.text;
-    }
-  }
-
-  if (!text) return undefined;
-
-  const PREFIX = 'Perform a web search for the query: ';
-  const query = text.startsWith(PREFIX) ? text.slice(PREFIX.length) : text;
-
-  return query || undefined;
+  const message = req.messages.findLast((item) => item.role === 'user');
+  if (!message) return undefined;
+  const text =
+    typeof message.content === 'string'
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content
+            .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+            .map((block) => block.text)
+            .join('\n')
+        : '';
+  const prefix = 'Perform a web search for the query: ';
+  return (text.startsWith(prefix) ? text.slice(prefix.length) : text).trim() || undefined;
 }
 
 // ============================================================================
@@ -206,18 +197,27 @@ function createMcpRequest(query: string): [string, McpRequest] {
 
 function parseSearchResults(mcpResponse: McpResponse): WebSearchResults | undefined {
   const result = mcpResponse.result;
-  if (!result || !Array.isArray(result.content)) return undefined;
+  if (!result || result.isError || !Array.isArray(result.content)) return undefined;
 
   const content = result.content[0];
   if (!content || content.type !== 'text') return undefined;
 
   try {
     const parsed = JSON.parse(content.text) as WebSearchResults;
-    // 上游 JSON 不保证含 results 数组(可能是 {totalResults:0} / {error:...} 等);
-    // 未通过校验则按"无结果"返回 undefined。否则下游 generateWebsearchEvents /
-    // generateSearchSummary 对 searchResults.results 调 .map/.forEach 会抛 TypeError,
-    // 而该处在 try/catch 之外 → 冒泡成 500,而非优雅的空结果 SSE。
-    if (!parsed || !Array.isArray(parsed.results)) return undefined;
+    // Invalid provider payloads are errors, not an empty successful search.
+    // An explicit results: [] is the only successful "no results" representation.
+    if (!parsed || parsed.error || !Array.isArray(parsed.results)) return undefined;
+    if (
+      parsed.results.some(
+        (item) =>
+          !item ||
+          typeof item.title !== 'string' ||
+          typeof item.url !== 'string' ||
+          (item.snippet != null && typeof item.snippet !== 'string') ||
+          (item.publishedDate != null && !Number.isFinite(item.publishedDate)),
+      )
+    )
+      return undefined;
     return parsed;
   } catch {
     return undefined;
@@ -228,170 +228,111 @@ function parseSearchResults(mcpResponse: McpResponse): WebSearchResults | undefi
 // SSE event generation
 // ============================================================================
 
-/**
- * Generate WebSearch SSE event sequence
- */
-function generateWebsearchEvents(
+interface WebsearchMessage {
+  id: string;
+  type: 'message';
+  role: 'assistant';
+  model: string;
+  content: ContentBlock[];
+  stop_reason: 'end_turn';
+  stop_sequence: null;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+    server_tool_use: { web_search_requests: number };
+  };
+}
+
+/** One result representation shared by JSON and SSE clients. */
+function buildWebsearchMessage(
   model: string,
   query: string,
   toolUseId: string,
-  searchResults: WebSearchResults | undefined,
+  results: WebSearchResults,
   inputTokens: number,
-): SseEvent[] {
-  const events: SseEvent[] = [];
-  const messageId = `msg_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+): WebsearchMessage {
+  const summary = generateSearchSummary(query, results);
+  const decision = `I'll search for "${query}".`;
+  return {
+    id: `msg_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [
+      { type: 'text', text: decision },
+      { type: 'server_tool_use', id: toolUseId, name: 'web_search', input: { query } },
+      {
+        type: 'web_search_tool_result',
+        tool_use_id: toolUseId,
+        content: results.results.map((result) => ({
+          type: 'web_search_result',
+          title: result.title,
+          url: result.url,
+          encrypted_content: result.snippet ?? '',
+          page_age: result.publishedDate ? formatPageAgeUTC(result.publishedDate) : null,
+        })),
+      },
+      { type: 'text', text: summary },
+    ],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: Math.ceil((decision.length + summary.length) / 4),
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      server_tool_use: { web_search_requests: 1 },
+    },
+  };
+}
 
-  // 1. message_start
-  events.push(
+function generateWebsearchEvents(message: WebsearchMessage): SseEvent[] {
+  const events = [
     createSseEvent('message_start', {
       type: 'message_start',
       message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        model,
+        ...message,
         content: [],
         stop_reason: null,
-        usage: {
-          input_tokens: inputTokens,
-          output_tokens: 0,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-        },
+        usage: { ...message.usage, output_tokens: 0 },
       },
     }),
-  );
-
-  // 2. content_block_start (text - search decision, index 0)
-  const decisionText = `I'll search for "${query}".`;
-  events.push(
-    createSseEvent('content_block_start', {
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'text', text: '' },
-    }),
-  );
-
-  events.push(
-    createSseEvent('content_block_delta', {
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'text_delta', text: decisionText },
-    }),
-  );
-
-  events.push(
-    createSseEvent('content_block_stop', {
-      type: 'content_block_stop',
-      index: 0,
-    }),
-  );
-
-  // 3. content_block_start (server_tool_use, index 1)
-  events.push(
-    createSseEvent('content_block_start', {
-      type: 'content_block_start',
-      index: 1,
-      content_block: {
-        id: toolUseId,
-        type: 'server_tool_use',
-        name: 'web_search',
-        input: { query },
-      },
-    }),
-  );
-
-  // 4. content_block_stop (server_tool_use)
-  events.push(
-    createSseEvent('content_block_stop', {
-      type: 'content_block_stop',
-      index: 1,
-    }),
-  );
-
-  // 5. content_block_start (web_search_tool_result, index 2)
-  const searchContent = searchResults
-    ? searchResults.results.map((r) => {
-        const pageAge = r.publishedDate ? formatPageAgeUTC(r.publishedDate) : null;
-        return {
-          type: 'web_search_result',
-          title: r.title,
-          url: r.url,
-          encrypted_content: r.snippet ?? '',
-          page_age: pageAge,
-        };
-      })
-    : [];
-
-  events.push(
-    createSseEvent('content_block_start', {
-      type: 'content_block_start',
-      index: 2,
-      content_block: {
-        type: 'web_search_tool_result',
-        content: searchContent,
-      },
-    }),
-  );
-
-  // 6. content_block_stop (web_search_tool_result)
-  events.push(
-    createSseEvent('content_block_stop', {
-      type: 'content_block_stop',
-      index: 2,
-    }),
-  );
-
-  // 7. content_block_start (text, index 3)
-  events.push(
-    createSseEvent('content_block_start', {
-      type: 'content_block_start',
-      index: 3,
-      content_block: { type: 'text', text: '' },
-    }),
-  );
-
-  // 8. content_block_delta (text_delta) - search result summary
-  const summary = generateSearchSummary(query, searchResults);
-
-  // Chunked text sending
-  const chunkSize = 100;
-  const chars = [...summary];
-  for (let i = 0; i < chars.length; i += chunkSize) {
-    const chunk = chars.slice(i, i + chunkSize).join('');
+  ];
+  for (const [index, block] of message.content.entries()) {
     events.push(
-      createSseEvent('content_block_delta', {
-        type: 'content_block_delta',
-        index: 3,
-        delta: { type: 'text_delta', text: chunk },
+      createSseEvent('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: block.type === 'text' ? { type: 'text', text: '' } : block,
       }),
     );
+    if (block.type === 'text') {
+      const chars = [...(block.text ?? '')];
+      for (let offset = 0; offset < chars.length; offset += 100) {
+        events.push(
+          createSseEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index,
+            delta: { type: 'text_delta', text: chars.slice(offset, offset + 100).join('') },
+          }),
+        );
+      }
+    }
+    events.push(createSseEvent('content_block_stop', { type: 'content_block_stop', index }));
   }
-
-  // 9. content_block_stop (text)
-  events.push(
-    createSseEvent('content_block_stop', {
-      type: 'content_block_stop',
-      index: 3,
-    }),
-  );
-
-  // 10. message_delta
-  const outputTokens = Math.floor((summary.length + 3) / 4);
   events.push(
     createSseEvent('message_delta', {
       type: 'message_delta',
-      delta: { stop_reason: 'end_turn' },
+      delta: { stop_reason: message.stop_reason, stop_sequence: null },
       usage: {
-        output_tokens: outputTokens,
-        server_tool_use: { web_search_requests: 1 },
+        output_tokens: message.usage.output_tokens,
+        server_tool_use: message.usage.server_tool_use,
       },
     }),
   );
-
-  // 11. message_stop
   events.push(createSseEvent('message_stop', { type: 'message_stop' }));
-
   return events;
 }
 
@@ -399,7 +340,7 @@ function generateWebsearchEvents(
 function generateSearchSummary(query: string, results: WebSearchResults | undefined): string {
   let summary = `Here are the search results for "${query}":\n\n`;
 
-  if (results) {
+  if (results && results.results.length > 0) {
     results.results.forEach((result, i) => {
       summary += `${i + 1}. **${result.title}**\n`;
       if (result.snippet) {
@@ -449,7 +390,7 @@ async function callMcpApi(provider: KiroProvider, request: McpRequest): Promise<
 /**
  * Handle WebSearch request.
  *
- * Writes SSE response to the reply.
+ * Honors the requested JSON/SSE transport and preserves search failure semantics.
  */
 export async function handleWebsearchRequest(
   provider: KiroProvider,
@@ -485,16 +426,17 @@ export async function handleWebsearchRequest(
   try {
     const mcpResponse = await callMcpApi(provider, mcpRequest);
     searchResults = parseSearchResults(mcpResponse);
-    if (searchResults) {
-      log.debug({
-        msg: 'WebSearch results parsed',
-        total_results: searchResults.totalResults,
-        result_titles: searchResults.results.slice(0, 5).map((r) => r.title.slice(0, 80)),
-      });
-    }
+    // 解析不出结构化结果 = 搜索失败,不是「零结果的成功搜索」(只有显式 `results: []`
+    // 才是后者)。抛出去和 MCP 调用本身失败走同一条错误出口。
+    if (!searchResults) throw new Error('Invalid web search response');
+    log.debug({
+      msg: 'WebSearch results parsed',
+      total_results: searchResults.totalResults,
+      result_titles: searchResults.results.slice(0, 5).map((r) => r.title.slice(0, 80)),
+    });
     log.info({
       msg: 'WebSearch MCP call succeeded',
-      result_count: searchResults?.results.length ?? 0,
+      result_count: searchResults.results.length,
       duration_ms: Date.now() - mcpStart,
     });
   } catch (e) {
@@ -503,17 +445,24 @@ export async function handleWebsearchRequest(
       duration_ms: Date.now() - mcpStart,
       error: String(e),
     });
-    searchResults = undefined;
+    mapProviderError(e, reply);
+    return;
   }
 
-  // 4. Generate and send SSE response
-  const events = generateWebsearchEvents(
+  // 4. Render the same result through the requested transport.
+  const message = buildWebsearchMessage(
     payload.model,
     query,
     toolUseId,
     searchResults,
     inputTokens,
   );
+
+  if (!payload.stream) {
+    reply.send(message);
+    return;
+  }
+  const events = generateWebsearchEvents(message);
 
   // Inject x-request-id for streaming responses
   const sseHeaders: Record<string, string> = {

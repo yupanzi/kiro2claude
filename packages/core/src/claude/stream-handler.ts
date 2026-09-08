@@ -55,13 +55,13 @@ import type { MessageHandlerResult } from './empty-capture.js';
 import { mapProviderError } from './error-mapper.js';
 import {
   awaitDrain,
+  canRetryZeroWorkRejection,
   createSseErrorEvent,
   isMeteringLost,
   type SseEvent,
   StreamContext,
   safeEnd,
   safeWrite,
-  sawBillableWork,
   selectEmptyUpstreamMessage,
   sseEventToString,
   upstreamErrorWire,
@@ -356,11 +356,13 @@ export async function handleStreamRequest(
           decoder.feed(buf);
         } catch (e) {
           log.warn({ msg: 'buffer overflow in decoder', error: String(e) });
+          ctx.recordStreamReadError(e);
         }
 
         for (const result of decoder.drainAll()) {
           if (!('frame' in result)) {
             log.warn({ msg: 'event decode failed', error: String(result.error) });
+            ctx.recordStreamReadError(result.error);
             continue;
           }
 
@@ -370,8 +372,9 @@ export async function handleStreamRequest(
             // Always process — captures the Metering frame and accumulates
             // outputTokens, even after the client has gone.
             sseEvents = ctx.processKiroEvent(event);
-          } catch {
-            // Frame parse error, skip
+          } catch (e) {
+            // Keep draining for metering, but never report dropped content as success.
+            ctx.recordStreamReadError(e);
             continue;
           }
 
@@ -395,11 +398,12 @@ export async function handleStreamRequest(
 
           // Commit on the first real content (text / tool_use / reasoning). The
           // buffered events (initial + this frame's) flush in order.
-          if (!committed && !aborted.value && hasContent()) {
+          if (!committed && !aborted.value && hasContent() && !ctx.getPendingUpstreamError()) {
             commit();
           }
         }
       }
+      if (!ctx.getPendingUpstreamError()?.bodyReadFailed) decoder.assertComplete();
     } catch (e) {
       if (aborted.value && abortUpstreamOnDisconnect) {
         // 主动 abort 上游:客户端已走,读流被取消是预期内的,不是错误(省了 credit)。
@@ -410,6 +414,7 @@ export async function handleStreamRequest(
         log.info({ msg: 'upstream stream closed after drain grace expired', error: String(e) });
       } else {
         log.error({ msg: 'error reading response stream', error: String(e) });
+        ctx.recordStreamReadError(e);
       }
     } finally {
       draining = false;
@@ -440,8 +445,9 @@ export async function handleStreamRequest(
     // 内零帧拒绝(event_counts 只有 `Exception:1`),没有任何 credit 可烧,重发几乎必然
     // 恢复。故把排除条件收窄到「已开工」,判据用 sawBillableWork 而**不是**
     // hasContent()(见其头注释:GPT 加密 reasoning 会让 hasContent() 谎报为空)。
-    const upstreamErrored = ctx.getPendingUpstreamError() !== undefined;
-    const deterministicUpstreamError = upstreamErrored && sawBillableWork(ctx.getEventCounts());
+    const pendingError = ctx.getPendingUpstreamError();
+    const deterministicUpstreamError =
+      pendingError && !canRetryZeroWorkRejection(pendingError, ctx.getEventCounts());
     if (
       hasContent() ||
       attemptStop === 'max_tokens' ||
@@ -493,7 +499,11 @@ export async function handleStreamRequest(
   // FULLY empty stream qualifies — an upstream that emits some content then goes
   // silent has already committed, so it surfaces as a normal (if truncated)
   // message_stop.
-  const silentFailure = !hasContent();
+  const terminalStop = ctx.stateManager.getStopReason();
+  const silentFailure =
+    !hasContent() &&
+    terminalStop !== 'max_tokens' &&
+    terminalStop !== 'model_context_window_exceeded';
 
   // 物化一次:下面 logFields 里 metering_lost 与 event_counts 都要用,
   // getEventCounts() 每次都重建一个对象。取同一份快照也保证两个字段互相自洽。
@@ -546,6 +556,10 @@ export async function handleStreamRequest(
     // retries; fatal → 502/api_error hard-stop. Client message is neutral; the raw
     // code/message was already logged at the Error/Exception case (leak rule).
     const { status, errorType, message } = upstreamErrorWire(upstreamError.retryable);
+    // Redacted reasoning can consume credit without triggering commit. Preserve
+    // any metering already received in that case, just as the non-stream path does.
+    const finalEvents =
+      committed || ctx.kiroMeteringRaw ? await ctx.generateFinalEvents(false) : [];
     if (!committed) {
       // Never committed → we can still send a real HTTP status, like the non-stream path.
       if (!aborted.value) {
@@ -572,7 +586,6 @@ export async function handleStreamRequest(
       downstream_status: status,
       ...logFields,
     });
-    const finalEvents = await ctx.generateFinalEvents(false);
     if (!aborted.value) {
       for (const ev of finalEvents) {
         if (!safeWrite(reply.raw, sseEventToString(ev))) break;
@@ -620,7 +633,11 @@ export async function handleStreamRequest(
   // Billable content exists. Run the usage-finish hook EXACTLY ONCE — even after a
   // disconnect (so plugins record the credit captured during the drain) and even
   // in the rare race where content arrived but the client aborted before commit.
+  // Explicit empty max_tokens/context-window terminals still need their SSE
+  // envelope committed; no content frame was available to trigger it earlier.
+  if (!committed && !aborted.value) commit();
   const finalEvents = await ctx.generateFinalEvents();
+  if (pingInterval) clearInterval(pingInterval);
 
   // Only forward while the client is still connected. After a disconnect the
   // billing data is already captured, so these events are simply discarded.
@@ -630,7 +647,13 @@ export async function handleStreamRequest(
     }
   }
 
-  log.info({ msg: 'stream completed', ...logFields });
+  // stop_reason 在 logFields 里是终结段生成**之前**的快照;generateFinalEvents 可能把它
+  // 收窄成 max_tokens(截断 tool_use / 无尾帧 EOF),日志必须记 wire 上真正发出的那个。
+  log.info({
+    msg: 'stream completed',
+    ...logFields,
+    stop_reason: ctx.stateManager.getStopReason(),
+  });
 
   if (committed) {
     safeEnd(reply.raw);

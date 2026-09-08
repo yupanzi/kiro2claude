@@ -26,6 +26,30 @@ const sigDelta = (i: number, signature: string) =>
   ev('content_block_delta', { index: i, delta: { type: 'signature_delta', signature } });
 
 describe('ResponsesEventEncoder: 文本流', () => {
+  it.each([
+    'max_tokens',
+    'model_context_window_exceeded',
+  ])('%s produces response.incomplete with preserved partial output and usage', (stopReason) => {
+    const enc = new ResponsesEventEncoder('claude-opus-4-6');
+    const events = parse([
+      ...enc.push(START),
+      ...enc.push(textDelta(0, 'partial answer')),
+      ...enc.push(stop(0)),
+      ...enc.push(ev('message_delta', { delta: { stop_reason: stopReason } })),
+      ...enc.finalize({ input_tokens: 10, output_tokens: 3, total_tokens: 13 }),
+    ]);
+    expect(events.some((event) => event.type === 'response.completed')).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: 'response.incomplete',
+      response: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ content: [{ text: 'partial answer' }] }],
+        usage: { total_tokens: 13 },
+      },
+    });
+  });
+
   it('严格事件序列 + content_part.added 在 delta 之前', () => {
     const enc = new ResponsesEventEncoder('gpt-5.6-sol');
     const all: string[] = [];

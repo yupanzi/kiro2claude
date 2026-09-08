@@ -107,6 +107,8 @@ export class EventStreamDecoder {
   private maxBufferSize: number;
   /** Bytes skipped during recovery (for debugging) */
   private bytesSkipped: number;
+  /** Recovery may salvage metering, but cannot make a damaged response whole. */
+  private firstError: ParseException | undefined;
 
   constructor(capacity: number = DEFAULT_BUFFER_CAPACITY) {
     this.buffer = Buffer.alloc(0);
@@ -134,6 +136,23 @@ export class EventStreamDecoder {
     return this.buffer.length - this.offset;
   }
 
+  /**
+   * A normal HTTP EOF must also fall on an event-frame boundary. decode() returns
+   * undefined for a partial frame while more chunks can arrive; at EOF the same
+   * buffered bytes prove truncation and must not be silently discarded.
+   * Call after the final drainAll(). No Metering/metadata tail frame is required.
+   */
+  assertComplete(): void {
+    if (this.firstError) throw this.firstError;
+    const available = this.getBufferedLength();
+    if (available === 0) return;
+    throw new ParseException({
+      type: 'Incomplete',
+      needed: available < PRELUDE_SIZE ? PRELUDE_SIZE : this.buffer.readUInt32BE(this.offset),
+      available,
+    });
+  }
+
   /** Get the total number of bytes skipped during error recovery (for debugging) */
   getBytesSkipped(): number {
     return this.bytesSkipped;
@@ -151,11 +170,13 @@ export class EventStreamDecoder {
     const newSize = remaining + incoming.length;
 
     if (newSize > this.maxBufferSize) {
-      throw new ParseException({
+      const error = new ParseException({
         type: 'BufferOverflow',
         size: newSize,
         max: this.maxBufferSize,
       });
+      this.firstError ??= error;
+      throw error;
     }
 
     if (remaining === 0) {
@@ -225,6 +246,7 @@ export class EventStreamDecoder {
         throw e;
       }
 
+      this.firstError ??= e;
       this.errorCount += 1;
       const errorMsg = e.message;
 

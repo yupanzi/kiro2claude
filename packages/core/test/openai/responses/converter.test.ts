@@ -160,7 +160,10 @@ describe('convertResponsesRequest — code mode', () => {
   });
 
   it('custom(freeform)工具 → 单 input 字符串字段的替身 schema + 适配说明,并登记名字', () => {
-    const { payload, customToolNames } = convertResponsesRequest(
+    const {
+      payload,
+      codec: { customToolNames },
+    } = convertResponsesRequest(
       base({
         model: 'gpt-5.6-sol',
         input: [
@@ -190,8 +193,11 @@ describe('convertResponsesRequest — code mode', () => {
     expect(payload.tools?.[0]?.description).toContain('`input` string field');
   });
 
-  it('非默认 namespace / web_search 仍被忽略(Codex 拒绝直调其子工具)', () => {
-    const { payload } = convertResponsesRequest(
+  it('非默认 namespace 展开并记下映射;web_search(hosted)仍被忽略', () => {
+    const {
+      payload,
+      codec: { toolNamespaces },
+    } = convertResponsesRequest(
       base({
         model: 'gpt-5.6-sol',
         input: [
@@ -210,13 +216,84 @@ describe('convertResponsesRequest — code mode', () => {
         ],
       }),
     );
-    expect(payload.tools?.map((t) => t.name)).toEqual(['keep']);
+    expect(payload.tools?.map((t) => t.name)).toEqual(['keep', 'spawn_agent']);
+    // 映射只覆盖非默认 namespace:顶层裸工具按裸名回调,进表就会被错加 namespace。
+    expect(toolNamespaces.get('spawn_agent')).toBe('collaboration');
+    expect(toolNamespaces.has('keep')).toBe(false);
   });
 
-  it('functions namespace(默认命名空间)就地展开:custom 子工具照常登记(0.147+)', () => {
+  it('同名工具跨 namespace 冲突时保留先出现者,映射不指向被丢弃的那个', () => {
+    // 从裸名反推不出该发哪个 namespace,发错等于让客户端执行另一个 handler。
+    const {
+      payload,
+      codec: { toolNamespaces },
+    } = convertResponsesRequest(
+      base({
+        model: 'gpt-5.6-sol',
+        input: [
+          {
+            type: 'additional_tools',
+            tools: [
+              { type: 'function', name: 'shared', parameters: {} },
+              {
+                type: 'namespace',
+                name: 'collaboration',
+                tools: [{ type: 'function', name: 'shared', parameters: {} }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(payload.tools?.map((t) => t.name)).toEqual(['shared']);
+    expect(toolNamespaces.has('shared')).toBe(false);
+  });
+
+  it('展开的 namespace 工具 schema 递归剥掉私有关键字 encrypted', () => {
+    const { payload } = convertResponsesRequest(
+      base({
+        model: 'gpt-5.6-sol',
+        input: [
+          {
+            type: 'additional_tools',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'collaboration',
+                tools: [
+                  {
+                    type: 'function',
+                    name: 'spawn_agent',
+                    parameters: {
+                      type: 'object',
+                      properties: {
+                        message: { type: 'string', encrypted: true },
+                        nested: { type: 'object', properties: { x: { encrypted: true } } },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(JSON.stringify(payload.tools?.[0]?.input_schema)).not.toContain('encrypted');
+    // 剥的是键名,其余 schema 原样保留。
+    expect(payload.tools?.[0]?.input_schema).toMatchObject({
+      properties: { message: { type: 'string' } },
+    });
+  });
+
+  it('functions 展开为裸名、collaboration 展开并记映射(0.147+)', () => {
     // 0.147.0 起 code mode 把 exec/wait 折进 functions 容器;实测子工具仍按裸名回调,
     // 故只展开、不改名。漏展开的后果是零工具上送——模型永远拿不到工具。
-    const { payload, customToolNames } = convertResponsesRequest(
+    // collaboration 同样展开,但必须记映射:响应侧漏写 namespace → `unsupported call`。
+    const {
+      payload,
+      codec: { customToolNames },
+    } = convertResponsesRequest(
       base({
         model: 'gpt-5.6-sol',
         input: [
@@ -243,13 +320,13 @@ describe('convertResponsesRequest — code mode', () => {
         ],
       }),
     );
-    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait']);
+    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait', 'spawn_agent']);
     expect(customToolNames).toEqual(new Set(['exec']));
   });
 
   it('functions namespace 只展开一层:内层容器按未支持 type 丢弃,不往下钻', () => {
     // 只摊平一层:第 2 层容器原样落到 convertTools 按未支持 type 丢弃(为什么不递归 =
-    // 结构上堵死栈溢出通道,理由见 expandDefaultNamespace 头注释)。
+    // 结构上堵死栈溢出通道,理由见 expandNamespaces 头注释)。
     const nested: ResponsesTool = {
       type: 'namespace',
       name: 'functions',
@@ -352,7 +429,10 @@ describe('convertResponsesRequest — code mode', () => {
   });
 
   it('tool_choice=none 时不产工具,也不登记 custom 名字', () => {
-    const { payload, customToolNames } = convertResponsesRequest(
+    const {
+      payload,
+      codec: { customToolNames },
+    } = convertResponsesRequest(
       base({
         model: 'gpt-5.6-sol',
         tool_choice: 'none',
@@ -377,7 +457,8 @@ describe('convertResponsesRequest — 真实 Codex code mode 抓包', () => {
     ),
   ) as ResponsesRequest;
   // 纯函数 + 冻结输入,转一次给全组用
-  const { payload, customToolNames } = convertResponsesRequest(fixture);
+  const { payload, codec } = convertResponsesRequest(fixture);
+  const { customToolNames } = codec;
   const allBlocks = payload.messages.flatMap(blocks);
 
   it('顶层无 tools/instructions,工具全在 additional_tools 里', () => {
@@ -385,9 +466,22 @@ describe('convertResponsesRequest — 真实 Codex code mode 抓包', () => {
     expect(fixture.instructions).toBeUndefined();
   });
 
-  it('4 个工具 → 上送 3 个(collaboration namespace 丢弃),freeform exec 被登记', () => {
-    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait', 'request_user_input']);
+  it('4 个工具 → 上送 9 个(collaboration 展开),freeform exec 被登记', () => {
+    expect(payload.tools?.map((t) => t.name)).toEqual([
+      'exec',
+      'wait',
+      'request_user_input',
+      'followup_task',
+      'interrupt_agent',
+      'list_agents',
+      'send_message',
+      'spawn_agent',
+      'wait_agent',
+    ]);
     expect(customToolNames).toEqual(new Set(['exec']));
+    // 六个 subagent 工具必须带 namespace 回程,否则客户端一律 unsupported call。
+    expect(codec.toolNamespaces.get('spawn_agent')).toBe('collaboration');
+    expect(codec.toolNamespaces.has('exec')).toBe(false);
   });
 
   it('工具调用往返还原:custom_tool_call → tool_use,output 数组 → tool_result 文本', () => {
@@ -467,7 +561,8 @@ describe('convertResponsesRequest — 真实 Codex 0.147+ code mode 抓包(funct
       'utf8',
     ),
   ) as ResponsesRequest;
-  const { payload, customToolNames } = convertResponsesRequest(fixture);
+  const { payload, codec } = convertResponsesRequest(fixture);
+  const { customToolNames } = codec;
   const allBlocks = payload.messages.flatMap(blocks);
 
   it('工具全嵌在 namespace 里:顶层无 tools,additional_tools 只有 namespace 条目', () => {
@@ -478,9 +573,21 @@ describe('convertResponsesRequest — 真实 Codex 0.147+ code mode 抓包(funct
     expect(carrier?.tools?.every((t) => t.type === 'namespace')).toBe(true);
   });
 
-  it('functions namespace 展开、collaboration 丢弃,freeform exec 被登记', () => {
-    expect(payload.tools?.map((t) => t.name)).toEqual(['exec', 'wait', 'request_user_input']);
+  it('functions 与 collaboration 两层容器都展开,freeform exec 被登记', () => {
+    expect(payload.tools?.map((t) => t.name)).toEqual([
+      'exec',
+      'wait',
+      'request_user_input',
+      'followup_task',
+      'interrupt_agent',
+      'list_agents',
+      'send_message',
+      'spawn_agent',
+      'wait_agent',
+    ]);
     expect(customToolNames).toEqual(new Set(['exec']));
+    expect(codec.toolNamespaces.get('spawn_agent')).toBe('collaboration');
+    expect(codec.toolNamespaces.has('exec')).toBe(false);
   });
 
   it('custom_tool_call 往返照旧:裸名 exec,裸文本包回 {input}', () => {

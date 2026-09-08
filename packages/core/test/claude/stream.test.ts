@@ -42,7 +42,7 @@ function makeToolUse(
   name: string,
   id: string,
   input = '{}',
-  isComplete = false,
+  isComplete = true,
 ): Extract<Event, { kind: 'ToolUse' }> {
   return { kind: 'ToolUse', name, toolUseId: id, input, isComplete };
 }
@@ -695,6 +695,7 @@ describe('Stop reasons', () => {
         content: '<thinking>\nabc</thinking>\n\nHello',
       }),
     );
+    all.push(...ctx.processKiroEvent({ kind: 'Metadata', stopReason: 'END_TURN' }));
     all.push(...(await ctx.generateFinalEvents()));
 
     const messageDelta = all.find((e) => e.event === 'message_delta');
@@ -711,6 +712,7 @@ describe('Stop reasons', () => {
       ...ctx.processKiroEvent({ kind: 'AssistantResponse', content: '<thinking>\nabc</thinking>' }),
     );
     all.push(...ctx.processToolUse(makeToolUse('test_tool', 'tool_1', '{}', true)));
+    all.push(...ctx.processKiroEvent({ kind: 'Metadata', stopReason: 'END_TURN' }));
     all.push(...(await ctx.generateFinalEvents()));
 
     const messageDelta = all.find((e) => e.event === 'message_delta');

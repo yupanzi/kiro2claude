@@ -166,7 +166,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 200,
           messages: [{ role: 'user', content: 'Answer in one sentence: what is 1+1?' }],
         },
@@ -212,7 +212,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 300,
           messages: [
             {
@@ -249,7 +249,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 100,
           messages: [{ role: 'user', content: 'hi' }],
         },
@@ -279,7 +279,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
           url: '/claude/v1/messages',
           headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
           payload: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-5',
             max_tokens: 300,
             system,
             messages: [
@@ -320,7 +320,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
           url: '/claude/v1/messages',
           headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
           payload: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-5',
             max_tokens: 100,
             messages: [{ role: 'user', content }],
           },
@@ -343,7 +343,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 200,
           stream: true,
           messages: [
@@ -371,7 +371,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   // --------------------------------------------------------------------------
   // 5. WebSearch MCP bypass — exercises websearch.ts shortcut path
   //
-  //    `tools.length === 1 && tools[0].name === 'web_search'` triggers
+  //    A single `web_search` tool with a dated hosted type triggers
   //    the shortcut that bypasses the converter and issues an MCP call.
   //    Query: live BTC/USD price. Assertion is against structure + price
   //    digit pattern, never against an exact price (too volatile).
@@ -384,9 +384,10 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 1024,
           tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+          stream: true,
           messages: [
             {
               role: 'user',
@@ -396,7 +397,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         },
       });
       expect(res.statusCode).toBe(200);
-      // WebSearch bypass forces SSE output regardless of stream flag
+      // Explicit streaming request uses the Messages SSE transport.
       const events = parseSseEvents(res.body);
 
       // server_tool_use block must be present, name=web_search
@@ -459,7 +460,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 400,
           messages: [
             {
@@ -526,7 +527,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
       url: '/claude/v1/messages/count_tokens',
       headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
       payload: {
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-5',
         messages: [{ role: 'user', content: 'What is the latest price of Bitcoin?' }],
       },
     });
@@ -581,7 +582,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools: [weatherTool],
           messages: [
@@ -621,7 +622,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools: [weatherTool],
           messages: [
@@ -698,7 +699,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           stream: true,
           tools: [calculatorTool],
@@ -804,7 +805,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 800,
           tools: [taskTool],
           messages: [
@@ -886,7 +887,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 1500,
           tools: [taskTool],
           messages: [
@@ -988,7 +989,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 400,
           tools: [longNameTool],
           messages: [
@@ -1113,7 +1114,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools,
           messages,
@@ -1150,7 +1151,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools,
           messages,
@@ -1191,7 +1192,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools,
           messages,
@@ -1236,7 +1237,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 2000,
           thinking: { type: 'enabled', budget_tokens: 4000 },
           messages: [
@@ -1313,7 +1314,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 2000,
           stream: true,
           thinking: { type: 'enabled', budget_tokens: 4000 },
@@ -1573,7 +1574,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 16384,
           system: [
             { text: 'You are Claude Code, Anthropic official CLI for Claude.' },
@@ -1667,7 +1668,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools,
           messages: [{ role: 'user', content: firstPrompt }],
@@ -1690,7 +1691,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 500,
           tools,
           messages: [
@@ -1780,7 +1781,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 1500,
           tools: [readTool],
           messages: [
@@ -1856,7 +1857,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 200,
           messages: [
             {
@@ -1904,7 +1905,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 300,
           tools: [
             {
@@ -1973,7 +1974,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 200,
           tools: [
             {
@@ -2030,7 +2031,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 100,
           messages: [
             {
@@ -2069,7 +2070,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 200,
           messages: [
             {
@@ -2117,7 +2118,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         url: '/claude/v1/messages',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
         payload: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-5',
           max_tokens: 64,
           system: 'You are a helper.',
           messages: [{ role: 'user', content: 'Reply with the single word: ready' }],

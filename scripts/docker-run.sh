@@ -38,7 +38,7 @@
 #   --image IMAGE      镜像 tag，默认 kiro2claude:latest
 #   --volume VOL       持久化卷名，默认 kiro-home
 #                      （删掉卷 = 清除认证 = 下次重新走 device flow）
-#   --rebuild          启动前先 docker build -t $IMAGE .
+#   --rebuild          启动前调用 docker-build.sh，自动选择 Dockerfile 和 CLI 版本
 #   --logs             启动后立刻 docker logs -f（首次登录用来看 device flow URL）
 #   --recreate         同名容器存在时先删再建（默认：已存在就报错退出）
 #   -h, --help         显示本帮助
@@ -54,13 +54,13 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # ---------------------------------------------------------------------------
 # 默认值 —— 优先级：CLI flag > 环境变量 > .env.docker > 硬编码
 # ---------------------------------------------------------------------------
-API_KEY="${KIRO2CLAUDE_API_KEY:-}"
-START_URL="${KIRO2CLAUDE_LOGIN_START_URL:-}"
-REGION="${KIRO2CLAUDE_LOGIN_REGION:-us-east-1}"
-PORT="${KIRO2CLAUDE_PORT_HOST:-8080}"
-NAME="${KIRO2CLAUDE_CONTAINER_NAME:-kiro2claude}"
-IMAGE="${KIRO2CLAUDE_IMAGE:-kiro2claude:latest}"
-VOLUME="${KIRO2CLAUDE_VOLUME:-kiro-home}"
+API_KEY=""
+START_URL=""
+REGION="us-east-1"
+PORT="8080"
+NAME="kiro2claude"
+IMAGE="kiro2claude:latest"
+VOLUME="kiro-home"
 REBUILD=0
 FOLLOW_LOGS=0
 RECREATE=0
@@ -72,6 +72,15 @@ if [[ -f "$PROJECT_ROOT/.env.docker" ]]; then
   # shellcheck disable=SC1091
   set -a; source "$PROJECT_ROOT/.env.docker"; set +a
 fi
+
+# 文件提供默认值，显式环境变量随后覆盖（包括空值，例如跳过 bootstrap login）。
+API_KEY="${KIRO2CLAUDE_API_KEY-$API_KEY}"
+START_URL="${KIRO2CLAUDE_LOGIN_START_URL-$START_URL}"
+REGION="${KIRO2CLAUDE_LOGIN_REGION-$REGION}"
+PORT="${KIRO2CLAUDE_PORT_HOST-$PORT}"
+NAME="${KIRO2CLAUDE_CONTAINER_NAME-$NAME}"
+IMAGE="${KIRO2CLAUDE_IMAGE-$IMAGE}"
+VOLUME="${KIRO2CLAUDE_VOLUME-$VOLUME}"
 
 # ---------------------------------------------------------------------------
 # 解析 CLI 参数 —— 覆盖上面的任何默认值
@@ -122,13 +131,12 @@ fi
 # 准备镜像
 # ---------------------------------------------------------------------------
 if [[ "$REBUILD" -eq 1 ]]; then
-  echo "→ docker build -t $IMAGE $PROJECT_ROOT"
-  docker build -t "$IMAGE" "$PROJECT_ROOT"
+  "$SCRIPT_DIR/docker-build.sh" -t "$IMAGE"
 elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   cat >&2 <<EOF
 错误: 镜像 '$IMAGE' 不存在。
-  先跑:  $0 --rebuild $*
-  或者:  docker build -t $IMAGE $PROJECT_ROOT
+  重新运行本命令并添加 --rebuild
+  或者:  $SCRIPT_DIR/docker-build.sh -t $IMAGE
 EOF
   exit 1
 fi
@@ -174,7 +182,7 @@ if [[ -n "$START_URL" ]]; then
   ENV_ARGS+=(-e "KIRO2CLAUDE_LOGIN_START_URL=$START_URL")
 fi
 
-echo "→ docker run $NAME  image=$IMAGE  port=$PORT→8080  volume=$VOLUME"
+echo "→ docker run $NAME  image=$IMAGE  port=${PORT}→8080  volume=$VOLUME"
 CID=$(docker run -d \
   --name "$NAME" \
   "${ENV_ARGS[@]}" \

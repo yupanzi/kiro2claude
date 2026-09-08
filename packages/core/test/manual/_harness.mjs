@@ -16,7 +16,7 @@
 
 export const KEY = process.env.K2C_KEY;
 export const BASE = process.env.K2C_BASE ?? 'http://127.0.0.1:8080';
-export const CLAUDE_MODEL = process.env.CLAUDE_MODEL ?? 'claude-opus-4-6';
+export const CLAUDE_MODEL = process.env.CLAUDE_MODEL ?? 'claude-opus-5';
 export const GPT_MODEL = process.env.GPT_MODEL ?? 'gpt-5.6-sol';
 
 export const CLAUDE_PATH = '/claude/v1/messages';

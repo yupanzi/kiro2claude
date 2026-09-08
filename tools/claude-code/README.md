@@ -127,13 +127,18 @@ claude --version
 cat /etc/cc-version    # build 时落地的实际版本号
 ```
 
+## 已知的客户端侧行为
+
+- **判定不能只看 `subtype:"success"`**:headless(`-p --output-format json`)下,持续故障的终态同样带 `subtype:"success"`,但 `is_error:true` 且退出码为 1;反过来,上游在帧边界干净 EOF 时(修复前)`exitCode:0`、`is_error:false`、任务却只做了一部分。判定必须联合退出码、`is_error`、工作区里的实际产物、网关状态码与流内终态,`test.sh` 与 `test/manual/` 的探针都是这么做的。
+- **Unicode 转义改写**:2.1.263 会把工具参数里字面的 `\u0000` / `\u000a` JSON 转义还原成真实 NUL / LF(直连 Anthropic 也复现),网关侧无解。细节与复现脚本见根 README「已知限制」。
+
 ## 自动化测试
 
 `test.sh` 用真实的 Claude Code CLI 经 kiro2claude 网关跑一组 headless 用例,覆盖项目 `test/e2e/live.test.ts` 没覆盖到的"真客户端 wire 兼容性"维度。
 
 ### 前置
 
-- kiro2claude 网关已在本地 `:8080` 启动（`pnpm dev` 或 docker）——`test.sh` 会自动 probe `/health` 失败立即报错
+- kiro2claude 网关已在本地 `:8080` 启动（`pnpm dev` 或 docker）——`test.sh` 会自动 probe `/health` 失败立即报错；传 `-u http://host.docker.internal:18080/claude` 时探测同一地址根路径的 `/health`，客户端仍使用原 `/claude` base URL
 - 宿主机有 `docker` / `jq` / `curl`
 - 仓库根 `.env` 里有 `KIRO2CLAUDE_API_KEY`（或 `-t` 显式传）
 

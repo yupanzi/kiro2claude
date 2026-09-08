@@ -21,7 +21,14 @@ export type ResponsesContentPart =
   | { type: 'input_text'; text: string }
   | { type: 'output_text'; text: string }
   | { type: 'input_image'; image_url?: string | { url?: string } }
-  | { type: 'refusal'; refusal: string };
+  | { type: 'refusal'; refusal: string }
+  /**
+   * multi-agent v2 的子任务正文通道。★ 名字叫 encrypted,内容实测是**明文**——它标记
+   * 的是「父线程不该复述给用户」,不是密码学加密(与 `reasoning.encrypted_content` 的
+   * 不透明密文**不是一回事**,那个真的无法解码)。只有 NEW_TASK 信封里的这一种会被
+   * 转成可读文本,判据与红线见 converter.ts `convertAgentMessage`。
+   */
+  | { type: 'encrypted_content'; encrypted_content: string };
 
 export interface ResponsesMessageItem {
   type?: 'message';
@@ -35,6 +42,12 @@ export interface ResponsesFunctionCallItem {
   call_id: string;
   name: string;
   arguments: string;
+  /**
+   * 调用所属的工具 namespace(如 `collaboration`)。客户端**按它路由**到对应 handler,
+   * 少了这个字段同一个调用会被判 `unsupported call`。请求侧只做回放(名字已够定位历史
+   * tool_use),真正必须写出的是响应侧——见 converter.ts `expandNamespaces`。
+   */
+  namespace?: string;
 }
 
 /**
@@ -89,6 +102,29 @@ export interface ResponsesCustomToolCallOutputItem extends ResponsesToolOutputIt
   type: 'custom_tool_call_output';
 }
 
+/**
+ * multi-agent v2 的线程间信封(实测 0.153.4):子线程的任务正文、以及 agent 之间的
+ * 消息都走它,`author`/`recipient` 是 `/root`、`/root/<task_name>` 这样的线程路径。
+ *
+ * ⚠ 它**不是** message item:`role` 不存在,内容分两段——一段 `input_text` 的元信息
+ * 头(`Message Type: NEW_TASK\n…Payload:\n`),一段 `encrypted_content` 的正文。
+ * 当成未知 type 丢掉的后果是子线程收到空 Payload(修复前实测)。转换判据见
+ * converter.ts `convertAgentMessage`。
+ */
+export interface ResponsesAgentMessageItem {
+  type: 'agent_message';
+  author?: string;
+  recipient?: string;
+  content: ResponsesContentPart[];
+}
+
+/**
+ * 「本请求没有任何带 namespace 的工具」。放在 types.ts 而不是 converter.ts:编码器
+ * 与转换器都要用它,而编码器不该为一个空 Map 反向依赖转换器(镜像 freeform 侧的
+ * `NO_FREEFORM_TOOLS` 落在共享的 freeform-tool.ts)。只读、可安全共享。
+ */
+export const NO_TOOL_NAMESPACES: ReadonlyMap<string, string> = new Map<string, string>();
+
 export type ResponsesInputItem =
   | ResponsesMessageItem
   | ResponsesFunctionCallItem
@@ -96,7 +132,8 @@ export type ResponsesInputItem =
   | ResponsesReasoningItem
   | ResponsesAdditionalToolsItem
   | ResponsesCustomToolCallItem
-  | ResponsesCustomToolCallOutputItem;
+  | ResponsesCustomToolCallOutputItem
+  | ResponsesAgentMessageItem;
 
 /**
  * Responses 工具定义(扁平:name/description/parameters 在顶层)。
@@ -107,7 +144,7 @@ export type ResponsesInputItem =
  * ★ 新版 Codex 的 code mode 会把 function/custom 工具再折进一层名为 **`functions`** 的
  * namespace 容器(`{type:'namespace',name:'functions',tools:[…]}`),子工具形状不变。
  * 两套形态都要接得住;展不展开、为什么只展开这一个,见 converter.ts
- * `expandDefaultNamespace`(唯一真相源)。
+ * `expandNamespaces`(唯一真相源)。
  */
 export interface ResponsesTool {
   type: string;
@@ -117,7 +154,7 @@ export interface ResponsesTool {
   strict?: boolean;
   /** freeform 工具的语法约束(实测 `{type:'grammar',syntax:'lark',definition}`)。上游无对应通道,丢弃。 */
   format?: { type?: string; syntax?: string; definition?: string };
-  /** `type:'namespace'` 的子工具。展开规则见 converter.ts `expandDefaultNamespace`。 */
+  /** `type:'namespace'` 的子工具。展开规则见 converter.ts `expandNamespaces`。 */
   tools?: ResponsesTool[];
 }
 
@@ -173,6 +210,11 @@ export interface ResponsesFunctionCallOutputItemOut {
   type: 'function_call';
   call_id: string;
   name: string;
+  /**
+   * 非默认 namespace 的工具**必须**带它,客户端 router 据此分发;默认命名空间按裸名
+   * 回调,字段缺席即正确。来源是请求侧的每请求映射,见 converter.ts `expandNamespaces`。
+   */
+  namespace?: string;
   arguments: string;
   status: 'in_progress' | 'completed';
 }
@@ -224,7 +266,7 @@ export interface ResponsesObject {
   usage: ResponsesUsage | null;
   // Codex/SDK 常读这几个;给中性默认值避免解析报错
   error: null;
-  incomplete_details: null;
+  incomplete_details: { reason: 'max_output_tokens' } | null;
   metadata: Record<string, unknown>;
 }
 

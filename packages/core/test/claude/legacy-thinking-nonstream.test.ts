@@ -4,6 +4,7 @@ import { buildToolTextRegistry } from '../../src/claude/tool-call-text.js';
 import type { Tool } from '../../src/claude/types.js';
 import {
   buildAssistantResponseFrame,
+  buildMetadataFrame,
   buildReasoningContentFrame,
   buildRedactedReasoningFrame,
   buildToolUseFrame,
@@ -30,9 +31,11 @@ const LEAKED_READ = [
   '</invoke>',
 ].join('\n');
 
+// Every case here is a *finished* upstream reply, so append the real
+// completion marker; the grammar under test is orthogonal to clean-EOF handling.
 function reduce(frames: Buffer[], options: { thinkingEnabled?: boolean; rescue?: boolean } = {}) {
   return reduceKiroResponse(
-    Buffer.concat(frames),
+    Buffer.concat([...frames, buildMetadataFrame()]),
     MODEL,
     options.thinkingEnabled ?? true,
     new Map(),
