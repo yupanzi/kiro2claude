@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/yupanzi/kiro2claude/compare/v1.6.0...v1.6.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **core:** 子 agent 发给父线程的中间消息不再丢正文 ([afe9767](https://github.com/yupanzi/kiro2claude/commit/afe9767e9e391514cf9a11df4d34372692e3700d))
+
 # [1.6.0](https://github.com/yupanzi/kiro2claude/compare/v1.5.5...v1.6.0) (2026-09-08)
 
 
