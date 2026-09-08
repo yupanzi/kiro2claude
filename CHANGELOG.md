@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/yupanzi/kiro2claude/compare/v1.5.5...v1.6.0) (2026-09-08)
+
+
+### Features
+
+* **kiro:** 上游连接池大小可配,默认 50 提到 100 ([b3872f7](https://github.com/yupanzi/kiro2claude/commit/b3872f7663b5f4ad6690a373b2698cc686ac22ba))
+
 ## [1.5.5](https://github.com/yupanzi/kiro2claude/compare/v1.5.4...v1.5.5) (2026-09-08)
 
 
