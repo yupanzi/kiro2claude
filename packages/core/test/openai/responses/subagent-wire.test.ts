@@ -1,26 +1,31 @@
 /**
  * multi-agent v2 扩展 wire format 的守卫(Codex 0.153.4 实测形态)。
  *
- * 这一组钉的是**三个静默失败**——都不报错,却让 subagent 功能整体失效:
+ * 这一组钉的是**四个静默失败**——都不报错,却让 subagent 功能整体失效:
  *   1. `function_call` 少 `namespace` 字段 → 客户端 router 按裸名查不到 handler,
  *      回 `unsupported call: spawn_agent`。
  *   2. `NEW_TASK` 信封(父 → 子)被当未知 type 丢弃 → 子线程收到**空 Payload**。
  *   3. `FINAL_ANSWER` 信封(子 → 父)被丢弃 → 父线程模型**看不到子 agent 的答案**。
  *      ★ 最隐蔽的一个:`wait_agent` 的工具结果只有 `{"message":"Wait completed."}`,
  *      不含答案,所以链路全绿、父线程却在空手总结。
+ *   4. `MESSAGE` 信封(子 → 父,`send_message`)的 `encrypted_content` 正文被跳过 →
+ *      父线程收到空 `Payload:`,把它误读成简短确认(「过早的 OK」)。spawn / NEW_TASK /
+ *      FINAL_ANSWER 全部正常,**只有**中间消息丢正文,固定 nonce 端到端返回
+ *      `{"message":"EMPTY"}` 才看得出来。
  *
  * 复跑:`test/manual/codex-subagent-probe-server.ts` 打因果对照(哪一半起作用),
  * `test/manual/codex-subagent-lifecycle-server.ts` 打完整生命周期(并发不串线 /
- * followup / interrupt / timeout / fork_turns / 故障重试不重复 spawn)。
- * 两个都是真实 Codex CLI + 假 provider,不连上游、不计费。
+ * followup / interrupt / timeout / fork_turns / 故障重试不重复 spawn / `message`
+ * 中间消息正文到达上游)。两个都是真实 Codex CLI + 假 provider,不连上游、不计费。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ReducedAttempt } from '../../../src/claude/non-stream-reduce.js';
 import type { SseEvent } from '../../../src/claude/stream.js';
 import { convertResponsesRequest } from '../../../src/openai/responses/converter.js';
 import { buildResponsesObject } from '../../../src/openai/responses/response-nonstream.js';
 import { ResponsesEventEncoder } from '../../../src/openai/responses/response-stream.js';
 import type { ResponsesRequest } from '../../../src/openai/responses/types.js';
+import { logger } from '../../../src/shared/logger.js';
 
 const COLLAB_TOOLS = [
   'followup_task',
@@ -231,11 +236,12 @@ describe('multi-agent v2 — 响应侧 namespace 字段', () => {
   });
 });
 
-describe('multi-agent v2 — NEW_TASK 信封', () => {
-  const envelope = (text: string, body: string) => ({
+describe('multi-agent v2 — 线程间信封(NEW_TASK / MESSAGE / FINAL_ANSWER)', () => {
+  // 默认父 → 子;子 → 父的信封把 author / recipient 反过来传。
+  const envelope = (text: string, body: string, author = '/root', recipient = '/root/probe') => ({
     type: 'agent_message' as const,
-    author: '/root',
-    recipient: '/root/probe',
+    author,
+    recipient,
     content: [
       { type: 'input_text' as const, text },
       { type: 'encrypted_content' as const, encrypted_content: body },
@@ -291,6 +297,112 @@ describe('multi-agent v2 — NEW_TASK 信封', () => {
     expect(JSON.stringify(msg?.content)).toContain('/root/probe');
   });
 
+  it('★ MESSAGE(子 → 父,send_message)的 encrypted_content 正文必须转明文', () => {
+    // 修复前:头留下、正文被当「非 NEW_TASK 的 encrypted_content」跳过 → 父线程只见空
+    // `Payload:`,把它误读成一句简短确认。固定 nonce 端到端返回 {"message":"EMPTY"}。
+    const { payload } = convertResponsesRequest({
+      model: 'gpt-5.6-sol',
+      input: [
+        envelope(
+          'Message Type: MESSAGE\nSender: /root/probe\nPayload:\n',
+          'MESSAGE_NONCE_7F3A',
+          '/root/probe',
+          '/root',
+        ),
+      ],
+    });
+    const msg = payload.messages.at(-1);
+    expect(msg?.role).toBe('user');
+    expect(msg?.content).toEqual([
+      { type: 'text', text: 'Message Type: MESSAGE\nSender: /root/probe\nPayload:\n' },
+      { type: 'text', text: 'MESSAGE_NONCE_7F3A' },
+    ]);
+    // author / recipient 是客户端侧路由信息,不进模型上下文。
+    expect(msg).not.toHaveProperty('author');
+    expect(msg).not.toHaveProperty('recipient');
+  });
+
+  it('两个子 agent 并发发 MESSAGE:各自正文跟各自的头走,顺序保持、不串线', () => {
+    const { payload } = convertResponsesRequest({
+      model: 'gpt-5.6-sol',
+      input: [
+        envelope(
+          'Message Type: MESSAGE\nSender: /root/alpha\nPayload:\n',
+          'NONCE_ALPHA',
+          '/root/alpha',
+          '/root',
+        ),
+        envelope(
+          'Message Type: MESSAGE\nSender: /root/beta\nPayload:\n',
+          'NONCE_BETA',
+          '/root/beta',
+          '/root',
+        ),
+      ],
+    });
+    expect(payload.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Message Type: MESSAGE\nSender: /root/alpha\nPayload:\n' },
+          { type: 'text', text: 'NONCE_ALPHA' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Message Type: MESSAGE\nSender: /root/beta\nPayload:\n' },
+          { type: 'text', text: 'NONCE_BETA' },
+        ],
+      },
+    ]);
+  });
+
+  it('Message Type 按整个 token 比对:MESSAGE_V2 这类前缀相同的类型不在白名单里', () => {
+    const { payload } = convertResponsesRequest({
+      model: 'gpt-5.6-sol',
+      input: [
+        envelope(
+          'Message Type: MESSAGE_V2\nPayload:\n',
+          'PREFIX_COLLISION_BODY',
+          '/root/probe',
+          '/root',
+        ),
+      ],
+    });
+    // 信封本身仍转发(头留下),但正文语义未知、不转明文。
+    expect(JSON.stringify(payload.messages)).toContain('MESSAGE_V2');
+    expect(JSON.stringify(payload.messages)).not.toContain('PREFIX_COLLISION_BODY');
+  });
+
+  it('日志只记类型与是否转了正文,绝不记 Payload / 正文', () => {
+    const spy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    try {
+      convertResponsesRequest({
+        model: 'gpt-5.6-sol',
+        input: [
+          envelope(
+            'Message Type: MESSAGE\nSender: /root/probe\nPayload:\n',
+            'SECRET_BODY_MUST_NOT_LOG',
+            '/root/probe',
+            '/root',
+          ),
+        ],
+      });
+      const envelopeLogs = spy.mock.calls
+        .map((c) => c[0] as Record<string, unknown>)
+        .filter((f) => f?.msg === 'responses: converted multi-agent envelope');
+      expect(envelopeLogs).toHaveLength(1);
+      const fields = envelopeLogs[0] as Record<string, unknown>;
+      expect(fields.message_type).toBe('MESSAGE');
+      expect(fields.body_converted).toBe(true);
+      expect(JSON.stringify(fields)).not.toContain('SECRET_BODY_MUST_NOT_LOG');
+      expect(JSON.stringify(fields)).not.toContain('Payload:');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('未知 Message Type 的信封也转发(丢弃 = 模型失明,是更糟的失败模式)', () => {
     const { payload } = convertResponsesRequest({
       model: 'gpt-5.6-sol',
@@ -308,21 +420,20 @@ describe('multi-agent v2 — NEW_TASK 信封', () => {
     expect(JSON.stringify(payload.messages)).toContain('hello');
   });
 
-  it('★ 非 NEW_TASK 信封的 encrypted_content 不转明文(语义未知,转出去是泄漏)', () => {
+  it('★ 白名单外信封(FINAL_ANSWER 等)的 encrypted_content 不转明文(语义未知,转出去是泄漏)', () => {
     const { payload } = convertResponsesRequest({
       model: 'gpt-5.6-sol',
       input: [
-        {
-          type: 'agent_message',
-          author: '/root/probe',
-          recipient: '/root',
-          content: [
-            { type: 'input_text', text: 'Message Type: FINAL_ANSWER\nPayload:\n' },
-            { type: 'encrypted_content', encrypted_content: 'PRIVATE_SIDE_CHANNEL' },
-          ],
-        },
+        envelope(
+          'Message Type: FINAL_ANSWER\nPayload:\n',
+          'PRIVATE_SIDE_CHANNEL',
+          '/root/probe',
+          '/root',
+        ),
       ],
     });
+    // FINAL_ANSWER 实测正文在 input_text 的 Payload 段,不走 encrypted_content;若某天它也
+    // 带了这个字段,语义未知,不转——要扩白名单先抓脱敏 fixture 确认(见 converter.ts)。
     // 信封本身转了(头留下),但那段私有内容没有跟进模型上下文。
     expect(JSON.stringify(payload.messages)).toContain('FINAL_ANSWER');
     expect(JSON.stringify(payload.messages)).not.toContain('PRIVATE_SIDE_CHANNEL');
@@ -333,15 +444,7 @@ describe('multi-agent v2 — NEW_TASK 信封', () => {
     const { payload } = convertResponsesRequest({
       model: 'gpt-5.6-sol',
       input: [
-        {
-          type: 'agent_message',
-          author: '/root',
-          recipient: '/root/other',
-          content: [
-            { type: 'input_text', text: 'just some chatter' },
-            { type: 'encrypted_content', encrypted_content: 'PRIVATE_STATE' },
-          ],
-        },
+        envelope('just some chatter', 'PRIVATE_STATE', '/root', '/root/other'),
         { role: 'user', content: 'go' },
       ],
     });

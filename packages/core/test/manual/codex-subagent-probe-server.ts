@@ -35,7 +35,11 @@ import Fastify from 'fastify';
 import type { KiroProvider } from '../../src/kiro/provider.js';
 import { HookBus } from '../../src/plugin-host/index.js';
 import { registerOpenAiRoutes } from '../../src/routes/openai.js';
-import { buildAssistantResponseFrame, buildToolUseFrame } from '../helpers/event-stream.js';
+import {
+  buildAssistantResponseFrame,
+  buildToolUseFrame,
+  completedFrames,
+} from '../helpers/event-stream.js';
 
 type Obj = Record<string, any>;
 
@@ -230,8 +234,8 @@ for (const kind of cases) {
       // a reply that never happened; the client's actual reply is in state.outputs.
       const nextFrames = (): Buffer[] =>
         state.outputs === 0
-          ? [buildToolUseFrame(dispatchTool, `call_${kind}_1`, dispatchInput, true)]
-          : [buildAssistantResponseFrame('PROBE_ROUND_TRIP_DONE')];
+          ? completedFrames(buildToolUseFrame(dispatchTool, `call_${kind}_1`, dispatchInput, true))
+          : completedFrames(buildAssistantResponseFrame('PROBE_ROUND_TRIP_DONE'));
 
       /**
        * The decisive end-to-end check: did the sub-thread's task body survive all

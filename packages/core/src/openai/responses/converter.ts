@@ -236,19 +236,32 @@ function convertInputItem(
 }
 
 /**
- * multi-agent v2 线程间信封的结构化头。**两个方向都必须转**(0.153.4 实测):
- * `NEW_TASK`(父 → 子,派活)与 `FINAL_ANSWER`(子 → 父,交活)。
+ * multi-agent v2 线程间信封的结构化头。**三类信封都必须转**(0.153.4 实测):
+ * `NEW_TASK`(父 → 子,派活)、`MESSAGE`(子 → 父,`send_message` 的中间消息)、
+ * `FINAL_ANSWER`(子 → 父,交活)。
  */
 const AGENT_ENVELOPE_MARKER = 'Message Type:';
-const NEW_TASK_MARKER = 'Message Type: NEW_TASK';
+/** 从明文头里取 `Message Type: <KIND>` 的值;只认整个 token,`MESSAGE_V2` 不等于 `MESSAGE`。 */
+const MESSAGE_TYPE_PATTERN = new RegExp(`${AGENT_ENVELOPE_MARKER}[ \\t]*([A-Za-z0-9_]+)`);
+/**
+ * 正文走 `encrypted_content` 且**允许**转成明文的信封类型(白名单)。
+ * `NEW_TASK` 是任务正文,`MESSAGE` 是 `send_message` 的消息正文——两者都是发给接收线程
+ * 模型看的,不转 = 接收方收到空 `Payload:`。`FINAL_ANSWER` 实测正文在 `input_text`,
+ * **不在**名单里;将来若它也改成分离正文,先抓脱敏 fixture 确认再加。
+ */
+const PLAINTEXT_BODY_MESSAGE_TYPES: ReadonlySet<string> = new Set(['NEW_TASK', 'MESSAGE']);
 
 /**
  * multi-agent v2 的 `agent_message` 信封 → 一条普通 user message。
  *
  * Kiro 只有 user/assistant 通道,信封没有对应类型,不转换就整条落进 `unknownTypes`。
- * 两个方向各自的实测后果:
+ * 三类信封各自的实测后果:
  *   - `NEW_TASK`(父 → 子,正文在 `encrypted_content`)丢了 → **子线程收到空 Payload**,
  *     拿着一个没有任务的 prompt 开工。
+ *   - `MESSAGE`(子 → 父,`send_message` 发出,正文同样在 `encrypted_content`)丢了 →
+ *     **父线程只看到空 `Payload:`**,把空回执误读成一句简短确认,出现「过早的 OK」类
+ *     错误叙述(0.153.4 实测:固定 nonce 端到端返回 `{"message":"EMPTY"}`,spawn /
+ *     NEW_TASK / FINAL_ANSWER 全部正常,只有这一条中间消息丢正文)。
  *   - `FINAL_ANSWER`(子 → 父,正文在 `input_text` 的 `Payload:` 段)丢了 → **父线程模型
  *     永远看不到子 agent 的答案**。★ 这条尤其隐蔽:`wait_agent` 的工具结果只有
  *     `{"message":"Wait completed.","timed_out":false}`,**不含**答案本身,所以链路看起来
@@ -257,13 +270,16 @@ const NEW_TASK_MARKER = 'Message Type: NEW_TASK';
  * ★ 判据分两层,**别合并**:
  *   1. 转不转这条信封 —— 看有没有结构化的 `Message Type:` 头。够窄(普通消息没有它),
  *      又不必逐个 Message Type 白名单——新增类型丢弃 = 模型失明,是更糟的失败模式。
- *   2. `encrypted_content` 转不转明文 —— **只在 `NEW_TASK` 信封里**。这是任务正文、
- *      子线程非看不到不可;其余信封的同名字段语义网关并不掌握,转出去是信息泄漏而非
- *      兼容(`reasoning.encrypted_content` 更是真正不可解码的密文,永不转)。
+ *   2. `encrypted_content` 转不转明文 —— **只在 `PLAINTEXT_BODY_MESSAGE_TYPES` 白名单
+ *      信封里**(`NEW_TASK` / `MESSAGE`)。这些是发给接收线程模型看的正文,非看到不可;
+ *      名单外信封的同名字段语义网关并不掌握,转出去是信息泄漏而非兼容
+ *      (`reasoning.encrypted_content` 更是真正不可解码的密文,永不转——那是另一个
+ *      item type,根本不进这个函数)。类型按**整个 token** 比对,不做前缀匹配。
  *
  * 元信息头与正文都保留、且**保持原顺序**:头里有 Sender / Task name / Payload 分段,
- * 只留正文会让接收方不知道这是谁发来的、是派活还是交活。
- * 正文本身不进日志(CLAUDE.md 日志红线:不记 prompt / 子任务正文)。
+ * 只留正文会让接收方不知道这是谁发来的、是派活还是交活。`author` / `recipient` 是
+ * 客户端侧的线程路由信息,不进模型上下文。
+ * 正文本身不进日志(CLAUDE.md 日志红线:不记 prompt / 子任务正文),只记类型与是否转了正文。
  */
 function convertAgentMessage(item: ResponsesAgentMessageItem): ClaudeMessage | undefined {
   const parts: ResponsesContentPart[] = Array.isArray(item.content) ? item.content : [];
@@ -272,16 +288,20 @@ function convertAgentMessage(item: ResponsesAgentMessageItem): ClaudeMessage | u
     .map((p) => (p as { text: string }).text)
     .join('\n');
   if (!headerText.includes(AGENT_ENVELOPE_MARKER)) return undefined;
-  const isNewTask = headerText.includes(NEW_TASK_MARKER);
+  const messageType = MESSAGE_TYPE_PATTERN.exec(headerText)?.[1];
+  const allowPlaintextBody =
+    messageType !== undefined && PLAINTEXT_BODY_MESSAGE_TYPES.has(messageType);
 
   const blocks: ContentBlock[] = [];
+  let bodyConverted = false;
   for (const part of parts) {
     if (!part || typeof part !== 'object') continue;
     if (part.type === 'encrypted_content') {
-      // 非 NEW_TASK 的 encrypted_content 跳过(见上「判据分两层」),不记内容。
-      if (!isNewTask) continue;
+      // 白名单外信封的 encrypted_content 跳过(见上「判据分两层」),不记内容。
+      if (!allowPlaintextBody) continue;
       if (typeof part.encrypted_content === 'string' && part.encrypted_content) {
         blocks.push({ type: 'text', text: part.encrypted_content });
+        bodyConverted = true;
       }
       continue;
     }
@@ -292,7 +312,8 @@ function convertAgentMessage(item: ResponsesAgentMessageItem): ClaudeMessage | u
   getLogger().info({
     msg: 'responses: converted multi-agent envelope',
     // 只记路由信息与类别,不记 Payload(日志红线)。
-    envelope_kind: isNewTask ? 'new_task' : 'other',
+    message_type: messageType ?? 'unknown',
+    body_converted: bodyConverted,
     author: item.author,
     recipient: item.recipient,
   });

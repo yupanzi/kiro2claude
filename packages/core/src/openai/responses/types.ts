@@ -23,10 +23,9 @@ export type ResponsesContentPart =
   | { type: 'input_image'; image_url?: string | { url?: string } }
   | { type: 'refusal'; refusal: string }
   /**
-   * multi-agent v2 的子任务正文通道。★ 名字叫 encrypted,内容实测是**明文**——它标记
-   * 的是「父线程不该复述给用户」,不是密码学加密(与 `reasoning.encrypted_content` 的
-   * 不透明密文**不是一回事**,那个真的无法解码)。只有 NEW_TASK 信封里的这一种会被
-   * 转成可读文本,判据与红线见 converter.ts `convertAgentMessage`。
+   * multi-agent v2 线程间信封的正文通道。★ 名字叫 encrypted,内容实测是**明文**——它标记
+   * 的是「父线程不该复述给用户」,不是密码学加密(与 `reasoning.encrypted_content` 的真密文
+   * **不是一回事**)。哪些信封转、哪些不转:converter.ts `convertAgentMessage` 头注释。
    */
   | { type: 'encrypted_content'; encrypted_content: string };
 
@@ -103,13 +102,12 @@ export interface ResponsesCustomToolCallOutputItem extends ResponsesToolOutputIt
 }
 
 /**
- * multi-agent v2 的线程间信封(实测 0.153.4):子线程的任务正文、以及 agent 之间的
- * 消息都走它,`author`/`recipient` 是 `/root`、`/root/<task_name>` 这样的线程路径。
+ * multi-agent v2 的线程间信封(实测 0.153.4):`NEW_TASK` / `MESSAGE` / `FINAL_ANSWER`
+ * 都走它,`author`/`recipient` 是 `/root`、`/root/<task_name>` 这样的线程路径。
  *
- * ⚠ 它**不是** message item:`role` 不存在,内容分两段——一段 `input_text` 的元信息
- * 头(`Message Type: NEW_TASK\n…Payload:\n`),一段 `encrypted_content` 的正文。
- * 当成未知 type 丢掉的后果是子线程收到空 Payload(修复前实测)。转换判据见
- * converter.ts `convertAgentMessage`。
+ * ⚠ 它**不是** message item:`role` 不存在,内容是一段 `input_text` 的元信息头
+ * (`Message Type: …\n…Payload:\n`)加可选的 `encrypted_content` 正文。三类信封各自
+ * 丢掉的后果与转换判据都在 converter.ts `convertAgentMessage` 头注释,别在这里复述。
  */
 export interface ResponsesAgentMessageItem {
   type: 'agent_message';

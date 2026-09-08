@@ -61,8 +61,8 @@ code mode 的工具集是 `exec`(**`type:"custom"`** freeform,lark grammar)+ `wa
 
 修复后再跑 `no-expand`(探针不做任何改写 = 纯网关逻辑):`tool_count=9`、
 `namespaced_tool_count=6`、子 agent 创建成功、日志出现
-`responses: converted multi-agent NEW_TASK envelope`,且 `taskBodyReachedUpstream=true`
-——子任务正文确实进了上游请求,不再是空 Payload。
+`responses: converted multi-agent envelope`(`message_type:"NEW_TASK"`、`body_converted:true`),
+且 `taskBodyReachedUpstream=true`——子任务正文确实进了上游请求,不再是空 Payload。
 
 **决定路由成败的是响应侧那个 `namespace` 字段,不是请求侧展开。** 少了它,router 按裸名查不到
 handler;补上它,同一个调用立刻被受理(中间态可见:参数缺 `task_name` 时错误从
@@ -71,9 +71,9 @@ handler;补上它,同一个调用立刻被受理(中间态可见:参数缺 `task
 请求侧展开仍然**必需**,但理由不同:探针是强制派发,真实场景里模型得先在工具表里看见
 `spawn_agent` 才会调用它。两者是**互补**的,不是二选一。
 
-### 线程间信封:**两个方向**都要转(修复前都被丢掉)
+### 线程间信封:**三类**都要转(修复前都被丢掉或丢正文)
 
-实测有两类 `agent_message` 信封,少转任何一个都让功能失效:
+实测有三类 `agent_message` 信封,少转任何一个都让功能失效:
 
 ```text
 父 → 子   author=/root          recipient=/root/probe
@@ -81,13 +81,22 @@ handler;补上它,同一个调用立刻被受理(中间态可见:参数缺 `task
           head="Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\nPayload:\n"
           ↑ 任务正文在 encrypted_content 里
 
-子 → 父   author=/root/probe    recipient=/root
+子 → 父   author=/root/probe    recipient=/root          (send_message 发出的中间消息)
+          partTypes=[input_text, encrypted_content]
+          head="Message Type: MESSAGE\nTask name: /root\nSender: /root/probe\nPayload:\n"
+          ↑ 消息正文同样在 encrypted_content 里
+
+子 → 父   author=/root/probe    recipient=/root          (交活)
           partTypes=[input_text]
           head="Message Type: FINAL_ANSWER\nSender: /root/probe\nPayload:\n<答案>"
           ↑ 答案就在 input_text 的 Payload 段
 ```
 
-修复前两类都落进 `responses: unknown input item types ignored  item_types:["agent_message"]`。
+最初两类都落进 `responses: unknown input item types ignored  item_types:["agent_message"]`。
+第一轮修复只把 `NEW_TASK` 的 `encrypted_content` 转成明文,`MESSAGE` 的正文于是被当
+「语义未知的同名字段」跳过——父线程只见空 `Payload:`,把它误读成一句简短确认(「过早的
+OK」)。spawn / NEW_TASK / FINAL_ANSWER 全部正常,固定 nonce 端到端返回
+`{"message":"EMPTY","final":"FINAL_NONCE_…"}` 才看得出来(2026-09-08 修复)。
 
 ★ **`FINAL_ANSWER` 这条最隐蔽**:`wait_agent` 的工具结果只有
 `{"message":"Wait completed.","timed_out":false}`,**不含答案本身**。所以丢了它,
@@ -96,14 +105,19 @@ spawn/wait 全部成功、日志全绿、`turn.completed` 正常,父线程模型
 
 现由 `convertAgentMessage` 统一处理,判据**分两层**(别合并):转不转这条信封看有没有
 结构化 `Message Type:` 头(不逐个白名单——新类型丢弃 = 模型失明);`encrypted_content`
-转不转明文**只看是不是 `NEW_TASK`**(其余信封的同名字段语义未知,转出去是泄漏;
-`reasoning.encrypted_content` 更是真密文,永不转)。
+转不转明文**只看 `Message Type` 在不在白名单 `NEW_TASK` / `MESSAGE` 里**(整 token 比对;
+名单外信封的同名字段语义未知,转出去是泄漏;`reasoning.encrypted_content` 是另一个 item
+type、真密文,永不转)。`FINAL_ANSWER` 实测正文在 `input_text`,**不在**名单里;升级 Codex 后
+若发现它也改成分离正文,先抓脱敏 fixture 确认再扩。
 
 ### 生命周期矩阵(0.153.4,真实 CLI,零上游成本)
 
 `test/manual/codex-subagent-lifecycle-server.ts`。判据是 **nonce 配对**不是「有没有报错」:
 每个 spawn 的任务正文埋唯一 nonce,子线程原样回,父线程必须在 `FINAL_ANSWER` 里收到
-**对应那一个**;串线靠信封 `author` 与 nonce 是否配对来检出。
+**对应那一个**;串线靠信封 `author` 与 nonce 是否配对来检出。`message` 场景另有一个
+中间 nonce,判据是**入口有、上游也有**:子线程 `send_message` 后,父线程请求入口的
+`MESSAGE` 信封 `encrypted_content` 含它(客户端没丢)且转换后的上游请求也含它(网关没丢);
+前有后无 = `lostAtGateway > 0`,同时进 `mismatches`。
 
 | 场景 | 覆盖 | 结果 |
 |---|---|---|
@@ -114,10 +128,20 @@ spawn/wait 全部成功、日志全绿、`turn.completed` 正常,父线程模型
 | `timeout` | `timeout_ms:1` 后再长 wait | 超时不谎报完成,后续 wait 仍取到最终结果 |
 | `fork-turns` | `none` 与 `all` 各一轮 | 两者都正常 |
 | `fault-retry` | spawn 后注入一次 503 | 客户端重试后 **spawn 不重复**(送达仍为 1 次) |
+| `message` | 子线程 `send_message` 给父线程一个中间 nonce,父线程 wait 两次 | 入口 2/2 有正文、上游 2/2 有正文,`lostAtGateway=0`,FINAL_ANSWER 也回收;修复前对照:入口 2/2、上游 **0/2** |
 
-7/7 通过。⚠ 探针自身的两个坑已修,别再踩:nonce 必须按**完整 token** 匹配
-(`NONCE_X_a` 会命中 `NONCE_X_a_SECOND`,followup 因此假阴性);`interrupt` 场景
-**不能**把「任务未送达」当失败——中止本来就发生在送达之前。
+8/8 通过(2026-09-08 复跑)。跑法两种都验过:全部 8 个场景用本机 npm 装的 `codex` 0.153.4 +
+隔离 `CODEX_HOME`(`base_url` 指 `127.0.0.1:18962`);`message` 场景另在本仓库的 harness 镜像
+`kiro2claude-codex:0.153.4` 里按下面「复跑」一节的 `docker run` 命令取了两个干净样本
+(每个样本重启一次探针——场景状态是进程内累计的,同一进程跑第二遍会从上次的 step 接着走)。
+⚠ 探针自身的四个坑已修,别再踩:nonce 必须按**完整 token** 匹配(`NONCE_X_a` 会命中
+`NONCE_X_a_SECOND`,followup 因此假阴性);`interrupt` 场景**不能**把「任务未送达」当失败
+——中止本来就发生在送达之前;伪造的正常响应**必须**以 `buildMetadataFrame()` 收尾
+(踩坑「帧边界 EOF」)——漏掉时网关按规范判 `max_tokens`、Codex 对每条回复
+`Incomplete response … max_output_tokens` 重连 5 次后 `turn.failed`,整套剧本走不动;
+`message` 场景父线程要 **wait 两次**——子线程的 `send_message` 会唤醒第一次 `wait_agent`
+(「Wait completed.」先于 FINAL_ANSWER 回来),只 wait 一次时 FINAL_ANSWER 赶不赶得上父线程
+最后一轮纯看时序(本机赶上、Docker 没赶上),会把时序当成回收失败。
 
 ### 还没验证的(合并到生产前应补)
 

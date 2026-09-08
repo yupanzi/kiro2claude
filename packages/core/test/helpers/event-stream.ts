@@ -71,6 +71,17 @@ export function buildMetadataFrame(stopReason: string | undefined = 'END_TURN'):
   );
 }
 
+/**
+ * Mark a scripted reply as a *finished* one: the given frames + the metadataEvent
+ * tail. The gateway treats a clean EOF without that tail as an unfinished response
+ * (`max_tokens` / Responses `incomplete`) and real CLIs then reconnect, so a bare
+ * frame array models a mid-response EOF, never a completed reply. Every manual
+ * server / fixture that means "normal completion" goes through here.
+ */
+export function completedFrames(...frames: Buffer[]): Buffer[] {
+  return [...frames, buildMetadataFrame()];
+}
+
 /** Build an AssistantResponse frame with the given text. */
 export function buildAssistantResponseFrame(content: string): Buffer {
   return encodeEventStreamFrame(
@@ -86,7 +97,7 @@ export function buildAssistantResponseFrame(content: string): Buffer {
  * metering frame exercises the usage/credits path.
  */
 export function framesWithMetering(metering: KiroMeteringData, content = 'hi'): Buffer[] {
-  return [buildAssistantResponseFrame(content), buildMetadataFrame(), buildMeteringFrame(metering)];
+  return [...completedFrames(buildAssistantResponseFrame(content)), buildMeteringFrame(metering)];
 }
 
 /**
