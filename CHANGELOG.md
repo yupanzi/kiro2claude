@@ -1,3 +1,10 @@
+## [1.5.5](https://github.com/yupanzi/kiro2claude/compare/v1.5.4...v1.5.5) (2026-09-08)
+
+
+### Bug Fixes
+
+* **core:** 链路上被静默丢弃的内容不再伪装成成功 ([c568a59](https://github.com/yupanzi/kiro2claude/commit/c568a5969f5611cb892b117aedabfacd9022b43b))
+
 ## [1.5.4](https://github.com/yupanzi/kiro2claude/compare/v1.5.3...v1.5.4) (2026-09-06)
 
 
