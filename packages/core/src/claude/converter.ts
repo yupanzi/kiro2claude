@@ -556,6 +556,53 @@ interface ProcessedContent {
   toolResults: ToolResult[];
 }
 
+interface ImageBoundaryState {
+  total: number;
+  nextOrdinal: number;
+}
+
+interface ContentProcessingContext {
+  boundary: ImageBoundaryState;
+  sourceLabel: string;
+}
+
+function countSupportedImages(content: unknown): number {
+  if (!Array.isArray(content)) return 0;
+  let count = 0;
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue;
+    const block = item as ContentBlock;
+    if (
+      block.type === 'image' &&
+      block.source &&
+      getImageFormat(block.source.media_type) !== undefined
+    ) {
+      count += 1;
+    } else if (block.type === 'tool_result') {
+      count += countSupportedImages(block.content);
+    }
+  }
+  return count;
+}
+
+function imageBoundaryMarker(
+  context: ContentProcessingContext,
+  contentIndex: number,
+  toolUseId?: string,
+): string {
+  const ordinal = context.boundary.nextOrdinal++;
+  const source = toolUseId
+    ? `${context.sourceLabel} tool result ${JSON.stringify(toolUseId)}`
+    : context.sourceLabel;
+  return `[Image ${ordinal}: independent input; source=${source}; content index=${contentIndex}]`;
+}
+
+function appendImageBoundaryNotice(content: string, total: number): string {
+  if (total < 2) return content;
+  const notice = `Images 1-${total} are separate inputs, not tiles of one canvas.`;
+  return content ? `${content}\n${notice}` : notice;
+}
+
 /**
  * Process message content, extracting text, images, and tool results.
  *
@@ -567,15 +614,21 @@ interface ProcessedContent {
 function processMessageContent(
   content: unknown,
   rejectUnsupportedDocuments: boolean,
+  processingContext?: ContentProcessingContext,
 ): ProcessedContent {
   const textParts: string[] = [];
   const images: KiroImage[] = [];
   const toolResults: ToolResult[] = [];
+  const ownsBoundary = processingContext === undefined;
+  const context: ContentProcessingContext = processingContext ?? {
+    boundary: { total: countSupportedImages(content), nextOrdinal: 1 },
+    sourceLabel: 'user message',
+  };
 
   if (typeof content === 'string') {
     textParts.push(content);
   } else if (Array.isArray(content)) {
-    for (const item of content) {
+    for (const [contentIndex, item] of content.entries()) {
       if (!item || typeof item !== 'object') continue;
       const block = item as ContentBlock;
 
@@ -588,7 +641,12 @@ function processMessageContent(
 
         case 'image': {
           const image = extractImageBlock(block, 'message');
-          if (image) images.push(image);
+          if (image) {
+            images.push(image);
+            if (context.boundary.total > 1) {
+              textParts.push(imageBoundaryMarker(context, contentIndex));
+            }
+          }
           break;
         }
 
@@ -597,6 +655,8 @@ function processMessageContent(
             const { text: resultText, images: resultImages } = extractToolResultContent(
               block.content,
               rejectUnsupportedDocuments,
+              context,
+              block.tool_use_id,
             );
             // Hoist any images embedded in the tool result up to the message-level
             // `images` array. Kiro's ToolResult wire format only carries text, so an
@@ -637,7 +697,9 @@ function processMessageContent(
   }
 
   return {
-    text: textParts.join('\n'),
+    text: ownsBoundary
+      ? appendImageBoundaryNotice(textParts.join('\n'), context.boundary.total)
+      : textParts.join('\n'),
     images,
     toolResults,
   };
@@ -698,6 +760,8 @@ function extractImageBlock(
 function extractToolResultContent(
   content: unknown,
   rejectUnsupportedDocuments: boolean,
+  processingContext?: ContentProcessingContext,
+  toolUseId?: string,
 ): { text: string; images: KiroImage[] } {
   const images: KiroImage[] = [];
 
@@ -705,7 +769,7 @@ function extractToolResultContent(
 
   if (Array.isArray(content)) {
     const parts: string[] = [];
-    for (const item of content) {
+    for (const [contentIndex, item] of content.entries()) {
       if (!item || typeof item !== 'object') continue;
       const block = item as ContentBlock;
 
@@ -713,7 +777,11 @@ function extractToolResultContent(
         const image = extractImageBlock(block, 'tool_result');
         if (image) {
           images.push(image);
-          parts.push('[image attached to this message]');
+          parts.push(
+            processingContext && processingContext.boundary.total > 1
+              ? imageBoundaryMarker(processingContext, contentIndex, toolUseId)
+              : '[image attached to this message]',
+          );
         }
         continue;
       }
@@ -1109,18 +1177,26 @@ function mergeUserMessages(
   const contentParts: string[] = [];
   const allImages: KiroImage[] = [];
   const allToolResults: ToolResult[] = [];
+  const boundary: ImageBoundaryState = {
+    total: messages.reduce((sum, message) => sum + countSupportedImages(message.content), 0),
+    nextOrdinal: 1,
+  };
 
-  for (const msg of messages) {
+  for (const [messageIndex, msg] of messages.entries()) {
     const { text, images, toolResults } = processMessageContent(
       msg.content,
       rejectUnsupportedDocuments,
+      {
+        boundary,
+        sourceLabel: messages.length > 1 ? `user message ${messageIndex + 1}` : 'user message',
+      },
     );
     if (text) contentParts.push(text);
     allImages.push(...images);
     allToolResults.push(...toolResults);
   }
 
-  const content = contentParts.join('\n');
+  const content = appendImageBoundaryNotice(contentParts.join('\n'), boundary.total);
   const userMsg = createUserMessage(content, modelId);
 
   if (allImages.length > 0) {
