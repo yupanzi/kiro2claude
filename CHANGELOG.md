@@ -1,3 +1,10 @@
+## [1.6.2](https://github.com/yupanzi/kiro2claude/compare/v1.6.1...v1.6.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* **core:** tool_result 里的多张图片按调用归属,不再只靠回执顺序 ([bb27dd5](https://github.com/yupanzi/kiro2claude/commit/bb27dd5d7a1b2c8de5edac24deac5f956e5f9ce7))
+
 ## [1.6.1](https://github.com/yupanzi/kiro2claude/compare/v1.6.0...v1.6.1) (2026-09-08)
 
 
