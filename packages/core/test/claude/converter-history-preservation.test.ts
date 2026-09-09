@@ -206,7 +206,7 @@ describe('unpaired and conflicting tool results remain quoted evidence', () => {
     );
     expect(containing?.images).toEqual([{ format: 'png', source: { bytes: 'QUJDRA==' } }]);
     expect(quoted(containing!)[0].result.content).toEqual([
-      { text: 'Captured output.\n[image attached to this message]' },
+      { text: 'Captured output.\n[image 1 attached to this message]' },
     ]);
     expect(calls(state)).toEqual([]);
     expect(users(state).flatMap((user) => user.userInputMessageContext.toolResults)).toEqual([]);
@@ -312,7 +312,7 @@ describe('unpaired and conflicting tool results remain quoted evidence', () => {
       result: {
         toolUseId: 'call_1',
         isError: true,
-        content: [{ text: '[image attached to this message]' }],
+        content: [{ text: '[image 1 attached to this message]' }],
       },
     });
     expect(users(state).flatMap((user) => user.userInputMessageContext.toolResults)).toHaveLength(

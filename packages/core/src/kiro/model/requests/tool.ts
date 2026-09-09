@@ -38,6 +38,13 @@ export function defaultInputSchema(): InputSchema {
  * 2. **`content[]` 上游支持 `{json}` 通道**（`execute_bash` 回
  *    `{json:{stdout,stderr,exit_status}}`），我们只产 `{text}`。可接受的降级：下游
  *    送来的 tool_result 本就是文本/blocks，结构化信息在进网关前已序列化过一次。
+ * 3. **`content[]` 没有图片通道**：塞 Bedrock 风格的 `{image:{format,source:{bytes}}}`
+ *    上游照样 200，但静默丢弃（2026-09-09 直连实测：模型说结果为空、输入 token 恰好
+ *    少掉图片的量）。所以 tool_result 里的图只能提升到消息级 `images[]`，与 kiro-cli
+ *    `fs_read` 的做法一致；归属只剩位置，`claude/converter.ts` 用三件套补回：
+ *    `canonicalizeToolResultOrder`（images[] 与 tool_use 同序）+ `imagePlaceholder`
+ *    （结果内 `[image k attached to this message]`）+ `prependImageLegend`（≥2 图时
+ *    user content 前置 `[Attached images, in order: …]`，真实上游实测缺了它两模型 4/4 错位）。
  *
  * ⚠ `status` 表示**工具本身是否执行成功**，不是业务结果：`exit 42` 仍是 `"success"`
  * （拿到了退出码），只有参数校验失败这类才是 `"error"`。

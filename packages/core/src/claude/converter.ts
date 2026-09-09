@@ -557,6 +557,126 @@ interface ProcessedContent {
 }
 
 /**
+ * Running 1-based position in the `images[]` of the Kiro message being built.
+ * Shared across everything that lands in one Kiro message (a merged run of user
+ * messages, every tool result inside them, and message-level image blocks), so
+ * the placeholder written into a tool result names the exact attachment it
+ * stands for. `attachments` remembers every tool-result image so the message
+ * can carry an `imageLegend` once it holds two or more images.
+ */
+interface ImageOrdinal {
+  next: number;
+  attachments: ImageAttachment[];
+}
+
+interface ImageAttachment {
+  ordinal: number;
+  toolUseId: string;
+  /** Last non-empty line of the text part right before the image in the same tool result. */
+  label: string | undefined;
+}
+
+function newImageOrdinal(): ImageOrdinal {
+  return { next: 1, attachments: [] };
+}
+
+/** `tool_use` id → what the assistant asked for, over the whole conversation. */
+type ToolUseIndex = Map<string, { name: string; input: unknown }>;
+
+function indexToolUses(messages: ClaudeMessage[]): ToolUseIndex {
+  const index: ToolUseIndex = new Map();
+  for (const msg of messages) {
+    if (msg.role !== 'assistant') continue;
+    for (const block of contentBlocks(msg.content)) {
+      if (block.type === 'tool_use' && typeof block.id === 'string') {
+        index.set(block.id, { name: block.name ?? 'tool', input: block.input });
+      }
+    }
+  }
+  return index;
+}
+
+const LEGEND_INPUT_MAX_LEN = 120;
+const LEGEND_LABEL_MAX_LEN = 80;
+
+/**
+ * Prepend, to the user `content` of a Kiro message that carries two or more
+ * images at least one of which came from a tool result, one line that says
+ * which attachment is which:
+ *
+ *   [Attached images, in order: image 1 = /workspace/a.png (tool call call_x);
+ *    image 2 = result of tool call toolu_y (Read {"file_path":"/workspace/b.png"})]
+ *
+ * Why this exists, and why it lives in `content` rather than only inside the
+ * tool results: Kiro's wire has no image channel except the message-level
+ * `images[]`, so a tool-result image is tied to its call by position alone.
+ * Real-upstream probes on 2026-09-09 (six images, opaque ids, Claude opus-5 and
+ * GPT-5.6): a plain user message that lists "attachment 1 … attachment 6" in its
+ * text is read in order every time, and six tool results whose only cue is the
+ * ordinal placeholder inside each result were scrambled 4/4 (4–6 of 6 files
+ * wrong, both models), while the same wire with this legend in `content` was
+ * correct 4/4. Six parallel Claude Code `Read` calls and Codex's single `exec`
+ * that views six files reproduced the scramble end to end (`test/manual/
+ * multi-image-cli-probe.mjs`). The legend only restates facts already on the
+ * wire (ordinal, tool_use id, the call's own input, the text the tool printed
+ * before the image); it is not an instruction, and it is omitted for the
+ * single-image case and for messages whose images all come from the user.
+ */
+function prependImageLegend(
+  content: string,
+  ordinal: ImageOrdinal,
+  toolUseIndex: ToolUseIndex,
+  toolNameMap: Map<string, string>,
+): string {
+  const total = ordinal.next - 1;
+  if (total < 2 || ordinal.attachments.length === 0) return content;
+  const entries = ordinal.attachments.map(({ ordinal: n, toolUseId, label }) => {
+    if (label) return `image ${n} = ${label} (tool call ${toolUseId})`;
+    const call = toolUseIndex.get(toolUseId);
+    if (!call) return `image ${n} = result of tool call ${toolUseId}`;
+    let input: string;
+    try {
+      input = JSON.stringify(call.input) ?? '';
+    } catch {
+      input = '';
+    }
+    if (input.length > LEGEND_INPUT_MAX_LEN) input = `${input.slice(0, LEGEND_INPUT_MAX_LEN)}…`;
+    const name = mapToolName(call.name, toolNameMap);
+    return `image ${n} = result of tool call ${toolUseId} (${name}${input ? ` ${input}` : ''})`;
+  });
+  const legend = `[Attached images, in order: ${entries.join('; ')}]`;
+  return content ? `${legend}\n${content}` : legend;
+}
+
+/** Label for a hoisted image: the last non-empty line of the text just before it. */
+function imageLabel(precedingText: string | undefined): string | undefined {
+  const line = precedingText
+    ?.split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (!line) return undefined;
+  return line.length > LEGEND_LABEL_MAX_LEN ? `${line.slice(0, LEGEND_LABEL_MAX_LEN)}…` : line;
+}
+
+/**
+ * Placeholder left inside a tool result where an image used to be. Kiro's
+ * ToolResult wire carries text only (see `ToolResult` in
+ * `kiro/model/requests/tool.ts`), so the image itself is hoisted to the
+ * message-level `images[]` and only position ties the two together. The
+ * ordinal is that position: Codex's code-mode `exec` returns one tool result
+ * whose parts interleave `text(path)` / `image(...)` for every file viewed, and
+ * with four identical placeholders GPT-5.6 mis-counted and swapped two files'
+ * digits in a real run (2026-09-09, `test/manual/multi-image-cli-probe.mjs`).
+ * kiro-cli's own placeholder ("See images data supplied") has no ordinal, but
+ * its `fs_read` also lists the paths it read in call order, which is the same
+ * information expressed differently.
+ */
+function imagePlaceholder(ordinal: number): string {
+  return `[image ${ordinal} attached to this message]`;
+}
+
+/**
  * Process message content, extracting text, images, and tool results.
  *
  * `rejectUnsupportedDocuments` controls what happens to content-bearing blocks
@@ -567,6 +687,7 @@ interface ProcessedContent {
 function processMessageContent(
   content: unknown,
   rejectUnsupportedDocuments: boolean,
+  ordinal: ImageOrdinal = newImageOrdinal(),
 ): ProcessedContent {
   const textParts: string[] = [];
   const images: KiroImage[] = [];
@@ -588,7 +709,12 @@ function processMessageContent(
 
         case 'image': {
           const image = extractImageBlock(block, 'message');
-          if (image) images.push(image);
+          if (image) {
+            images.push(image);
+            // A message-level image has no placeholder but still occupies a
+            // slot in images[], so later tool-result placeholders must skip it.
+            ordinal.next++;
+          }
           break;
         }
 
@@ -597,12 +723,16 @@ function processMessageContent(
             const { text: resultText, images: resultImages } = extractToolResultContent(
               block.content,
               rejectUnsupportedDocuments,
+              ordinal,
+              block.tool_use_id,
             );
             // Hoist any images embedded in the tool result up to the message-level
             // `images` array. Kiro's ToolResult wire format only carries text, so an
             // image left inside the tool result would be silently dropped and the
             // model would never see it (e.g. Claude Code's Read tool returns large
-            // images as a tool_result image block).
+            // images as a tool_result image block). Position is then the only
+            // association left, which is why canonicalizeToolResultOrder has
+            // already put these blocks in tool_use order.
             images.push(...resultImages);
             const isError = block.is_error ?? false;
 
@@ -691,13 +821,16 @@ function extractImageBlock(
  *
  * Text stays in the tool result; any image blocks are pulled out into `images`
  * so the caller can hoist them to the message level (Kiro tool results carry
- * text only — see the `tool_result` case in `processMessageContent`). When a
- * tool result contains only an image, a short textual placeholder is emitted so
- * the result isn't empty and the model can correlate it with the attached image.
+ * text only — see the `tool_result` case in `processMessageContent`). Each
+ * image leaves an `imagePlaceholder` at its original position carrying its
+ * 1-based slot in the message's `images[]`, so interleaved text (Codex's
+ * `text(path)` before every `image(...)`) keeps pointing at the right file.
  */
 function extractToolResultContent(
   content: unknown,
   rejectUnsupportedDocuments: boolean,
+  ordinal: ImageOrdinal = newImageOrdinal(),
+  toolUseId = '',
 ): { text: string; images: KiroImage[] } {
   const images: KiroImage[] = [];
 
@@ -705,6 +838,9 @@ function extractToolResultContent(
 
   if (Array.isArray(content)) {
     const parts: string[] = [];
+    // Text seen since the previous image: Codex's exec prints `text(path)`
+    // right before each `image(...)`, which is the best label an image can get.
+    let precedingText: string | undefined;
     for (const item of content) {
       if (!item || typeof item !== 'object') continue;
       const block = item as ContentBlock;
@@ -713,13 +849,17 @@ function extractToolResultContent(
         const image = extractImageBlock(block, 'tool_result');
         if (image) {
           images.push(image);
-          parts.push('[image attached to this message]');
+          const n = ordinal.next++;
+          ordinal.attachments.push({ ordinal: n, toolUseId, label: imageLabel(precedingText) });
+          parts.push(imagePlaceholder(n));
         }
+        precedingText = undefined;
         continue;
       }
 
       if (typeof block.text === 'string') {
         parts.push(block.text);
+        precedingText = block.text;
         continue;
       }
 
@@ -1105,22 +1245,27 @@ function mergeUserMessages(
   messages: ClaudeMessage[],
   modelId: string,
   rejectUnsupportedDocuments: boolean,
+  toolUseIndex: ToolUseIndex,
+  toolNameMap: Map<string, string>,
 ): KiroMessage {
   const contentParts: string[] = [];
   const allImages: KiroImage[] = [];
   const allToolResults: ToolResult[] = [];
+  // One images[] per Kiro message → one running ordinal across the merged run.
+  const ordinal = newImageOrdinal();
 
   for (const msg of messages) {
     const { text, images, toolResults } = processMessageContent(
       msg.content,
       rejectUnsupportedDocuments,
+      ordinal,
     );
     if (text) contentParts.push(text);
     allImages.push(...images);
     allToolResults.push(...toolResults);
   }
 
-  const content = contentParts.join('\n');
+  const content = prependImageLegend(contentParts.join('\n'), ordinal, toolUseIndex, toolNameMap);
   const userMsg = createUserMessage(content, modelId);
 
   if (allImages.length > 0) {
@@ -1174,6 +1319,7 @@ function buildHistory(
   toolNameMap: Map<string, string>,
   identityOverride: boolean,
   rejectUnsupportedDocuments: boolean,
+  toolUseIndex: ToolUseIndex,
 ): KiroMessage[] {
   const history: KiroMessage[] = [];
 
@@ -1228,7 +1374,15 @@ function buildHistory(
     } else if (msg.role === 'assistant') {
       // Flush accumulated user messages
       if (userBuffer.length > 0) {
-        history.push(mergeUserMessages(userBuffer, modelId, rejectUnsupportedDocuments));
+        history.push(
+          mergeUserMessages(
+            userBuffer,
+            modelId,
+            rejectUnsupportedDocuments,
+            toolUseIndex,
+            toolNameMap,
+          ),
+        );
         userBuffer = [];
       }
       assistantBuffer.push(msg);
@@ -1242,7 +1396,9 @@ function buildHistory(
 
   // Handle trailing orphan user messages
   if (userBuffer.length > 0) {
-    history.push(mergeUserMessages(userBuffer, modelId, rejectUnsupportedDocuments));
+    history.push(
+      mergeUserMessages(userBuffer, modelId, rejectUnsupportedDocuments, toolUseIndex, toolNameMap),
+    );
 
     // Auto-pair with an "OK" assistant response
     const autoAssistant = createAssistantMessage('OK');
@@ -1302,6 +1458,128 @@ function foldTextIntoMessage(
   if (where === 'prepend') arr.unshift(block);
   else arr.push(block);
   return { ...msg, content: arr };
+}
+
+/**
+ * Put each user turn's `tool_result` blocks in the order of the `tool_use`
+ * blocks that requested them (the preceding assistant turn, merged across a run
+ * of consecutive assistant messages the same way `mergeAssistantMessages` does).
+ *
+ * Why the order matters: Kiro's ToolResult wire carries text only. A `{image}`
+ * member inside `toolResults[].content` is accepted (200) but silently dropped
+ * (2026-09-09 probe: the model reports the result as empty and the input token
+ * count shrinks by exactly the image size). So images inside tool results are
+ * hoisted to the message-level `images[]` (see the `tool_result` case in
+ * `processMessageContent`), and the only thing still tying an image to its tool
+ * call is *position*. Real upstream probes with two parallel image-returning
+ * calls show both Claude opus-5 and GPT-5.6 attribute `images[i]` to the i-th
+ * `tool_use`, not to the i-th `tool_result`: with the results sent in reverse
+ * order every answer came back swapped. kiro-cli never produces that shape
+ * because it runs tools sequentially in call order, so canonicalising to
+ * tool_use order is also what mirroring it requires.
+ *
+ * Rules: only `tool_result` blocks move, and only among the slots they already
+ * occupy (text/image blocks stay where they are). Grouping mirrors what reaches
+ * one Kiro message: a run of consecutive user messages inside the history is
+ * one group because `mergeUserMessages` flattens it, but `buildHistory` splits
+ * the *trailing* run — its last message becomes `currentMessage` on its own —
+ * so that last message is its own group and blocks never cross into it. Ids
+ * the assistant turn never issued keep their relative order after the known
+ * ones (pairing validation reports them separately); an already-canonical
+ * group is returned untouched (no clone).
+ */
+function canonicalizeToolResultOrder(messages: ClaudeMessage[]): ClaudeMessage[] {
+  const out = messages.slice();
+  let movedTotal = 0;
+  let i = 0;
+  while (i < out.length) {
+    if (out[i].role !== 'assistant') {
+      i++;
+      continue;
+    }
+    const order = new Map<string, number>();
+    let j = i;
+    while (j < out.length && out[j].role === 'assistant') {
+      for (const block of contentBlocks(out[j].content)) {
+        if (block.type === 'tool_use' && typeof block.id === 'string' && !order.has(block.id)) {
+          order.set(block.id, order.size);
+        }
+      }
+      j++;
+    }
+    let k = j;
+    while (k < out.length && out[k].role === 'user') k++;
+    if (order.size > 0) {
+      // The trailing run's last message is the future currentMessage: group it alone.
+      const split = k === out.length ? k - 1 : k;
+      movedTotal += reorderToolResultSlots(out, j, split, order);
+      if (split < k) movedTotal += reorderToolResultSlots(out, split, k, order);
+    }
+    i = k;
+  }
+  if (movedTotal > 0) {
+    getLogger().info({
+      msg: 'reordered tool_result blocks to match tool_use order',
+      moved_tool_results: movedTotal,
+    });
+  }
+  return out;
+}
+
+/** The object blocks of a content array (a string or junk yields nothing). */
+function contentBlocks(content: unknown): ContentBlock[] {
+  if (!Array.isArray(content)) return [];
+  return content.filter((item): item is ContentBlock => !!item && typeof item === 'object');
+}
+
+interface ToolResultSlot {
+  messageIndex: number;
+  blockIndex: number;
+  block: ContentBlock;
+}
+
+/**
+ * Reorder the `tool_result` blocks of `messages[from, to)` (cloning only the
+ * messages that actually change). Returns how many blocks changed slot.
+ */
+function reorderToolResultSlots(
+  messages: ClaudeMessage[],
+  from: number,
+  to: number,
+  order: Map<string, number>,
+): number {
+  const slots: ToolResultSlot[] = [];
+  for (let m = from; m < to; m++) {
+    const content = messages[m].content;
+    if (!Array.isArray(content)) continue;
+    content.forEach((item, blockIndex) => {
+      if (item && typeof item === 'object' && (item as ContentBlock).type === 'tool_result') {
+        slots.push({ messageIndex: m, blockIndex, block: item as ContentBlock });
+      }
+    });
+  }
+  if (slots.length < 2) return 0;
+  // Unknown ids rank after every known one; sort is stable so they keep their order.
+  const unknownRank = order.size;
+  const rank = (block: ContentBlock): number =>
+    typeof block.tool_use_id === 'string'
+      ? (order.get(block.tool_use_id) ?? unknownRank)
+      : unknownRank;
+  const sorted = slots.map((slot) => slot.block).sort((a, b) => rank(a) - rank(b));
+  const cloned = new Map<number, unknown[]>();
+  let moved = 0;
+  slots.forEach((slot, s) => {
+    if (sorted[s] === slot.block) return;
+    moved++;
+    let content = cloned.get(slot.messageIndex);
+    if (!content) {
+      content = [...(messages[slot.messageIndex].content as unknown[])];
+      cloned.set(slot.messageIndex, content);
+    }
+    content[slot.blockIndex] = sorted[s];
+  });
+  for (const [m, content] of cloned) messages[m] = { ...messages[m], content };
+  return moved;
 }
 
 /**
@@ -1537,6 +1815,10 @@ export function convertRequest(
     messages = foldedMessages;
   }
 
+  // 2.7. tool_result 顺序规范化为 tool_use 顺序:tool_result 里的图片只能提升到
+  // 消息级 images[],归属全靠位置(见 canonicalizeToolResultOrder 头注释)。
+  messages = canonicalizeToolResultOrder(messages);
+
   // 3. Generate conversation ID and agent continuation ID
   // typeof 守卫:metadata 是宽松类型,客户端可能传非字符串 user_id;直接传给
   // extractSessionId(内部走 String.indexOf)会抛 TypeError —— 非 ConversionError,
@@ -1558,13 +1840,17 @@ export function convertRequest(
     currentWorkingDirectory: process.cwd(),
   };
 
+  // 4.5. tool_use id → 调用内容,给多图消息的图例用(prependImageLegend)
+  const toolUseIndex = indexToolUses(messages);
+
   // 5. Process last message as current_message
   const lastMessage = messages[messages.length - 1];
+  const currentImageOrdinal = newImageOrdinal();
   const {
     text: textContent,
     images,
     toolResults,
-  } = processMessageContent(lastMessage.content, rejectUnsupportedDocuments);
+  } = processMessageContent(lastMessage.content, rejectUnsupportedDocuments, currentImageOrdinal);
 
   // 6. Convert tool definitions
   const toolNameMap = new Map<string, string>();
@@ -1578,6 +1864,7 @@ export function convertRequest(
     toolNameMap,
     identityOverride,
     rejectUnsupportedDocuments,
+    toolUseIndex,
   );
 
   // 7.5. kiro-cli 抓包显示 history 里每条 user message 都带 origin + envState。
@@ -1639,7 +1926,12 @@ export function convertRequest(
   // 当前用户消息末尾——current message 保持客户端原文,避免污染纯 tool_result。
   const userInput: UserInputMessage = {
     ...createUserInputMessage(
-      quotedToolResults.reduce(appendToolResultEvidence, textContent),
+      prependImageLegend(
+        quotedToolResults.reduce(appendToolResultEvidence, textContent),
+        currentImageOrdinal,
+        toolUseIndex,
+        toolNameMap,
+      ),
       modelId,
     ),
     userInputMessageContext: context,
@@ -1689,6 +1981,12 @@ export function convertRequest(
     history_message_count: history.length,
     system_prompt_length: req.system?.reduce((n, s) => n + s.text.length, 0) ?? 0,
     tool_name_mappings: toolNameMap.size,
+    // 多图排障用:当前轮 / 历史里各上送了几张图(归属只靠顺序,见踩坑「多图归属只靠顺序」)
+    current_image_count: images.length,
+    history_image_count: history.reduce(
+      (n, m) => n + (m.kind === 'user' ? (m.userInputMessage.images?.length ?? 0) : 0),
+      0,
+    ),
   });
 
   return {

@@ -89,7 +89,7 @@ describe.each([false, true])('Responses tool images (custom=%s)', (custom) => {
         toolUseId: 'call_image',
         content: [
           {
-            text: 'Here is chart.png:\n[image attached to this message]\nImage loaded successfully.',
+            text: 'Here is chart.png:\n[image 1 attached to this message]\nImage loaded successfully.',
           },
         ],
       },
@@ -106,7 +106,7 @@ describe.each([false, true])('Responses tool images (custom=%s)', (custom) => {
     );
     expect(message?.images).toHaveLength(1);
     expect(message?.userInputMessageContext?.toolResults).toMatchObject([
-      { toolUseId: 'call_image', content: [{ text: '[image attached to this message]' }] },
+      { toolUseId: 'call_image', content: [{ text: '[image 1 attached to this message]' }] },
     ]);
   });
 
