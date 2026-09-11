@@ -1,3 +1,10 @@
+## [1.6.3](https://github.com/yupanzi/kiro2claude/compare/v1.6.2...v1.6.3) (2026-09-11)
+
+
+### Bug Fixes
+
+* **core:** system 文本折进首条 user 消息,网关不再伪造 assistant 轮次 ([913d61c](https://github.com/yupanzi/kiro2claude/commit/913d61c7db1ab034c1a710af358eb0a2b5c5b84a))
+
 ## [1.6.2](https://github.com/yupanzi/kiro2claude/compare/v1.6.1...v1.6.2) (2026-09-09)
 
 
