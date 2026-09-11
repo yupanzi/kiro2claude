@@ -15,7 +15,7 @@
 - **双协议、三端点**——`/claude/v1`(Messages)+ `/openai/v1`(Chat Completions & Responses)。一套凭据同时喂 Anthropic 和 OpenAI 生态,不用起两个服务。
 - **模型全,reasoning 原生**——Claude 全系 + GPT-5.6(Sol / Terra / Luna)。Extended Thinking、`reasoning_effort` 直接映射 Kiro 原生 reasoning,不靠 prompt 硬凑。
 - **真客户端跑通,不只是"兼容 SDK"**——Claude Code、Codex CLI 的对话 + 工具调用端到端实测过(harness 在 [`tools/`](./tools/))。
-- **替你抠上游的坑**——工具调用文本救援、空流自动重试、身份覆写、`/api/*` 去插件字段镜像:把 Kiro 的偶发毛病在网关层吸收掉,客户端无感。
+- **替你抠上游的坑**——工具调用文本救援、空流自动重试、`/api/*` 去插件字段镜像:把 Kiro 的偶发毛病在网关层吸收掉,客户端无感。
 - **插件化,全 MIT**——计量、credit 反演都是插件,经 [`@kiro2claude/plugin-api`](./packages/plugin-api/) 契约接入;写自己的插件不用碰 core。
 - **零配置文件**——纯环境变量,复用 kiro-cli 的 SQLite 凭据,token 到期自动刷新。
 
@@ -130,6 +130,7 @@ pnpm workspace,Node ≥ 22 / TypeScript / ES Modules。husky pre-commit 强制 `
 
 网关只能修上游 wire 与协议翻译层的问题;下面这些在链路里仍然存在,单测全绿不等于会话无损:
 
+- **system prompt 只能以 user 级权重进模型,身份覆写因此不可靠**:Kiro wire 没有 system 字段,`additionalContext` 这类结构化字段上游收下即丢(2026-09-10 实测:塞进去的内容模型一概不知、input token 不变)。网关把 system 文本折进首条 user 消息正文,不再伪造任何 assistant 轮次;但它压不过上游自己的系统提示,直接问「你是谁」时模型多半自报 Kiro / AWS。`KIRO2CLAUDE_IDENTITY_OVERRIDE` 追加的身份指令实测 opus-5 只有约三成、opus-4-6 0/2 生效,换措辞与位置都改不了,故**默认关**。长上下文 + 真实工具调用的 A/B(24 会话、352 次调用)显示这两种注入方式对工具调用与任务完成率没有可测差异。
 - **continuation 文案偶发进正文**:请求以 assistant 结尾时(prefill 或上轮中断的续接),Kiro 只接受 user 作为当前消息,网关把该 assistant 内容留在历史并追加一句续写指令。实测 7 次里 2 次模型把指令句尾复述进可见输出。相比修复前(prefill 场景 3/3 破损)是净改进,但不到 100%,也不是字节级 prefill。
 - **客户端省略的历史无法还原**:上轮的 thinking、被自动压缩掉的内容不再随请求发来时,网关没有跨请求存储,不擅自复活。Claude Code 自动压缩(实测约第 50 个请求触发)保留主线任务与未完成项,但会丢部分 API 签名、返回结构、错误码拼写等细节。
 - **GPT 加密 reasoning 不可见**:上游只给加密 blob,没有可重放的输入字段,网关不伪装成明文。
@@ -144,6 +145,8 @@ pnpm workspace,Node ≥ 22 / TypeScript / ES Modules。husky pre-commit 强制 `
 | 主题 | 入口 |
 |---|---|
 | 架构分层 / 代码风格 / 踩坑地图 | [CLAUDE.md](./CLAUDE.md) |
+| 踩坑的来龙去脉与实测证据 | [`docs/PITFALLS.md`](./docs/PITFALLS.md) |
+| 手工探针与检测器(含打真实上游的)| [`packages/core/test/manual/README.md`](./packages/core/test/manual/README.md) |
 | 插件开发指南 | [`docs/PLUGIN-DEVELOPMENT.md`](./docs/PLUGIN-DEVELOPMENT.md) |
 | 插件契约类型 | [`packages/plugin-api/`](./packages/plugin-api/) |
 | 贡献 / 提交规范 | [CONTRIBUTING.md](./CONTRIBUTING.md) |

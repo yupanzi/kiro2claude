@@ -379,19 +379,22 @@ describe('convertRequest: reasoning.effort 注入', () => {
   });
 
   it('4.7 + thinking → 不注入 <thinking_mode> prompt 前缀（避免双重处理）', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-7',
-      thinking: { type: 'enabled', budget_tokens: 8000 },
-      messages: [{ role: 'user', content: 'compute 1+1' }],
-    });
-    const result = convertRequest(req);
-    // history 里第一条若有 system directive，content 不应包含 <thinking_mode> 标签
-    const allContent = result.conversationState.history
-      .filter((m) => m.kind === 'user')
-      .map((m) => (m.kind === 'user' ? m.userInputMessage.content : ''))
-      .join('\n');
-    expect(allContent).not.toMatch(/<thinking_mode>/);
-    expect(allContent).not.toMatch(/<max_thinking_length>/);
+    // 前缀(若有)折在首条 user 消息 = 单轮请求的 currentMessage;history 为空,扫 history
+    // 会让断言空转。两个分支都查:无 system(前缀单独成段)与有 system(前缀接在 system 前)。
+    for (const system of [undefined, [{ type: 'text', text: 'Be brief.' }]]) {
+      const req = baseMessagesRequest({
+        model: 'claude-opus-4-7',
+        thinking: { type: 'enabled', budget_tokens: 8000 },
+        system,
+        messages: [{ role: 'user', content: 'compute 1+1' }],
+      });
+      const result = convertRequest(req);
+      expect(result.conversationState.history).toHaveLength(0);
+      const content = result.conversationState.currentMessage.userInputMessage.content;
+      expect(content).not.toMatch(/<thinking_mode>/);
+      expect(content).not.toMatch(/<max_thinking_length>/);
+      expect(content.endsWith('compute 1+1')).toBe(true);
+    }
   });
 
   it('4.6 + thinking → 旧路径仍注入 <thinking_mode> prompt 前缀', () => {
@@ -401,11 +404,12 @@ describe('convertRequest: reasoning.effort 注入', () => {
       messages: [{ role: 'user', content: 'compute 1+1' }],
     });
     const result = convertRequest(req);
-    const allContent = result.conversationState.history
-      .filter((m) => m.kind === 'user')
-      .map((m) => (m.kind === 'user' ? m.userInputMessage.content : ''))
-      .join('\n');
-    expect(allContent).toMatch(/<thinking_mode>enabled<\/thinking_mode>/);
+    // 单轮请求:注入的前缀折在首条 user 消息 = currentMessage 的开头(history 为空,
+    // 网关不再造 system 假对话轮次)。
+    expect(result.conversationState.history).toHaveLength(0);
+    expect(result.conversationState.currentMessage.userInputMessage.content).toMatch(
+      /^<thinking_mode>enabled<\/thinking_mode>/,
+    );
   });
 });
 

@@ -36,6 +36,26 @@ describe('convertResponsesRequest', () => {
     expect(blocks(r.messages[0])).toEqual([{ type: 'text', text: 'q' }]);
   });
 
+  it('developer item after the conversation started stays in place as role:system', () => {
+    // 开头的 developer 项与 instructions 一起是请求级 system(Codex fixture 里五个 developer
+    // 全在开头);对话开始后出现的是中途插入,原位保留,不提到开头。
+    const r = conv(
+      base({
+        instructions: 'inst',
+        input: [
+          { type: 'message', role: 'developer', content: 'lead' },
+          { role: 'user', content: [{ type: 'input_text', text: 'q1' }] },
+          { role: 'assistant', content: [{ type: 'output_text', text: 'a1' }] },
+          { type: 'message', role: 'developer', content: 'from now on be terse' },
+          { role: 'user', content: [{ type: 'input_text', text: 'q2' }] },
+        ],
+      }),
+    );
+    expect(r.system).toEqual([{ text: 'inst' }, { text: 'lead' }]);
+    expect(r.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'system', 'user']);
+    expect(r.messages[2].content).toBe('from now on be terse');
+  });
+
   it('function_call → assistant tool_use;function_call_output → user tool_result', () => {
     const r = conv(
       base({

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  ConversionError,
   convertRequest,
   getContextWindowSize,
   IDENTITY_OVERRIDE_DIRECTIVE,
@@ -888,248 +889,341 @@ describe('convertRequest - merge consecutive assistant messages (Issue #79)', ()
   });
 });
 
-describe('convertRequest - identity override', () => {
-  // 断言用 .toContain(IDENTITY_OVERRIDE_DIRECTIVE)：常量改写时 import 会自动跟进，
-  // 文案微调不会让测试沉默 flake。
+describe('convertRequest - system text folds into the first user message', () => {
+  // Kiro 没有 system 字段,additionalContext 上游静默丢弃(2026-09-10 实测),system 只能作为
+  // user 文本进模型。契约:前置到**首条** user 消息正文,不造任何 assistant 轮次(旧实现的
+  // `user: system / assistant: "I will follow these instructions."` 假对话对已移除,见
+  // test/static/no-fabricated-turns.test.ts)。baseRequest 的 claude-sonnet-4 非原生 reasoning,
+  // 未开 thinking 时无 `<thinking_mode>` 前缀,故可以整串 toBe 精确钉形态。
+  const SYSTEM = 'You are a helpful coding assistant.';
+  const withSystem = (messages: MessagesRequest['messages']) =>
+    convertRequest(baseRequest({ system: [{ type: 'text', text: SYSTEM }], messages }));
 
-  it('default (options omitted): system content gets identity directive appended', () => {
-    const req = baseRequest({
-      system: [{ type: 'text', text: 'You are a helpful coding assistant.' }],
-      messages: [{ role: 'user', content: 'hello' }],
-    });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain('You are a helpful coding assistant.');
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-  });
-
-  it('identityOverride: true explicit behaves identically to default', () => {
-    const req = baseRequest({
-      system: [{ type: 'text', text: 'You are a helpful assistant.' }],
-      messages: [{ role: 'user', content: 'hi' }],
-    });
-    const result = convertRequest(req, { identityOverride: true });
-    const head = result.conversationState.history[0];
-    // 外层守卫:head 必须是 user pair。缺它时,head 丢失会让下面的 if 体被跳过,
-    // Vitest 默认不对零断言用例报错 → 用例假绿、掩盖「directive 从未注入」。
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-  });
-
-  it('identityOverride: false: system content has no directive', () => {
-    const req = baseRequest({
-      system: [{ type: 'text', text: 'You are a helpful assistant.' }],
-      messages: [{ role: 'user', content: 'hi' }],
-    });
-    const result = convertRequest(req, { identityOverride: false });
-    const head = result.conversationState.history[0];
-    // 外层守卫:见上一个用例的说明——无守卫时 head 丢失会让断言体静默跳过、用例假绿。
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain('You are a helpful assistant.');
-      expect(head.userInputMessage.content).not.toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-  });
-
-  it('no system + default: directive injected as standalone user msg at history head', () => {
-    const req = baseRequest({
-      messages: [{ role: 'user', content: 'hello' }],
-    });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-  });
-
-  it('no system + identityOverride false + no thinking: no injected directive anywhere in history', () => {
-    const req = baseRequest({
-      messages: [{ role: 'user', content: 'hello' }],
-    });
-    const result = convertRequest(req, { identityOverride: false });
-    // 该路径(无 system + 关身份 + 无 thinking)既不进 if 也不进 else-if,history 必为空。
-    // 只对一个恒为 [] 的 history 做 not.toContain 是 vacuous——实现对错都过。先钉死 history
-    // 为空(回归让 else-if 无视 identityOverride 恒触发 → length 1 → 此断言红),再确认
-    // directive 既没进 history 也没泄漏到 currentMessage,才真正覆盖「完全无注入」。
+  it('single turn: system heads the currentMessage text, history is empty', () => {
+    const result = withSystem([{ role: 'user', content: 'hello' }]);
     expect(result.conversationState.history).toHaveLength(0);
-    const serialized = JSON.stringify(result.conversationState.history);
-    expect(serialized).not.toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    expect(result.conversationState.currentMessage.userInputMessage.content).not.toContain(
-      IDENTITY_OVERRIDE_DIRECTIVE,
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${SYSTEM}\n\nhello`,
     );
   });
 
-  it('empty system (text: "") + default: directive still injected, not bare', () => {
-    // 回归:客户端发 system:[{text:''}] 时,过去会进 if 外层却跳过内层注入、
-    // 也不落 else if,导致 identity 完全丢失。修复后空 system 等价于无 system。
-    const req = baseRequest({
-      system: [{ type: 'text', text: '' }],
-      messages: [{ role: 'user', content: 'hi' }],
-    });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+  it('multi turn: system stays on history[0] (the first user message); later turns are verbatim', () => {
+    const result = withSystem([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'second' },
+    ]);
+    const { history, currentMessage } = result.conversationState;
+    expect(history).toHaveLength(2);
+    expect(history[0].kind).toBe('user');
+    if (history[0].kind === 'user') {
+      expect(history[0].userInputMessage.content).toBe(`${SYSTEM}\n\nfirst`);
     }
+    expect(history[1].kind).toBe('assistant');
+    if (history[1].kind === 'assistant') {
+      expect(history[1].assistantResponseMessage.content).toBe('reply');
+    }
+    expect(currentMessage.userInputMessage.content).toBe('second');
   });
 
-  it('thinking + identityOverride both enabled: same user msg carries both', () => {
-    const req = baseRequest({
-      messages: [{ role: 'user', content: 'hello' }],
-      thinking: { type: 'enabled', budget_tokens: 8000 },
-    });
-    const result = convertRequest(req, { identityOverride: true });
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain('<thinking_mode>enabled</thinking_mode>');
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
+  it('never fabricates an assistant turn: history maps 1:1 onto the client turns', () => {
+    const result = withSystem([
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: 'b' },
+      { role: 'user', content: 'c' },
+      { role: 'assistant', content: 'd' },
+      { role: 'user', content: 'e' },
+    ]);
+    const kinds = result.conversationState.history.map((m) => m.kind);
+    expect(kinds).toEqual(['user', 'assistant', 'user', 'assistant']);
+    expect(JSON.stringify(result.conversationState)).not.toContain(
+      'I will follow these instructions',
+    );
   });
 
-  it('directive only in system layer, not appended to current message', () => {
-    // 新契约:身份 directive 只注入 system 层(history 第一轮),近因强化已移除,
-    // 当前用户消息保持客户端原文、末尾不带身份指令。回退此契约会让本断言失败。
-    const req = baseRequest({
-      system: [{ type: 'text', text: 'You are a helpful coding assistant.' }],
-      messages: [{ role: 'user', content: 'hello' }],
-    });
-    const result = convertRequest(req, { identityOverride: true });
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
+  it('folds into the first *user* message even when the client leads with an assistant message', () => {
+    // OpenAI chat UIs send [assistant greeting, user]. The Kiro history then opens
+    // with an assistant turn; a 2026-09-11 live probe confirmed the upstream accepts
+    // that shape and the model answers normally (test/manual/inserted-content-live.mjs,
+    // scenario `leading-assistant`).
+    const result = withSystem([
+      { role: 'assistant', content: 'leading' },
+      { role: 'user', content: 'q' },
+    ]);
+    const { history, currentMessage } = result.conversationState;
+    expect(history).toHaveLength(1);
+    expect(history[0].kind).toBe('assistant');
+    expect(currentMessage.userInputMessage.content).toBe(`${SYSTEM}\n\nq`);
+  });
+
+  it('block-array first user message: same wire bytes as the string form, other blocks are kept', () => {
+    // The prefix is joined on the Kiro message after the client content has been
+    // flattened, so the two Anthropic-equivalent spellings of one request cannot
+    // drift apart (they once did: "SYS\n\nhello" vs "SYS\nhello"). Claude Code and
+    // Codex both send block arrays; the byte-exact cases above use strings.
+    const asString = withSystem([{ role: 'user', content: 'look' }]);
+    const result = withSystem([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/png', data: 'QUJDRA==' },
+          },
+        ],
+      },
+    ] as MessagesRequest['messages']);
     const current = result.conversationState.currentMessage.userInputMessage;
-    expect(current.content).toContain('hello');
-    expect(current.content).not.toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+    expect(current.content).toBe(`${SYSTEM}\n\nlook`);
+    expect(current.content).toBe(
+      asString.conversationState.currentMessage.userInputMessage.content,
+    );
+    expect(current.images).toHaveLength(1);
   });
 
-  // --------------------------------------------------------------------------
-  // 退化输入边界:hi / 空请求 / 空 system —— 身份覆写在最小/空载请求下仍须成立。
-  // 这三组与 e2e live.test.ts 的同名身份回归一一对应:单元层只钉「directive 被
-  // 注入到 system 层」,e2e 层才钉「真实模型不泄漏后端身份」(3b 注释的分工)。
-  // --------------------------------------------------------------------------
+  it('system prefix stays ahead of the multi-image legend', () => {
+    // prependImageLegend runs on the assembled content and the prefix is joined
+    // afterwards, so the system text is still the first thing in the message.
+    const png = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'QUJDRA==' },
+    };
+    const result = withSystem([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'orphan',
+            content: [{ type: 'text', text: '/w/o.png' }, png],
+          },
+          png,
+        ],
+      },
+    ] as MessagesRequest['messages']);
+    const content = result.conversationState.currentMessage.userInputMessage.content;
+    expect(content.startsWith(`${SYSTEM}\n\n[Attached images, in order:`)).toBe(true);
+  });
 
-  it('minimal "hi" greeting (no system, default): directive at head, current msg verbatim', () => {
-    const req = baseRequest({ messages: [{ role: 'user', content: 'hi' }] });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+  it('blank system blocks inject nothing: [{text:""},{text:""}] and whitespace-only', () => {
+    // Joining two empty blocks yields "\n", which is truthy; blank blocks are
+    // dropped before the join so no stray newlines reach the first user message.
+    for (const system of [
+      [
+        { type: 'text', text: '' },
+        { type: 'text', text: '' },
+      ],
+      [{ type: 'text', text: '   \n' }],
+    ]) {
+      const result = convertRequest(
+        baseRequest({ system, messages: [{ role: 'user', content: 'hi' }] }),
+      );
+      expect(result.conversationState.currentMessage.userInputMessage.content).toBe('hi');
+      expect(result.conversationState.history).toHaveLength(0);
     }
-    // current message 保持客户端原文 'hi',末尾不带身份指令(directive 只落 system 层)。
+  });
+
+  it('later tool_result-only user turns are never touched', () => {
+    const result = withSystem([
+      { role: 'user', content: 'q' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'data' }] },
+    ] as MessagesRequest['messages']);
     const current = result.conversationState.currentMessage.userInputMessage;
-    expect(current.content).toBe('hi');
-    expect(current.content).not.toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+    expect(current.content).toBe('');
+    expect(current.userInputMessageContext.toolResults.map((r) => r.toolUseId)).toEqual(['tu1']);
   });
 
-  it('empty request (user content ""): no throw, directive still at head, current empty', () => {
-    // 空 content 不抛 EmptyMessages —— 那个守卫只挡 messages 数组为空。current message
-    // 文本退化为空串,但身份 directive 仍由 else-if 分支注入到 history 头。
-    const req = baseRequest({ messages: [{ role: 'user', content: '' }] });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-    expect(result.conversationState.currentMessage.userInputMessage.content).toBe('');
+  it('empty system [{text: ""}] is byte-identical to no system', () => {
+    // 判断基于拼接后的 systemContent 真值而非数组长度:客户端发 system:[{text:''}] 时不能
+    // 拼出一个只剩分隔符的空前缀。
+    const empty = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: '' }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    );
+    const none = convertRequest(baseRequest({ messages: [{ role: 'user', content: 'hi' }] }));
+    expect(empty.conversationState.currentMessage).toEqual(none.conversationState.currentMessage);
+    expect(empty.conversationState.history).toEqual(none.conversationState.history);
+    expect(none.conversationState.currentMessage.userInputMessage.content).toBe('hi');
   });
 
-  it('empty request (user content []): no throw, directive still at head, current empty', () => {
-    const req = baseRequest({ messages: [{ role: 'user', content: [] }] });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
-    }
-    expect(result.conversationState.currentMessage.userInputMessage.content).toBe('');
-  });
-
-  it('empty system wire "" → preprocessSystem normalizes to [{text:""}], directive still injected', () => {
-    // 客户端发 system:"" (空字符串)。handler 经 messagesRequestSchema → preprocessSystem
-    // 归一成 [{text:""}](与已覆盖的 system:[{text:""}] 同形)→ buildHistory 空 systemContent
-    // → else-if 仍注入身份。这条链同时钉住归一规则 + 身份不丢。
-    const normalized = preprocessSystem('');
-    expect(normalized).toEqual([{ text: '' }]);
-    const req = baseRequest({ system: normalized, messages: [{ role: 'user', content: 'hi' }] });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+  it('empty system wire "" / [] normalize through preprocessSystem and inject nothing', () => {
+    expect(preprocessSystem('')).toEqual([{ text: '' }]);
+    expect(preprocessSystem([])).toBeUndefined();
+    for (const system of [preprocessSystem(''), preprocessSystem([])]) {
+      const result = convertRequest(
+        baseRequest({ system, messages: [{ role: 'user', content: 'hi' }] }),
+      );
+      expect(result.conversationState.currentMessage.userInputMessage.content).toBe('hi');
+      expect(result.conversationState.history).toHaveLength(0);
     }
   });
 
-  it('empty system wire [] → preprocessSystem normalizes to undefined, directive still injected', () => {
-    // 空数组被 preprocessSystem 丢成 undefined(等价「无 system」)→ else-if 仍注入身份。
-    const normalized = preprocessSystem([]);
-    expect(normalized).toBeUndefined();
-    const req = baseRequest({ system: normalized, messages: [{ role: 'user', content: 'hi' }] });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+  it('empty user content "" / []: no throw, the folded text is the whole content (no dangling separator)', () => {
+    for (const content of ['', []] as const) {
+      const result = withSystem([{ role: 'user', content }] as MessagesRequest['messages']);
+      expect(result.conversationState.currentMessage.userInputMessage.content).toBe(SYSTEM);
     }
   });
 
-  it('with-system branch: identity directive appended after system with a blank-line separator', () => {
-    // byte 级钉死 if(systemContent) 分支的形态与顺序:客户端 system 原文 + 空行 + 身份指令。
-    // 该分支曾在 system 与 directive 之间夹一段 chunked-write policy;该 policy 已移除后,
-    // 形态收敛为 `${system}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}`(无中间夹层),故直接用整串
-    // toBe 精确钉(强于历史的 endsWith/startsWith):把 \n\n 改回单 \n、挪走 directive、
-    // 或重新引入 system 后的夹层内容都会变红。baseRequest 为非原生 reasoning 且未启用
-    // thinking,故无 `<thinking_mode>` 前缀注入。
-    const systemText = 'You are a helpful coding assistant.';
+  it('rejects a message role other than user/assistant/system instead of dropping it', () => {
+    // Dropping the message silently would lose client content (and let the
+    // continuation bridge fuse into a real user turn); the Anthropic API rejects
+    // such roles too. Checked after system-role folding, so reminders still pass.
+    const messages = [
+      { role: 'user', content: 'x' },
+      { role: 'tool', content: 'weird' },
+    ] as unknown as MessagesRequest['messages'];
+    expect(() => withSystem(messages)).toThrow(ConversionError);
+    try {
+      withSystem(messages);
+    } catch (e) {
+      expect((e as ConversionError).code).toBe('InvalidRole');
+    }
+  });
+});
+
+describe('convertRequest - identity override', () => {
+  // 断言用 IDENTITY_OVERRIDE_DIRECTIVE 常量:文案微调不会让测试沉默 flake。
+  // 默认**关**:实测 opus-5 4/13、opus-4-6 0/2 生效(见 IDENTITY_OVERRIDE_DIRECTIVE 头注释)。
+  const SYSTEM = 'You are a helpful coding assistant.';
+
+  it('default (options omitted): no directive anywhere on the wire', () => {
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: SYSTEM }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    );
+    expect(JSON.stringify(result.conversationState)).not.toContain(IDENTITY_OVERRIDE_DIRECTIVE);
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${SYSTEM}\n\nhello`,
+    );
+  });
+
+  it('identityOverride: false explicit behaves identically to default', () => {
     const req = baseRequest({
-      system: [{ type: 'text', text: systemText }],
+      system: [{ type: 'text', text: SYSTEM }],
       messages: [{ role: 'user', content: 'hello' }],
     });
-    const result = convertRequest(req, { identityOverride: true });
+    expect(
+      convertRequest(req, { identityOverride: false }).conversationState.currentMessage,
+    ).toEqual(convertRequest(req).conversationState.currentMessage);
+  });
+
+  it('identityOverride: true, with system: system, blank line, directive, then the first user text', () => {
+    // byte 级钉死顺序:客户端 system 原文 + 空行 + 身份指令 + 空行 + 首条 user 原文。
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: SYSTEM }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      { identityOverride: true },
+    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${SYSTEM}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}\n\nhello`,
+    );
+  });
+
+  it('identityOverride: true, no system: the directive alone heads the first user text', () => {
+    const result = convertRequest(baseRequest({ messages: [{ role: 'user', content: 'hi' }] }), {
+      identityOverride: true,
+    });
+    expect(result.conversationState.history).toHaveLength(0);
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${IDENTITY_OVERRIDE_DIRECTIVE}\n\nhi`,
+    );
+  });
+
+  it('identityOverride: true, multi turn: directive only on history[0], current message verbatim', () => {
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: SYSTEM }],
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'reply' },
+          { role: 'user', content: 'go' },
+        ],
+      }),
+      { identityOverride: true },
+    );
     const head = result.conversationState.history[0];
     expect(head?.kind).toBe('user');
     if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toBe(`${systemText}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}`);
+      expect(head.userInputMessage.content).toBe(
+        `${SYSTEM}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}\n\nfirst`,
+      );
     }
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe('go');
+  });
+
+  it('identityOverride: true + empty user content: the directive is the whole content', () => {
+    for (const content of ['', []] as const) {
+      const result = convertRequest(
+        baseRequest({ messages: [{ role: 'user', content }] } as Partial<MessagesRequest>),
+        {
+          identityOverride: true,
+        },
+      );
+      expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+        IDENTITY_OVERRIDE_DIRECTIVE,
+      );
+    }
+  });
+
+  it('identityOverride: true + legacy thinking: prefix, then system, then directive, then user text', () => {
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: SYSTEM }],
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking: { type: 'enabled', budget_tokens: 8000 },
+      }),
+      { identityOverride: true },
+    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>\n${SYSTEM}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}\n\nhello`,
+    );
   });
 });
 
 describe('convertRequest - thinking prefix injection', () => {
   // 请求侧 `<thinking_mode>` 注入的回归覆盖(与身份覆写正交,这里只钉 thinking)。
   // baseRequest 的 claude-sonnet-4 非原生 reasoning,故 thinking 走 prompt 前缀注入路径。
+  const thinking = { type: 'enabled' as const, budget_tokens: 8000 };
+  const TAG =
+    '<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>';
 
-  it('thinking enabled (no system): thinking_mode prefix injected at history head', () => {
-    const req = baseRequest({
-      messages: [{ role: 'user', content: 'hello' }],
-      thinking: { type: 'enabled', budget_tokens: 8000 },
-    });
-    const result = convertRequest(req);
-    const head = result.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain('<thinking_mode>enabled</thinking_mode>');
-    }
+  it('thinking enabled (no system): prefix heads the first user message', () => {
+    const result = convertRequest(
+      baseRequest({ messages: [{ role: 'user', content: 'hello' }], thinking }),
+    );
+    expect(result.conversationState.history).toHaveLength(0);
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${TAG}\n\nhello`,
+    );
   });
 
-  it('empty system (text: "") + thinking: treated as no-system, no empty system shell', () => {
-    // 回归:converter.ts 的 system 存在判断基于「拼接后的 systemContent 真值」而非
-    // `req.system` 数组长度。客户端发 `system:[{text:''}]`(数组非空、内容空)必须等价于
-    // 「无 system」,走 else 分支(thinking + identity),而不是走 if 分支拼出一个带
-    // 多余前导空行的畸形 system(`\n\n`+identity)。用「与无 system 的结果逐字节相等」钉死它:
-    // 若有人把判断改回 `req.system?.length`,空 system 会走 system 分支、与无 system
-    // 分支产物发散 ⇒ 此处 toEqual 失败。
-    const thinking = { type: 'enabled' as const, budget_tokens: 8000 };
+  it('thinking enabled + system: prefix, newline, system, then the user text', () => {
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: 'Be brief.' }],
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+      }),
+    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${TAG}\nBe brief.\n\nhello`,
+    );
+  });
+
+  it('empty system (text: "") + thinking: byte-identical to no-system + thinking', () => {
+    // 回归:存在判断基于拼接后的 systemContent 真值而非 req.system 数组长度。
     const withEmptySystem = convertRequest(
       baseRequest({
         system: [{ type: 'text', text: '' }],
@@ -1138,21 +1232,121 @@ describe('convertRequest - thinking prefix injection', () => {
       }),
     );
     const withNoSystem = convertRequest(
+      baseRequest({ messages: [{ role: 'user', content: 'hi' }], thinking }),
+    );
+    expect(withEmptySystem.conversationState.currentMessage).toEqual(
+      withNoSystem.conversationState.currentMessage,
+    );
+    expect(withNoSystem.conversationState.currentMessage.userInputMessage.content).toBe(
+      `${TAG}\n\nhi`,
+    );
+  });
+
+  it('client system already carrying thinking tags is not doubled', () => {
+    const result = convertRequest(
       baseRequest({
-        messages: [{ role: 'user', content: 'hi' }],
+        system: [{ type: 'text', text: '<thinking_mode>enabled</thinking_mode> Be brief.' }],
+        messages: [{ role: 'user', content: 'hello' }],
         thinking,
       }),
     );
-    expect(withEmptySystem.conversationState.history).toEqual(
-      withNoSystem.conversationState.history,
-    );
+    const content = result.conversationState.currentMessage.userInputMessage.content;
+    expect(content.split('<thinking_mode>').length - 1).toBe(1);
+  });
 
-    // 正向:history 头部带 thinking 前缀(确实注入了),且未退化成空 system 壳。
-    const head = withEmptySystem.conversationState.history[0];
-    expect(head?.kind).toBe('user');
-    if (head?.kind === 'user') {
-      expect(head.userInputMessage.content).toContain('<thinking_mode>enabled</thinking_mode>');
+  it('first user text already carrying a thinking block is not doubled (no system)', () => {
+    // The prefix is joined to the first user message, so that message is the text
+    // that can already carry the block; the dedup must look there, not only at
+    // the request system text.
+    const tagged =
+      '<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>\nhello';
+    const result = convertRequest(
+      baseRequest({ messages: [{ role: 'user', content: tagged }], thinking }),
+    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(tagged);
+  });
+
+  it('a system prompt that merely mentions <thinking_mode> in prose keeps the prefix', () => {
+    // Only a complete tag block counts as "already tagged"; a bare mention is not
+    // one, otherwise extended thinking would silently switch off with no log.
+    const result = convertRequest(
+      baseRequest({
+        system: [{ type: 'text', text: 'Never emit literal <thinking_mode> tags in replies.' }],
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+      }),
+    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toMatch(
+      /^<thinking_mode>enabled<\/thinking_mode>/,
+    );
+  });
+
+  it('native-reasoning model: no prompt prefix, effort rides the wire field instead', () => {
+    const result = convertRequest(
+      baseRequest({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+      }),
+    );
+    const current = result.conversationState.currentMessage.userInputMessage;
+    expect(current.content).toBe('hello');
+    expect(current.reasoning).toBeDefined();
+  });
+});
+
+describe('convertRequest - trailing run of user messages is the current turn', () => {
+  // Anthropic 语义:连续同角色消息是一轮。旧实现把末尾连串的前几条塞进 history 并补一条
+  // 假 assistant "OK",下一轮同一段又被 mergeUserMessages 合并成一条——形态随轮次漂移。
+  const convert = (messages: MessagesRequest['messages']) =>
+    convertRequest(baseRequest({ messages })).conversationState;
+
+  it('two trailing user messages merge into one currentMessage; history is empty', () => {
+    const state = convert([
+      { role: 'user', content: 'My secret code is 7731.' },
+      { role: 'user', content: 'What is my secret code?' },
+    ]);
+    expect(state.history).toHaveLength(0);
+    expect(state.currentMessage.userInputMessage.content).toBe(
+      'My secret code is 7731.\nWhat is my secret code?',
+    );
+    expect(JSON.stringify(state)).not.toContain('"OK"');
+  });
+
+  it('tool_result turn followed by a user text turn: results and text share the current message', () => {
+    const state = convert([
+      { role: 'user', content: 'q' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'data' }] },
+      { role: 'user', content: 'now summarize' },
+    ] as MessagesRequest['messages']);
+    expect(state.history.map((m) => m.kind)).toEqual(['user', 'assistant']);
+    const current = state.currentMessage.userInputMessage;
+    expect(current.content).toBe('now summarize');
+    expect(current.userInputMessageContext.toolResults.map((r) => r.toolUseId)).toEqual(['tu1']);
+  });
+
+  it('the same two messages have the same shape whether they are current or history', () => {
+    // 形态一致性:本轮的 currentMessage 文本 == 下一轮 history 里合并后的文本。
+    const now = convert([
+      { role: 'user', content: 'A' },
+      { role: 'user', content: 'B' },
+    ]);
+    const later = convert([
+      { role: 'user', content: 'A' },
+      { role: 'user', content: 'B' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'C' },
+    ]);
+    const head = later.history[0];
+    expect(head.kind).toBe('user');
+    if (head.kind === 'user') {
+      expect(head.userInputMessage.content).toBe(now.currentMessage.userInputMessage.content);
     }
+    expect(later.history).toHaveLength(2);
   });
 });
 

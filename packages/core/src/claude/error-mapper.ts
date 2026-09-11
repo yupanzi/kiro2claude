@@ -204,11 +204,15 @@ export function mapProviderError(err: unknown, reply: FastifyReply): void {
  * of `kind`).
  */
 export function mapConversionError(
-  code: 'UnsupportedModel' | 'EmptyMessages',
+  code: 'UnsupportedModel' | 'EmptyMessages' | 'InvalidRole',
   modelName: string,
   reply: FastifyReply,
 ): void {
   const message =
-    code === 'UnsupportedModel' ? `Model not supported: ${modelName}` : 'Messages list is empty';
+    code === 'UnsupportedModel'
+      ? `Model not supported: ${modelName}`
+      : code === 'InvalidRole'
+        ? 'messages[].role must be "user", "assistant" or "system"'
+        : 'Messages list is empty';
   reply.status(400).send(createErrorResponse('invalid_request_error', message));
 }

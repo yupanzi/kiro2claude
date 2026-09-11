@@ -221,6 +221,29 @@ describe('handlers: POST /claude/v1/messages - validation', () => {
     expect(body.error.message).toMatch(/Model not supported/);
   });
 
+  it('rejects an unsupported message role with 400 instead of silently dropping it', async () => {
+    app = await buildApp(makeStubProvider());
+    const response = await app.inject({
+      method: 'POST',
+      url: '/claude/v1/messages',
+      headers: { 'x-api-key': API_KEY },
+      payload: {
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 1024,
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'tool', content: 'weird' },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    const body = response.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.message).toMatch(/role/);
+    // Client junk is never echoed back into the response body.
+    expect(body.error.message).not.toContain('weird');
+  });
+
   it('rejects empty messages array with 400 "Messages list is empty"', async () => {
     app = await buildApp(makeStubProvider());
     const response = await app.inject({

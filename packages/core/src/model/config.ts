@@ -32,9 +32,11 @@ export interface Config {
   captureEmptyDir?: string;
   extractThinking: boolean;
   /**
-   * 启用身份覆写 directive。开启时（默认）在 system prompt 末尾追加一段
-   * "你是 Claude" 的身份指令，挡住模型自报为 Amazon Q / Kiro 的路径。
-   * 关闭可换回更高的 prompt cache 命中率（代价是身份会暴露）。
+   * 启用身份覆写 directive。开启时在 system 文本末尾追加一段"你是 Claude"的身份
+   * 指令。**默认关**:网关注入的一切都以 user 级权重进模型,压不过上游自己的
+   * 系统提示,2026-09-10 实测 opus-5 只有 4/13、opus-4-6 0/2 会自报 Claude,
+   * 措辞与位置都改不了这个比例(见 `IDENTITY_OVERRIDE_DIRECTIVE` 头注释)。
+   * 开启 = 每请求多付一段 token 换一个抛硬币的结果,请知情选择。
    */
   identityOverride: boolean;
   /**

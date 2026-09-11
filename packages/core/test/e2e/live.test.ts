@@ -72,6 +72,7 @@ function joinTextDeltas(events: SseEvent[]): string {
 describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   let app: FastifyInstance;
   let apiKey: string;
+  let identityOverride: boolean;
 
   beforeAll(async () => {
     const config = loadConfigFromEnv();
@@ -80,6 +81,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
     const kiroProvider = new KiroProvider(tokenManager);
     const hookBus = new HookBus();
     apiKey = config.apiKey;
+    identityOverride = config.identityOverride;
 
     initCountTokensConfig({
       apiUrl: config.countTokensApiUrl,
@@ -199,13 +201,16 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   );
 
   // --------------------------------------------------------------------------
-  // 3b. Identity override — the model must self-identify as Claude/Anthropic
-  //     and NEVER leak the upstream backend (Kiro / Amazon Q / CodeWhisperer).
-  //     This is the only check that proves the request-side identity directive
-  //     actually steers model behavior; the unit tests only prove it is injected.
+  // 3b. Identity question — with KIRO2CLAUDE_IDENTITY_OVERRIDE on, the model
+  //     should self-identify as Claude/Anthropic and not leak the upstream
+  //     backend (Kiro / Amazon Q / CodeWhisperer). The directive is off by
+  //     default and holds only sometimes even when on (see
+  //     IDENTITY_OVERRIDE_DIRECTIVE in claude/converter.ts), so the identity
+  //     assertions run only when the flag is set; the request itself must
+  //     always succeed. The unit tests only prove the directive is injected.
   // --------------------------------------------------------------------------
   it(
-    '3b. POST /claude/v1/messages identity question: self-IDs as Claude, never Kiro/Q',
+    '3b. POST /claude/v1/messages identity question: self-IDs as Claude when override is on',
     async () => {
       const res = await app.inject({
         method: 'POST',
@@ -227,22 +232,26 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
       const body = res.json() as { content: Array<{ type: string; text?: string }> };
       const text = body.content.map((b) => b.text ?? '').join('');
       expect(text.length).toBeGreaterThan(0);
-      // identity override ON (default) ⇒ model self-identifies as Claude / Anthropic …
-      expect(text).toMatch(/claude|anthropic/i);
-      // … and never surfaces the upstream backend identity.
-      expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+      if (identityOverride) {
+        // Directive on ⇒ model self-identifies as Claude / Anthropic …
+        expect(text).toMatch(/claude|anthropic/i);
+        // … and does not surface the upstream backend identity.
+        expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+      }
     },
     LIVE_TIMEOUT_MS,
   );
 
   // --------------------------------------------------------------------------
-  // 3c–3e. Identity under degenerate inputs — the request-side identity
-  //   directive must keep steering (and never leak the backend) even when the
-  //   client sends the smallest / emptiest possible request. Mirrors the unit
-  //   regressions in converter.test.ts `convertRequest - identity override`.
+  // 3c–3e. Degenerate inputs — the smallest / emptiest possible requests must
+  //   still convert and get a handled response. Checks on *model output* follow
+  //   the same flag gate as 3b (with the directive off the model may introduce
+  //   itself by the upstream name, README「已知限制」); checks on gateway-authored
+  //   error bodies stay unconditional. Mirrors the unit regressions in
+  //   converter.test.ts `convertRequest - identity override`.
   // --------------------------------------------------------------------------
   it(
-    '3c. POST /claude/v1/messages "hi" greeting: responds without leaking the upstream backend',
+    '3c. POST /claude/v1/messages "hi" greeting: responds; leak check gated on flag',
     async () => {
       const res = await app.inject({
         method: 'POST',
@@ -258,21 +267,22 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
       const body = res.json() as { content: Array<{ type: string; text?: string }> };
       const text = body.content.map((b) => b.text ?? '').join('');
       expect(text.length).toBeGreaterThan(0);
-      // A casual greeting won't volunteer an identity claim, so assert only the
-      // negative: the backend identity must never surface, even on trivial input.
-      expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+      // A casual greeting won't volunteer an identity claim; with the directive on
+      // the backend identity must still not surface, even on trivial input.
+      if (identityOverride) expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
     },
     LIVE_TIMEOUT_MS,
   );
 
   it(
-    '3d. POST /claude/v1/messages empty system (array + string): still self-IDs as Claude, no leak',
+    '3d. POST /claude/v1/messages empty system (array + string): converts; identity gated on flag',
     async () => {
       // Empty client system in BOTH wire forms. preprocessSystem normalizes
       // [] → undefined (treated as "no system") and "" → [{text:""}]; either way
-      // buildHistory sees empty systemContent and still injects the identity
-      // directive via its else-if branch, so identity must hold end-to-end.
-      // Two sequential real upstream calls → double the per-test timeout.
+      // buildSystemPrefix sees empty system text and still emits the identity
+      // directive when the flag is on (folded into the first user message by
+      // foldSystemIntoFirstUserMessage), so identity is asserted under the same
+      // gate as 3b. Two sequential real upstream calls → double the per-test timeout.
       for (const system of [[], ''] as unknown[]) {
         const res = await app.inject({
           method: 'POST',
@@ -295,15 +305,17 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         const body = res.json() as { content: Array<{ type: string; text?: string }> };
         const text = body.content.map((b) => b.text ?? '').join('');
         expect(text.length).toBeGreaterThan(0);
-        expect(text).toMatch(/claude|anthropic/i);
-        expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+        if (identityOverride) {
+          expect(text).toMatch(/claude|anthropic/i);
+          expect(text).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+        }
       }
     },
     2 * LIVE_TIMEOUT_MS,
   );
 
   it(
-    '3e. POST /claude/v1/messages empty user content (string + array): handled, never leaks',
+    '3e. POST /claude/v1/messages empty user content (string + array): handled; error bodies never leak',
     async () => {
       // Degenerate empty content passes through the converter as an empty string
       // (processMessageContent never throws on "" or []), so it cannot itself
@@ -326,7 +338,11 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
           },
         });
         expect([200, 400, 503]).toContain(res.statusCode);
-        expect(res.body).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+        // Error bodies are gateway-authored and must stay neutral regardless of
+        // the flag; a 200 body is model output and follows the 3b gate.
+        if (res.statusCode !== 200 || identityOverride) {
+          expect(res.body).not.toMatch(/kiro|amazon\s*q|codewhisperer/i);
+        }
       }
     },
     2 * LIVE_TIMEOUT_MS,
@@ -1380,8 +1396,8 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   //     metadata.user_id containing session_id, and max_tokens=16384.
   //
   //     Exercises simultaneously:
-  //       - buildHistory system injection — 3 text blocks join + identity
-  //         directive append + user/assistant pair
+  //       - buildSystemPrefix — 3 text blocks join (+ identity directive when
+  //         the flag is on), folded into the first user message
   //       - extractSessionId JSON branch (converter.ts:186)
   //       - convertTools over a 15-element list (Write/Edit included)
   //       - normalizeJsonSchema over varied schemas

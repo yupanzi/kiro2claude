@@ -118,7 +118,7 @@ describe('tool_result order follows tool_use order', () => {
     });
   });
 
-  it('never moves blocks into the trailing message (buildHistory splits it off as currentMessage)', () => {
+  it('treats the trailing run of consecutive user messages as one turn too (it becomes currentMessage)', () => {
     const state = wire([
       { role: 'user', content: 'look up alpha and beta' },
       { role: 'assistant', content: [toolUse('toolu_alpha'), toolUse('toolu_beta')] },
@@ -126,17 +126,15 @@ describe('tool_result order follows tool_use order', () => {
       { role: 'user', content: [toolResult('toolu_alpha', [image(PNG_A)])] },
     ]);
 
-    // 末尾两条 user 不合并:beta 进 history(自动补 OK),alpha 留在 currentMessage。
-    // 每条 Kiro 消息只有一张图、一个结果,归属本就无歧义,所以不跨消息搬动。
+    // 末尾两条 user 与历史里的连串规则相同:整体是一轮、整体是 currentMessage。旧实现把前
+    // 一条塞进 history 再补一条假 assistant "OK",同一段对话在下一轮又会合并成一条——
+    // 形态随轮次漂移。现在 history 只剩客户端真实的两条,两个结果按 tool_use 顺序排。
+    expect(state.history).toHaveLength(2);
     expect(summarize(state.currentMessage.userInputMessage)).toEqual({
       content: '',
-      images: [PNG_A],
-      results: ['toolu_alpha'],
+      images: [PNG_A, PNG_B],
+      results: ['toolu_alpha', 'toolu_beta'],
     });
-    const historyUser = state.history.find(
-      (m: { userInputMessage?: UserWire }) => m.userInputMessage?.images?.length === 1,
-    ).userInputMessage as UserWire;
-    expect(summarize(historyUser).results).toEqual(['toolu_beta']);
   });
 
   it('follows the merged order of a run of consecutive assistant messages', () => {

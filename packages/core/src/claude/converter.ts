@@ -39,10 +39,15 @@ import type { Message as ClaudeMessage, ContentBlock, MessagesRequest, Tool } fr
 // ============================================================================
 
 /**
- * Pins the model's self-identity to Claude / Anthropic, overriding any
- * upstream-injected "You are Q" prompts from Kiro / AWS CodeWhisperer.
- * Placed at the end of system content so it takes precedence over earlier
- * conflicting directives. Toggled by `KIRO2CLAUDE_IDENTITY_OVERRIDE`.
+ * Pins the model's self-identity to Claude / Anthropic against the upstream's
+ * own "You are Kiro" system prompt. Appended to the end of the request system
+ * text, which itself is folded into the first user message (see
+ * `foldSystemIntoFirstUserMessage`). Toggled by `KIRO2CLAUDE_IDENTITY_OVERRIDE`,
+ * **default off**: everything the gateway injects rides in a user turn while the
+ * upstream keeps its system prompt above it, so the directive holds only
+ * sometimes — 2026-09-10 live probes: opus-5 answered "Claude" 4/13, opus-4-6
+ * 0/2, and neither the ack wording nor the placement changed that. Keeping it
+ * on costs tokens on every request for a coin-flip; opt in knowingly.
  */
 export const IDENTITY_OVERRIDE_DIRECTIVE = `Identity directive: You are Claude, made by Anthropic.`;
 
@@ -308,7 +313,7 @@ export interface ConversionResult {
 }
 
 export interface ConvertRequestOptions {
-  /** 默认 true。详见 `Config.identityOverride`。 */
+  /** 默认 false(实测生效率低,见 `IDENTITY_OVERRIDE_DIRECTIVE` 头注释)。详见 `Config.identityOverride`。 */
   identityOverride?: boolean;
   /**
    * 默认 false（库函数保守默认，保持向后兼容的"静默丢弃"行为）。生产路径由
@@ -336,7 +341,7 @@ export interface ConvertRequestOptions {
 
 export class ConversionError extends Error {
   constructor(
-    public readonly code: 'UnsupportedModel' | 'EmptyMessages',
+    public readonly code: 'UnsupportedModel' | 'EmptyMessages' | 'InvalidRole',
     message: string,
   ) {
     super(message);
@@ -1130,8 +1135,17 @@ function generateThinkingPrefix(req: MessagesRequest): string | undefined {
   return undefined;
 }
 
+/**
+ * True when `content` already carries a complete `<thinking_mode>…</thinking_mode>`
+ * (or `<max_thinking_length>…</max_thinking_length>`) block, i.e. the shape
+ * `generateThinkingPrefix` itself emits. A bare mention of the tag name in prose
+ * (a system prompt saying "never emit <thinking_mode> tags") is not a block and
+ * must not switch the prefix off.
+ */
 function hasThinkingTags(content: string): boolean {
-  return content.includes('<thinking_mode>') || content.includes('<max_thinking_length>');
+  return /<thinking_mode>[^<]*<\/thinking_mode>|<max_thinking_length>[^<]*<\/max_thinking_length>/.test(
+    content,
+  );
 }
 
 // ============================================================================
@@ -1240,7 +1254,31 @@ function mergeAssistantMessages(
   };
 }
 
-/** Merge multiple user messages */
+/**
+ * Process a run of consecutive user messages as **one** turn: one images[]
+ * ordinal across the run (placeholders keep counting), texts joined by newline,
+ * tool results concatenated in message order. The Anthropic API treats such a
+ * run as a single turn, so this is what both a history entry
+ * (`mergeUserMessages`) and the current turn (`convertRequest`) are built from.
+ */
+function processMessageRun(
+  messages: ClaudeMessage[],
+  rejectUnsupportedDocuments: boolean,
+  ordinal: ImageOrdinal,
+): ProcessedContent {
+  const textParts: string[] = [];
+  const images: KiroImage[] = [];
+  const toolResults: ToolResult[] = [];
+  for (const msg of messages) {
+    const processed = processMessageContent(msg.content, rejectUnsupportedDocuments, ordinal);
+    if (processed.text) textParts.push(processed.text);
+    images.push(...processed.images);
+    toolResults.push(...processed.toolResults);
+  }
+  return { text: textParts.join('\n'), images, toolResults };
+}
+
+/** Merge a run of consecutive user messages into one Kiro history message. */
 function mergeUserMessages(
   messages: ClaudeMessage[],
   modelId: string,
@@ -1248,34 +1286,24 @@ function mergeUserMessages(
   toolUseIndex: ToolUseIndex,
   toolNameMap: Map<string, string>,
 ): KiroMessage {
-  const contentParts: string[] = [];
-  const allImages: KiroImage[] = [];
-  const allToolResults: ToolResult[] = [];
-  // One images[] per Kiro message → one running ordinal across the merged run.
   const ordinal = newImageOrdinal();
+  const { text, images, toolResults } = processMessageRun(
+    messages,
+    rejectUnsupportedDocuments,
+    ordinal,
+  );
 
-  for (const msg of messages) {
-    const { text, images, toolResults } = processMessageContent(
-      msg.content,
-      rejectUnsupportedDocuments,
-      ordinal,
-    );
-    if (text) contentParts.push(text);
-    allImages.push(...images);
-    allToolResults.push(...toolResults);
-  }
-
-  const content = prependImageLegend(contentParts.join('\n'), ordinal, toolUseIndex, toolNameMap);
+  const content = prependImageLegend(text, ordinal, toolUseIndex, toolNameMap);
   const userMsg = createUserMessage(content, modelId);
 
-  if (allImages.length > 0) {
-    userMsg.images = allImages;
+  if (images.length > 0) {
+    userMsg.images = images;
   }
 
-  if (allToolResults.length > 0) {
+  if (toolResults.length > 0) {
     userMsg.userInputMessageContext = {
       ...userMsg.userInputMessageContext,
-      toolResults: allToolResults,
+      toolResults,
     };
   }
 
@@ -1286,93 +1314,144 @@ function mergeUserMessages(
 }
 
 // ============================================================================
-// Build history
+// Request-level system text → first user message
 // ============================================================================
 
 /**
- * Build history messages.
+ * Compose everything the gateway wants the model to read ahead of the client's
+ * conversation: the client's `system` text, the legacy `<thinking_mode>` prefix
+ * for models without native reasoning, and the identity directive when enabled.
+ * Returns undefined when there is nothing to inject.
  *
- * @param req - Original request (for system, thinking, etc.)
- * @param messages - Pre-processed messages ending in a user message
- * @param modelId - Mapped Kiro model ID
- * @param toolNameMap - Mutable tool name mapping
+ * The existence check is on the joined text, not on `req.system.length`: clients
+ * send `system: [{text: ''}]`, which must behave exactly like "no system"; blank
+ * blocks are dropped before joining so they cannot leave stray newlines either.
+ * `firstUserText` is the client text the prefix will be joined to (see
+ * `foldSystemIntoFirstUserMessage`): the thinking prefix is skipped when either
+ * the system text or that target already carries the tags, so a client shipping
+ * its own `<thinking_mode>` block never gets a second one right next to it.
  */
-function pushSystemDirectivePair(
-  history: KiroMessage[],
-  userContent: string,
-  modelId: string,
-): void {
-  history.push({
-    kind: 'user',
-    userInputMessage: createUserMessage(userContent, modelId),
-  });
-  history.push({
-    kind: 'assistant',
-    assistantResponseMessage: createAssistantMessage('I will follow these instructions.'),
-  });
-}
-
-function buildHistory(
+function buildSystemPrefix(
   req: MessagesRequest,
-  messages: ClaudeMessage[],
   modelId: string,
-  toolNameMap: Map<string, string>,
   identityOverride: boolean,
-  rejectUnsupportedDocuments: boolean,
-  toolUseIndex: ToolUseIndex,
-): KiroMessage[] {
-  const history: KiroMessage[] = [];
-
-  // 走原生 reasoning 路径的 model（4.7/4.8）：thinking 在 wire 字段
-  // `userInputMessage.reasoning.effort` 上传递，**不**再注入 `<thinking_mode>`
-  // prompt 前缀，避免 prompt 和 wire 字段双重处理。
-  // 其它 model 走 prompt 注入路径作为 fallback。
+  firstUserText: string,
+): string | undefined {
+  // Native-reasoning models carry thinking on the wire field
+  // `userInputMessage.reasoning.effort`; the prompt prefix is only the fallback
+  // for the others(踩坑「原生 reasoning 路径互斥」).
   const thinkingPrefix = usesNativeReasoning(modelId) ? undefined : generateThinkingPrefix(req);
-
-  // 1. Process system messages
-  // 判断基于"拼接后的 systemContent"而非 req.system 数组长度:客户端可能发
-  // `system: [{text: ''}]`——数组非空但内容为空。这种情况必须等价于"无 system",
-  // 照常注入 thinking/identity,否则会连身份覆写一起丢掉(模型裸奔暴露上游身份)。
-  const systemContent = req.system?.map((s) => s.text).join('\n') ?? '';
+  const systemContent =
+    req.system
+      ?.map((s) => s.text)
+      .filter((t) => t.trim().length > 0)
+      .join('\n') ?? '';
+  const alreadyTagged = hasThinkingTags(systemContent) || hasThinkingTags(firstUserText);
 
   if (systemContent) {
     const content = identityOverride
       ? `${systemContent}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}`
       : systemContent;
-
-    // Inject thinking tags at the start if needed and not already present
-    const finalContent =
-      thinkingPrefix && !hasThinkingTags(content) ? `${thinkingPrefix}\n${content}` : content;
-
-    pushSystemDirectivePair(history, finalContent, modelId);
-  } else if (thinkingPrefix || identityOverride) {
-    // 无客户端 system 文本,内容仅由 server 拼装(thinkingPrefix + 身份指令),
-    // 不会出现"客户端自带 <thinking_mode>"的重复,故不需要上面分支的 hasThinkingTags 去重。
-    const parts: string[] = [];
-    if (thinkingPrefix) parts.push(thinkingPrefix);
-    if (identityOverride) parts.push(IDENTITY_OVERRIDE_DIRECTIVE);
-    pushSystemDirectivePair(history, parts.join('\n\n'), modelId);
+    return thinkingPrefix && !alreadyTagged ? `${thinkingPrefix}\n${content}` : content;
   }
 
-  // 2. Process regular message history
-  // Last message becomes currentMessage, not added to history
-  const historyEndIndex = messages.length - 1;
+  const parts: string[] = [];
+  if (thinkingPrefix && !alreadyTagged) parts.push(thinkingPrefix);
+  if (identityOverride) parts.push(IDENTITY_OVERRIDE_DIRECTIVE);
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
 
+/**
+ * Kiro has no system field: `conversationState` is user/assistant turns only,
+ * and `userInputMessageContext.additionalContext` — the one structured slot that
+ * looks like a context channel — is accepted (200) and silently dropped
+ * (2026-09-10 probe: a secret placed there is unknown to the model, instructions
+ * in it are ignored, the input token count does not move). So system text can
+ * only travel as user-turn text; the only choice is *where*.
+ *
+ * It goes to the front of the first user message. The previous shape mirrored
+ * kiro-cli's own context injection — a synthetic opening turn `user: <system>` /
+ * `assistant: "I will follow these instructions."` — but that turn is real
+ * history to the model: asked to quote its earlier replies it quotes the
+ * fabricated ack verbatim (2026-09-10 probes; the zero-injection baseline
+ * answers NONE). A 24-session / 352-call A/B under 35K–78K context with real
+ * tool execution found no difference between the two placements in tool-call
+ * validity or task completion, so the fabricated turn bought nothing. Folding
+ * is cache-neutral: the first user message is stable across turns, so the
+ * prefix bytes are.
+ *
+ * Applied on the **Kiro** message after its content has been assembled (image
+ * legend included), not on the client message: joined with one blank line
+ * whatever shape the client sent (string or block array), so the same logical
+ * request yields the same wire bytes, and the prefix is the very first thing in
+ * that message — ahead of the image legend, not behind it. A leading assistant
+ * message, if a client sends one, stays where it is (the upstream accepts an
+ * assistant-first history; 2026-09-11 live probe): on the first turn the first
+ * user message is the `currentMessage`, from the second turn on it is the first
+ * user entry of `history`. Later user turns — tool_result-only ones included —
+ * are never modified.
+ *
+ * Mutates that history entry in place; returns the current-message content,
+ * prefixed only when the history holds no user turn yet.
+ */
+function foldSystemIntoFirstUserMessage(
+  prefix: string | undefined,
+  history: KiroMessage[],
+  currentContent: string,
+): string {
+  if (!prefix) return currentContent;
+  // Empty client text: the prefix *is* the content (no dangling separator).
+  const join = (content: string): string => (content ? `${prefix}\n\n${content}` : prefix);
+  const firstUser = history.find((m) => m.kind === 'user');
+  if (firstUser?.kind === 'user') {
+    firstUser.userInputMessage.content = join(firstUser.userInputMessage.content);
+    return currentContent;
+  }
+  return join(currentContent);
+}
+
+// ============================================================================
+// Build history
+// ============================================================================
+
+/**
+ * Convert the client's history turns — everything before the current turn —
+ * into Kiro history. Consecutive same-role messages merge into one Kiro message
+ * (the Anthropic API treats such a run as a single turn), so the result strictly
+ * alternates user / assistant.
+ *
+ * The caller hands over messages ending with an assistant turn (or nothing):
+ * the trailing run of user messages *is* the current turn and becomes
+ * `currentMessage` in `convertRequest`. There is therefore no trailing user to
+ * pair with a synthetic assistant reply here — the old `assistant: "OK"` pairing
+ * also made the history shape drift between turns (the same two client messages
+ * were `user / "OK" / user` while the second was current, then one merged user
+ * message once both were history). **The gateway fabricates no assistant
+ * turns**; `test/static/no-fabricated-turns.test.ts` pins that.
+ *
+ * @param messages - History messages only; the caller has split off the current turn
+ */
+function buildHistory(
+  messages: ClaudeMessage[],
+  modelId: string,
+  toolNameMap: Map<string, string>,
+  rejectUnsupportedDocuments: boolean,
+  toolUseIndex: ToolUseIndex,
+): KiroMessage[] {
+  const history: KiroMessage[] = [];
   let userBuffer: ClaudeMessage[] = [];
   let assistantBuffer: ClaudeMessage[] = [];
 
-  for (let i = 0; i < historyEndIndex; i++) {
-    const msg = messages[i];
-
+  for (const msg of messages) {
     if (msg.role === 'user') {
-      // Flush accumulated assistant messages
       if (assistantBuffer.length > 0) {
         history.push(mergeAssistantMessages(assistantBuffer, toolNameMap));
         assistantBuffer = [];
       }
       userBuffer.push(msg);
-    } else if (msg.role === 'assistant') {
-      // Flush accumulated user messages
+    } else {
+      // Only user / assistant reach here: convertRequest step 2.25 rejects any
+      // other role once system-role reminders have been folded into user turns.
       if (userBuffer.length > 0) {
         history.push(
           mergeUserMessages(
@@ -1389,29 +1468,16 @@ function buildHistory(
     }
   }
 
-  // Flush trailing assistant messages
+  // The input ends with an assistant message (or is empty), so every buffered
+  // user run has already been flushed by the assistant that followed it.
   if (assistantBuffer.length > 0) {
     history.push(mergeAssistantMessages(assistantBuffer, toolNameMap));
-  }
-
-  // Handle trailing orphan user messages
-  if (userBuffer.length > 0) {
-    history.push(
-      mergeUserMessages(userBuffer, modelId, rejectUnsupportedDocuments, toolUseIndex, toolNameMap),
-    );
-
-    // Auto-pair with an "OK" assistant response
-    const autoAssistant = createAssistantMessage('OK');
-    history.push({ kind: 'assistant', assistantResponseMessage: autoAssistant });
   }
 
   getLogger().debug({
     msg: 'history built',
     history_entry_count: history.length,
-    source_message_count: messages.length - 1,
-    has_system_prompt: !!(req.system && req.system.length > 0),
-    thinking_type: req.thinking?.type,
-    budget_tokens: req.thinking?.budget_tokens,
+    source_message_count: messages.length,
   });
 
   return history;
@@ -1439,9 +1505,9 @@ function systemMessageText(content: unknown): string {
 
 /**
  * Return a copy of `msg` with `extra` folded into its content. String content is
- * concatenated; block-array content gets a `text` block unshifted (`prepend`) or
- * pushed (`append`) — so a tool_result-only user message keeps its tool_result
- * blocks intact while also carrying the reminder text.
+ * concatenated with a newline; block-array content gets a `text` block
+ * unshifted (`prepend`) or pushed (`append`) — so a tool_result-only user
+ * message keeps its tool_result blocks intact while also carrying the text.
  */
 function foldTextIntoMessage(
   msg: ClaudeMessage,
@@ -1451,6 +1517,8 @@ function foldTextIntoMessage(
   if (!extra) return msg;
   const c = msg.content;
   if (typeof c === 'string') {
+    // Empty client text: the folded text *is* the content — no dangling separator.
+    if (c === '') return { ...msg, content: extra };
     return { ...msg, content: where === 'prepend' ? `${extra}\n${c}` : `${c}\n${extra}` };
   }
   const arr: unknown[] = Array.isArray(c) ? [...c] : [];
@@ -1480,13 +1548,12 @@ function foldTextIntoMessage(
  *
  * Rules: only `tool_result` blocks move, and only among the slots they already
  * occupy (text/image blocks stay where they are). Grouping mirrors what reaches
- * one Kiro message: a run of consecutive user messages inside the history is
- * one group because `mergeUserMessages` flattens it, but `buildHistory` splits
- * the *trailing* run — its last message becomes `currentMessage` on its own —
- * so that last message is its own group and blocks never cross into it. Ids
- * the assistant turn never issued keep their relative order after the known
- * ones (pairing validation reports them separately); an already-canonical
- * group is returned untouched (no clone).
+ * one Kiro message: a run of consecutive user messages is one group — inside
+ * the history because `mergeUserMessages` flattens it, at the tail because that
+ * run *is* the `currentMessage` (both go through `processMessageRun`). Ids the
+ * assistant turn never issued keep their relative order after the known ones
+ * (pairing validation reports them separately); an already-canonical group is
+ * returned untouched (no clone).
  */
 function canonicalizeToolResultOrder(messages: ClaudeMessage[]): ClaudeMessage[] {
   const out = messages.slice();
@@ -1509,12 +1576,7 @@ function canonicalizeToolResultOrder(messages: ClaudeMessage[]): ClaudeMessage[]
     }
     let k = j;
     while (k < out.length && out[k].role === 'user') k++;
-    if (order.size > 0) {
-      // The trailing run's last message is the future currentMessage: group it alone.
-      const split = k === out.length ? k - 1 : k;
-      movedTotal += reorderToolResultSlots(out, j, split, order);
-      if (split < k) movedTotal += reorderToolResultSlots(out, split, k, order);
-    }
+    if (order.size > 0) movedTotal += reorderToolResultSlots(out, j, k, order);
     i = k;
   }
   if (movedTotal > 0) {
@@ -1632,7 +1694,7 @@ function foldSystemMessages(messages: ClaudeMessage[]): ClaudeMessage[] {
   // message if any, else materialize a user message so it still reaches Kiro.
   if (pending.length > 0) {
     const text = pending.join('\n');
-    const lastUserIdx = findLastIndex(out, (m) => m.role === 'user');
+    const lastUserIdx = out.findLastIndex((m) => m.role === 'user');
     if (lastUserIdx >= 0) {
       out[lastUserIdx] = foldTextIntoMessage(out[lastUserIdx], text, 'append');
     } else {
@@ -1752,7 +1814,7 @@ export function convertRequest(
   req: MessagesRequest,
   options: ConvertRequestOptions = {},
 ): ConversionResult {
-  const identityOverride = options.identityOverride ?? true;
+  const identityOverride = options.identityOverride ?? false;
   const rejectUnsupportedDocuments = options.rejectUnsupportedDocuments ?? false;
   // `??` only substitutes on nullish, so an explicit 0 / negative / non-integer
   // from a direct library caller (the env path is schema-guarded to 1..1_000_000)
@@ -1786,6 +1848,18 @@ export function convertRequest(
     throw new ConversionError('EmptyMessages', 'No user message found in messages list');
   }
 
+  // 2.25. Only user / assistant remain after the fold. Anything else has no Kiro
+  // turn to go to, and dropping it silently would lose client content, so it is
+  // rejected up front (the Anthropic API rejects such roles as well). Every later
+  // pass may therefore assume user/assistant only.
+  const unsupportedRole = foldedMessages.find((m) => m.role !== 'user' && m.role !== 'assistant');
+  if (unsupportedRole) {
+    throw new ConversionError(
+      'InvalidRole',
+      `Unsupported message role: ${String(unsupportedRole.role)}`,
+    );
+  }
+
   // 2.3. 历史去污染：剥掉 assistant 历史文本里泄漏的工具调用标记块，阻断
   // 模型模仿坏格式的自我污染循环（详见 stripLeakedToolCallsFromAssistantHistory）。
   if (options.toolTextRegistry) {
@@ -1802,7 +1876,7 @@ export function convertRequest(
   // This bridges continuation semantics; it cannot implement byte-exact prefill.
   let messages: ClaudeMessage[];
   if (foldedMessages[foldedMessages.length - 1].role !== 'user') {
-    const lastUserIdx = findLastIndex(foldedMessages, (m) => m.role === 'user');
+    const lastUserIdx = foldedMessages.findLastIndex((m) => m.role === 'user');
     if (lastUserIdx < 0) {
       throw new ConversionError('EmptyMessages', 'No user message found in messages list');
     }
@@ -1818,6 +1892,20 @@ export function convertRequest(
   // 2.7. tool_result 顺序规范化为 tool_use 顺序:tool_result 里的图片只能提升到
   // 消息级 images[],归属全靠位置(见 canonicalizeToolResultOrder 头注释)。
   messages = canonicalizeToolResultOrder(messages);
+
+  // 2.8. Compose the request-level system text (+ legacy thinking prefix +
+  // identity directive). Kiro has no system field and no working structured
+  // context slot, so it is joined onto the first user Kiro message at step 12
+  // (see foldSystemIntoFirstUserMessage). The first user message's own text is
+  // passed so the thinking prefix is not doubled when the client already
+  // carries the tags there.
+  const firstUser = messages.find((m) => m.role === 'user');
+  const systemPrefix = buildSystemPrefix(
+    req,
+    modelId,
+    identityOverride,
+    firstUser ? systemMessageText(firstUser.content) : '',
+  );
 
   // 3. Generate conversation ID and agent continuation ID
   // typeof 守卫:metadata 是宽松类型,客户端可能传非字符串 user_id;直接传给
@@ -1843,14 +1931,22 @@ export function convertRequest(
   // 4.5. tool_use id → 调用内容,给多图消息的图例用(prependImageLegend)
   const toolUseIndex = indexToolUses(messages);
 
-  // 5. Process last message as current_message
-  const lastMessage = messages[messages.length - 1];
+  // 4.6. Split the current turn off the history. The Anthropic API treats a run
+  // of consecutive same-role messages as one turn, so the trailing run of user
+  // messages *is* the current turn (merged into one currentMessage); everything
+  // before it is history and ends with an assistant message (step 2.5 guarantees
+  // the last message is a user, step 2.25 that only user/assistant remain).
+  const currentStart = messages.findLastIndex((m) => m.role === 'assistant') + 1;
+  const historyMessages = messages.slice(0, currentStart);
+  const currentMessages = messages.slice(currentStart);
+
+  // 5. Process the current turn
   const currentImageOrdinal = newImageOrdinal();
   const {
     text: textContent,
     images,
     toolResults,
-  } = processMessageContent(lastMessage.content, rejectUnsupportedDocuments, currentImageOrdinal);
+  } = processMessageRun(currentMessages, rejectUnsupportedDocuments, currentImageOrdinal);
 
   // 6. Convert tool definitions
   const toolNameMap = new Map<string, string>();
@@ -1858,11 +1954,9 @@ export function convertRequest(
 
   // 7. Build history (need to build first to collect history tool names)
   const history = buildHistory(
-    req,
-    messages,
+    historyMessages,
     modelId,
     toolNameMap,
-    identityOverride,
     rejectUnsupportedDocuments,
     toolUseIndex,
   );
@@ -1922,25 +2016,28 @@ export function convertRequest(
   };
 
   // 12. Build current message
-  // 身份 directive 只注入 system 层(buildHistory 落在 history 第一轮),不再追加到
-  // 当前用户消息末尾——current message 保持客户端原文,避免污染纯 tool_result。
-  const userInput: UserInputMessage = {
-    ...createUserInputMessage(
-      prependImageLegend(
-        quotedToolResults.reduce(appendToolResultEvidence, textContent),
-        currentImageOrdinal,
-        toolUseIndex,
-        toolNameMap,
-      ),
-      modelId,
+  // 网关注入的 system 前缀只落在**首条** user Kiro 消息:首轮它就是 currentMessage,之后
+  // 落在 history 的首条 user 上、current message 保持客户端原文,纯 tool_result 的轮次
+  // 不会被污染(见 foldSystemIntoFirstUserMessage)。
+  const currentContent = foldSystemIntoFirstUserMessage(
+    systemPrefix,
+    history,
+    prependImageLegend(
+      quotedToolResults.reduce(appendToolResultEvidence, textContent),
+      currentImageOrdinal,
+      toolUseIndex,
+      toolNameMap,
     ),
+  );
+  const userInput: UserInputMessage = {
+    ...createUserInputMessage(currentContent, modelId),
     userInputMessageContext: context,
     images,
     origin: bodyOrigin,
   };
 
   // 12b. 原生 reasoning 注入：仅对 4.7/4.8 等支持的 model 生效。
-  // 双通道映射在 mapThinkingToEffort 里。其它 model 走 buildHistory 里的
+  // 双通道映射在 mapThinkingToEffort 里。其它 model 走 buildSystemPrefix 的
   // prompt 注入路径，保持现有 fallback。
   if (usesNativeReasoning(modelId)) {
     const effort = mapThinkingToEffort(req.thinking, req.output_config);
@@ -1980,6 +2077,8 @@ export function convertRequest(
     tool_count: tools.length,
     history_message_count: history.length,
     system_prompt_length: req.system?.reduce((n, s) => n + s.text.length, 0) ?? 0,
+    system_prefix_length: systemPrefix?.length ?? 0,
+    current_turn_message_count: currentMessages.length,
     tool_name_mappings: toolNameMap.size,
     // 多图排障用:当前轮 / 历史里各上送了几张图(归属只靠顺序,见踩坑「多图归属只靠顺序」)
     current_image_count: images.length,
@@ -1993,12 +2092,4 @@ export function convertRequest(
     conversationState,
     toolNameMap,
   };
-}
-
-/** Array findLastIndex polyfill */
-function findLastIndex<T>(arr: T[], predicate: (item: T) => boolean): number {
-  for (let i = arr.length - 1; i >= 0; i--) {
-    if (predicate(arr[i])) return i;
-  }
-  return -1;
 }

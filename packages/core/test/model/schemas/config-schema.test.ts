@@ -390,7 +390,7 @@ describe('envToConfig', () => {
       KIRO2CLAUDE_PORT: '8888',
       KIRO2CLAUDE_REGION: 'eu-central-1',
       KIRO2CLAUDE_AUTH_REGION: 'us-east-1',
-      KIRO2CLAUDE_EXTRACT_THINKING: 'false',
+      KIRO2CLAUDE_EXTRACT_THINKING: 'true',
     }) as ParsedEnv;
 
     const config = envToConfig(parsed);
@@ -399,10 +399,11 @@ describe('envToConfig', () => {
     expect(config.port).toBe(8888);
     expect(config.region).toBe('eu-central-1');
     expect(config.authRegion).toBe('us-east-1');
-    expect(config.extractThinking).toBe(false);
-    // identityOverride 未在此 env 显式设置 → 默认 true;与 extractThinking=false 取交叉值,
-    // 「envToConfig 把 identityOverride 误映射成 KIRO2CLAUDE_EXTRACT_THINKING」会让此断言变红。
-    expect(config.identityOverride).toBe(true);
+    expect(config.extractThinking).toBe(true);
+    // identityOverride 未在此 env 显式设置 → 默认 false(实测生效率低,见 Config 注释);
+    // 与 extractThinking=true 取交叉值,「envToConfig 把 identityOverride 误映射成
+    // KIRO2CLAUDE_EXTRACT_THINKING」会让此断言变红。
+    expect(config.identityOverride).toBe(false);
     expect(config.countTokensAuthType).toBe('x-api-key');
     expect(config.loginLicense).toBe('pro');
     expect(config.loginTimeoutMs).toBe(600_000);
@@ -426,6 +427,19 @@ describe('envToConfig', () => {
     const config = envToConfig(parsed);
     expect(config.identityOverride).toBe(false);
     expect(config.extractThinking).toBe(true);
+  });
+
+  it('KIRO2CLAUDE_IDENTITY_OVERRIDE=true reaches Config.identityOverride (opt-in direction)', () => {
+    // 默认已翻成 false,上面的交叉检查只走 'false':若 envToConfig 硬编码 identityOverride: false
+    // 它仍然全绿。这里反向钉住:显式开启必须真的到达 Config。
+    const parsed = envSchema.parse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_IDENTITY_OVERRIDE: 'true',
+      KIRO2CLAUDE_EXTRACT_THINKING: 'false',
+    }) as ParsedEnv;
+    const config = envToConfig(parsed);
+    expect(config.identityOverride).toBe(true);
+    expect(config.extractThinking).toBe(false);
   });
 
   it('does not leak plugin-owned env keys into core schema', () => {

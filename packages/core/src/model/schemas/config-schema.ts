@@ -196,7 +196,7 @@ export const envSchema = z.object({
   // 写到该目录下的 JSONL,用于事后定位「确定性空流」的根因。留空(默认)= 不抓包。
   KIRO2CLAUDE_CAPTURE_EMPTY_DIR: optionalString(),
   KIRO2CLAUDE_EXTRACT_THINKING: boolField(true),
-  KIRO2CLAUDE_IDENTITY_OVERRIDE: boolField(true),
+  KIRO2CLAUDE_IDENTITY_OVERRIDE: boolField(false),
   KIRO2CLAUDE_REJECT_UNSUPPORTED_DOCUMENTS: boolField(true),
   // Tool `description` 最大长度(code points),超出则截断并 warn。**不是**单
   // description 的 Kiro 上限——单个 description 即便极大上游仍照收(200 OK);真限制

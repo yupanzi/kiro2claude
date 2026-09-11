@@ -85,9 +85,11 @@ export function buildClaudeTool(name: string, description: unknown, parameters: 
 /**
  * 把连续的「仅含 tool_result 块」user 消息合并成一条(镜像 Anthropic wire:并行
  * 工具结果打包进单条 user 消息)。OpenAI Chat 的 `tool` 消息、Responses 的
- * `function_call_output` item 都是**每结果一条**独立消息;不合并会让 convertRequest
- * 的 buildHistory 把靠前的结果当「trailing orphan user」、补一个模型从未产出的
- * 幻影 assistant('OK'),破坏并行工具调用(Codex 常见)的多轮语义。两端共用。
+ * `function_call_output` item 都是**每结果一条**独立消息。convertRequest 自己也把
+ * 连续 user 消息当同一轮合并(history 走 mergeUserMessages,末尾连串整体成
+ * currentMessage),所以这一步不再是多轮语义的前提;保留它是让交给 convertRequest
+ * 的 MessagesRequest 与真实 Anthropic 客户端同形——一个 user 轮就是一条消息——
+ * Messages 侧的观测(`current_turn_message_count`)与 fixture 都按这个形态写。两端共用。
  */
 export function coalesceToolResultMessages(messages: ClaudeMessage[]): ClaudeMessage[] {
   const isToolResultOnly = (m: ClaudeMessage): boolean =>
@@ -234,7 +236,16 @@ export function convertOpenAiRequest(req: ChatCompletionRequest): MessagesReques
       case 'system':
       case 'developer': {
         const text = extractTextContent(msg.content);
-        if (text) systemParts.push(text);
+        if (!text) break;
+        // Leading system/developer messages are the request-level system text.
+        // One that arrives after the conversation has started is an instruction
+        // inserted mid-thread ("from now on answer in French"): keep it where
+        // the client put it, as a `role:"system"` message that the Messages
+        // converter folds into the adjacent user turn (foldSystemMessages),
+        // instead of hoisting it to the top where it reads as an opening rule
+        // and its ordering relative to earlier turns is lost.
+        if (messages.length === 0) systemParts.push(text);
+        else messages.push({ role: 'system', content: text });
         break;
       }
       case 'user':

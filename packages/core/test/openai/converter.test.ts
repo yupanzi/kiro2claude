@@ -29,6 +29,26 @@ describe('convertOpenAiRequest: 角色与 content', () => {
     expect(r.messages[0].content).toBe('hi');
   });
 
+  it('mid-conversation system/developer stays in place as a role:system message', () => {
+    // 只有开头那段 system/developer 是请求级 system;对话开始后插入的是「从现在起…」
+    // 一类的中途指令,提到开头会丢掉它相对前面轮次的顺序(读起来像开场规则)。原位保留为
+    // role:'system',由 Messages 侧 foldSystemMessages 折进相邻 user 轮。
+    const r = convertOpenAiRequest(
+      base({
+        messages: [
+          { role: 'system', content: 'A' },
+          { role: 'user', content: 'Hello' },
+          { role: 'assistant', content: 'Hi there' },
+          { role: 'developer', content: 'From now on answer in French' },
+          { role: 'user', content: 'continue' },
+        ],
+      }),
+    );
+    expect(r.system).toEqual([{ text: 'A' }]);
+    expect(r.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'system', 'user']);
+    expect(r.messages[2].content).toBe('From now on answer in French');
+  });
+
   it('user parts: text + data: image → text/image 块;远程 url → 占位', () => {
     const r = convertOpenAiRequest(
       base({
@@ -204,7 +224,7 @@ describe('convertOpenAiRequest: 其它字段', () => {
   });
 });
 
-describe('convertOpenAiRequest: 并行工具结果合并(避免幻影 assistant OK)', () => {
+describe('convertOpenAiRequest: 并行工具结果合并(镜像 Anthropic 单条 user 打包并行结果)', () => {
   it('连续 tool 消息合并成单条 user(多 tool_result 块)', () => {
     const r = convertOpenAiRequest(
       base({

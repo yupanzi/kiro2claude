@@ -121,7 +121,8 @@ function toolOutputContent(output: string | ResponsesContentPart[]): string | Co
 }
 
 /**
- * 单个 input item → Claude Message(system/developer 返回 undefined,由上层收进 system[])。
+ * 单个 input item → Claude Message(开头的 system/developer 返回 undefined,由上层收进
+ * system[];对话开始后的 system/developer 原位保留为 role:"system" 消息)。
  * 未识别的 type 记进 `unknownTypes`,由调用方**每请求汇总成一行**——Responses 客户端
  * 每轮重放全部历史,逐条打日志会随会话长度平方级增长。
  */
@@ -129,6 +130,7 @@ function convertInputItem(
   item: ResponsesInputItem,
   systemParts: string[],
   unknownTypes: Set<string>,
+  leading: boolean,
 ): ClaudeMessage | undefined {
   // 工具投递项(code mode):工具已由 collectTools 取走,这里显式吞掉。它带
   // role:'developer',若被下面的 message 分支接住会把整个工具集当 system 文本灌进去。
@@ -139,8 +141,16 @@ function convertInputItem(
     const m = item as Extract<ResponsesInputItem, { role: string }>;
     if (m.role === 'system' || m.role === 'developer') {
       const t = partsText(m.content);
-      if (t) systemParts.push(t);
-      return undefined;
+      if (!t) return undefined;
+      // Leading system/developer items join `instructions` as request-level
+      // system text. One after the conversation has started is a mid-thread
+      // insertion and stays in place as a `role:"system"` message (folded into
+      // the adjacent user turn downstream), same as the Chat converter.
+      if (leading) {
+        systemParts.push(t);
+        return undefined;
+      }
+      return { role: 'system', content: t };
     }
     return {
       role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -512,7 +522,7 @@ export function convertResponsesRequest(req: ResponsesRequest): ResponsesConvers
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
-      const msg = convertInputItem(item, systemParts, unknownTypes);
+      const msg = convertInputItem(item, systemParts, unknownTypes, messages.length === 0);
       if (msg) messages.push(msg);
     }
   }
