@@ -135,6 +135,37 @@ describe('envSchema - KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN', () => {
   });
 });
 
+describe('envSchema - KIRO2CLAUDE_GPT_CONTEXT_WINDOW', () => {
+  it('defaults to 1000000 (upstream 1M since 2026-09-14) and maps to config.gptContextWindow', () => {
+    const result = envSchema.safeParse(MINIMAL_ENV);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.KIRO2CLAUDE_GPT_CONTEXT_WINDOW).toBe(1_000_000);
+      expect(envToConfig(result.data).gptContextWindow).toBe(1_000_000);
+    }
+  });
+
+  it('accepts the legacy 272000 for accounts not yet on the 1M rollout', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_GPT_CONTEXT_WINDOW: '272000',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(envToConfig(result.data).gptContextWindow).toBe(272_000);
+  });
+
+  it('rejects 0 — a zero multiplier would report every GPT request as 0 input tokens', () => {
+    const result = envSchema.safeParse({
+      ...MINIMAL_ENV,
+      KIRO2CLAUDE_GPT_CONTEXT_WINDOW: '0',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(formatEnvError(result.error)).toMatch(/KIRO2CLAUDE_GPT_CONTEXT_WINDOW out of range/);
+    }
+  });
+});
+
 describe('envSchema - KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS', () => {
   it('defaults to 100 and maps to config.upstreamMaxSockets', () => {
     const result = envSchema.safeParse(MINIMAL_ENV);

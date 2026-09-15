@@ -23,8 +23,8 @@ import { reduceKiroResponse } from './non-stream-reduce.js';
 import {
   buildClaudeUsagePayload,
   buildKiroUsageFinishEvent,
+  buildMeteringLogFields,
   canRetryZeroWorkRejection,
-  isMeteringLost,
   selectEmptyUpstreamMessage,
   upstreamErrorWire,
 } from './stream.js';
@@ -183,7 +183,7 @@ export async function handleNonStreamRequest(
         input_tokens: contextInputTokens ?? inputTokens,
         // 这条路径上 usage-finish hook 只在 `if (kiroMetering)` 里跑,所以「已开工
         // 但没拿到 Metering」的漏账**对 plugin 不可见**——日志是它唯一的出口。
-        metering_lost: isMeteringLost(kiroMetering, finalEventCounts),
+        ...buildMeteringLogFields(kiroMetering, finalEventCounts),
         event_counts: finalEventCounts,
         unknown_event_types: [...unknownEventTypes],
         total_duration_ms: Date.now() - apiStart,
@@ -308,10 +308,7 @@ export async function handleNonStreamRequest(
       output_tokens: outputTokens,
       tool_use_count: toolUses.length,
       thinking_detected: thinkingDetected,
-      // 与流式 transport 同源同名(判据见 isMeteringLost)。非流式没有 drain grace,
-      // 但上游照样可能只发内容帧、不发尾帧 Metering;缺了这行,按此字段统计的漏账
-      // 规模就只覆盖流式那一半。
-      metering_lost: isMeteringLost(kiroMetering, finalEventCounts),
+      ...buildMeteringLogFields(kiroMetering, finalEventCounts),
       // 前向兼容观测:上游若发来未识别 event-type,在此显形(当前为良性 metadata)。
       unknown_event_types: [...unknownEventTypes],
       total_duration_ms: Date.now() - apiStart,

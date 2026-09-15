@@ -15,8 +15,8 @@ import type { FastifyReply } from 'fastify';
 import type { MessageHandlerResult } from '../claude/empty-capture.js';
 import {
   awaitDrain,
+  buildMeteringLogFields,
   canRetryZeroWorkRejection,
-  isMeteringLost,
   type SseEvent,
   StreamContext,
   safeEnd,
@@ -329,14 +329,10 @@ export async function runOpenAiStream<E extends StreamEncoder>(
     output_tokens: ctx.outputTokens,
     input_tokens: ctx.contextInputTokens ?? ctx.inputTokens,
     stop_reason: ctx.stateManager.getStopReason(),
+    ...buildMeteringLogFields(ctx.kiroMeteringRaw, ctx.getEventCounts()),
     committed,
     aborted: aborted.value,
     disconnect_source: disconnectSource,
-    // 与 claude/stream-handler.ts 同源同名(判据见 isMeteringLost)。这里的 drain
-    // grace 是那边的结构复制,同一个「宽限窗到期 → 丢尾帧 Metering → 上游已扣费但
-    // 记不了账」的漏账在 openai 端一模一样地发生;只在 claude 侧打标会让按此字段
-    // 统计出的漏账规模系统性偏低,漏掉的正是全部 Codex/GPT 流量。
-    metering_lost: isMeteringLost(ctx.kiroMeteringRaw, ctx.getEventCounts()),
     empty_attempts: emptyAttempts,
     total_duration_ms: Date.now() - apiStart,
     stream_duration_ms: Date.now() - streamStart,

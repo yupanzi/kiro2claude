@@ -26,6 +26,15 @@
 import { z } from 'zod';
 import type { Config } from '../config.js';
 
+/**
+ * GPT-5.6 系列 context window 的默认值(上游 2026-09-14 起 1M)。
+ *
+ * ★ 单一真相源:`KIRO2CLAUDE_GPT_CONTEXT_WINDOW` 的 schema 默认值、`converter.ts` 的
+ * 模块单例初值、`index.ts` 判断「是否被覆盖」的基准,三者必须是同一个数。此前 schema
+ * 与 converter 各写一份字面量,只改其一就会让启动告警要么恒响、要么永久静默。
+ */
+export const DEFAULT_GPT_CONTEXT_WINDOW = 1_000_000;
+
 // ============================================================================
 // Field-level parsers
 // ============================================================================
@@ -207,6 +216,15 @@ export const envSchema = z.object({
     min: 1,
     max: 1_000_000,
   }),
+  // GPT-5.6 系列(sol/terra/luna)的 context window,单位 token。网关用它把上游
+  // contextUsagePercentage 反推成 usage.input_tokens,写错了 token 数整体缩放、后果直通
+  // 计费。Kiro 逐账号渐进放开 1M,还停在 272K 的账号设回 272000。
+  // 详见 Config.gptContextWindow 与踩坑「GPT context window 随上游漂移」。
+  KIRO2CLAUDE_GPT_CONTEXT_WINDOW: intField(
+    'KIRO2CLAUDE_GPT_CONTEXT_WINDOW',
+    DEFAULT_GPT_CONTEXT_WINDOW,
+    { min: 1, max: 10_000_000 },
+  ),
   // 客户端断连时是否主动 abort 上游请求(而非 drain 到 EOF 如实计费)。默认 false。
   // 实测:Kiro 对客户端 TCP 断会停止生成计费,但网关默认 drain 到 EOF、维持上游
   // 连接,导致断连仍全额计费(断连常发生在生成中途,drain 会把断连点之后未生成的
@@ -269,6 +287,7 @@ export function envToConfig(env: ParsedEnv): Config {
     identityOverride: env.KIRO2CLAUDE_IDENTITY_OVERRIDE,
     rejectUnsupportedDocuments: env.KIRO2CLAUDE_REJECT_UNSUPPORTED_DOCUMENTS,
     toolDescriptionMaxLen: env.KIRO2CLAUDE_TOOL_DESCRIPTION_MAX_LEN,
+    gptContextWindow: env.KIRO2CLAUDE_GPT_CONTEXT_WINDOW,
     abortUpstreamOnDisconnect: env.KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT,
     upstreamMaxSockets: env.KIRO2CLAUDE_UPSTREAM_MAX_SOCKETS,
     toolCallTextRescue: env.KIRO2CLAUDE_TOOL_CALL_TEXT_RESCUE,

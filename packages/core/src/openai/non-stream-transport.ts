@@ -16,8 +16,8 @@ import {
 } from '../claude/non-stream-reduce.js';
 import {
   buildKiroUsageFinishEvent,
+  buildMeteringLogFields,
   canRetryZeroWorkRejection,
-  isMeteringLost,
   type PluginUsageExtensions,
   resolvePluginUsageExtensions,
   selectEmptyUpstreamMessage,
@@ -136,7 +136,7 @@ export async function runOpenAiNonStream(
         msg: 'openai non-stream: mid-stream error frame, surfacing error',
         downstream_status: status,
         // hook 只在 `if (kiroMetering)` 里跑 → 漏账对 plugin 不可见,日志是唯一出口。
-        metering_lost: isMeteringLost(reduced.kiroMetering, eventCounts),
+        ...buildMeteringLogFields(reduced.kiroMetering, eventCounts),
         total_duration_ms: Date.now() - apiStart,
       });
       reply.status(status).send(createOpenAiError(message, errorType));
@@ -187,9 +187,7 @@ export async function runOpenAiNonStream(
       input_tokens: finalInputTokens,
       output_tokens: outputTokens,
       tool_use_count: reduced.toolUses.length,
-      // 与其余三个 transport 同源同名(判据见 isMeteringLost)——四条终态路径齐了,
-      // 按此字段统计的漏账规模才是全量而非某个协议的切片。
-      metering_lost: isMeteringLost(reduced.kiroMetering, eventCounts),
+      ...buildMeteringLogFields(reduced.kiroMetering, eventCounts),
       total_duration_ms: Date.now() - apiStart,
     });
 

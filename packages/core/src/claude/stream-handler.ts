@@ -55,9 +55,9 @@ import type { MessageHandlerResult } from './empty-capture.js';
 import { mapProviderError } from './error-mapper.js';
 import {
   awaitDrain,
+  buildMeteringLogFields,
   canRetryZeroWorkRejection,
   createSseErrorEvent,
-  isMeteringLost,
   type SseEvent,
   StreamContext,
   safeEnd,
@@ -517,13 +517,11 @@ export async function handleStreamRequest(
     input_tokens: ctx.contextInputTokens ?? ctx.inputTokens,
     stop_reason: ctx.stateManager.getStopReason(),
     thinking_detected: ctx.thinkingExtracted,
-    kiro_metering: ctx.kiroMeteringRaw,
-    // 上游已扣费、这边记不了账。判据与两条口径偏差(abort flag 下多报、判空路径下
-    // 漏报)都在 isMeteringLost 头注释,plugin 侧的 `kiro.meteringMissing` 同源于它。
-    // 这里只记本文件独有的一点:与紧邻的 drained_after_disconnect **口径不同**——
-    // 后者是「付了钱但客户端不要了」,本字段是「付了钱且账目丢了」,两者对
+    // kiro_metering + metering_lost,构造见 buildMeteringLogFields。这里只记本文件
+    // 独有的一点:`metering_lost` 与紧邻的 drained_after_disconnect **口径不同**——
+    // 后者是「付了钱但客户端不要了」,前者是「付了钱且账目丢了」,两者对
     // abortUpstreamOnDisconnect 的反应恰好相反,排查与治理路径也不一样。
-    metering_lost: isMeteringLost(ctx.kiroMeteringRaw, finalEventCounts),
+    ...buildMeteringLogFields(ctx.kiroMeteringRaw, finalEventCounts),
     committed,
     aborted: aborted.value,
     // 'client_close' = 客户端真的走了;'write_failed' = 写 socket 失败(存活判定见

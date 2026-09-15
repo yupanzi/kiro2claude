@@ -80,6 +80,16 @@ Kiro wire 只有消息级 `images[]`——`toolResults[].content` 塞 Bedrock �
 
 请求体逐字段相同,唯一差异 `modelId`——支持 GPT = `mapModel` 加分支即两端可用,无需新上游适配。响应侧唯一真差异:GPT reasoning 走**同名** `reasoningContentEvent`,payload `{redactedContent}`(加密、无 text/signature)。**「见过原生帧」与「原生帧有内容可 surface」是两件事,`processReasoningContent` 必须分开记**:前者(含空/redacted 帧)决定锁 native 模式、关掉 legacy decoder,后者才决定开 thinking content block。合并是二选一的错——只留后者则 redacted 帧不锁模式,GPT 可见输出里的字面 `<thinking>` 会被 legacy 解码剥走;只留前者则开一个永远空的 thinking 块。`metadataEvent{stopReason}` 故意落 `Unknown` 由网关推断(工具调用时 `tool_use` 比上游 `END_TURN` 准)。
 
+### GPT context window 随上游漂移
+
+`usage.input_tokens` 不是上游直接给的,是网关拿 `contextUsageEvent.contextUsagePercentage` 乘 `getContextWindowSize()` 反推的。**上游改窗口不报错、只缩放**:Kiro 2026-09-14 把 GPT-5.6 升到 1M(`kiro-cli chat --list-models` 写 "1M context window"),网关仍按 272K 算就整体低报 3.68 倍。
+
+后果直通计费:Kiro 对 >272K 的请求**整条**按双倍档计(sol 4.4x→8.8x)。实测 gpt-5.6-luna 单请求 250,338 token 记 18.25 credit/M、301,919 token 记 36.50,恰好 2.0 倍。低报时客户端以为还有余量,真实上下文养到 ~95 万,整段会话每条都落双倍档,单请求可达正常档的数十倍。同请求重发 credit 逐字节不变,GPT 无缓存折扣,没有别的缓解。
+
+**为什么 1M 是对的**:Codex 不读网关上报的窗口,只拿 `input_tokens` 比自己内置的常量——Codex 0.154 对 gpt-5.6-sol 内置 272000 再乘 0.95 保留系数 = 258,400(session rollout 的 `model_context_window` 可查)。上报准确时它在真实 258.4K 就压缩,**恰停在双倍线下方,余量 13,600**;低报 3.68 倍时同一个 258.4K 对应真实 950,912,于是整段双倍。★ 这个余量依赖客户端那个常量不变:**客户端若跟进抬到 1M,余量立刻消失**,届时须在客户端侧 pin `model_context_window`。
+
+Kiro 逐账号灰度,还停在 272K 的账号把 `KIRO2CLAUDE_GPT_CONTEXT_WINDOW` 设回 272000(反过来高报会让客户端在 7 万就压缩)。判断口径:拿一段已知长度文本发 gpt-5.6-luna(最便宜),`input_tokens` 与 `count_tokens` 差 ~3.7 倍即窗口不匹配。守卫 `test/claude/reasoning-native.test.ts`;`exceeded`(`model_context_window_exceeded`)只看百分比是否到 100,与此常量无关。
+
 ### OpenAI prompt_tokens
 
 `buildClaudeUsagePayload` 会应用 derived 插件的 `input_tokens` 覆写(缓存拆分语义),而 OpenAI `prompt_tokens` 是**输入总量(含缓存)**。故 `openai/` usage 必须直接读 reducer 原始 `contextInputTokens ?? inputTokens` 与 `outputTokens`、绕过 `buildClaudeUsagePayload`;计费 hook 仍跑,只出标准三字段、不含 `kiro_*` 扩展。

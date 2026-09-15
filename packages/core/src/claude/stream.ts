@@ -292,9 +292,10 @@ export function computeHasContent(p: ContentPresence): boolean {
  * multiplier),编一个数字会把「accumulated vs limit」这条真账混成假账——宁可显式
  * 承认这笔不可知,也不要一个看起来合理的错数。
  *
- * 这是该信号的唯一定义点:plugin 侧读 `kiro.meteringMissing` meta,运维侧读四条
- * 终态路径(claude/openai × 流式/非流式)日志里的 `metering_lost` 字段,两者必须
- * 同源(一个指标只有一个 owner)。
+ * 这是该信号的唯一定义点:plugin 侧读 `kiro.meteringMissing` meta,运维侧读六个终态
+ * 日志点(claude/openai × 流式/非流式,外加两条非流式 mid-stream error 分支)里的
+ * `metering_lost` 字段,两者必须同源(一个指标只有一个 owner)。日志侧六处一律经
+ * `buildMeteringLogFields` 展开,别手写。
  *
  * ★ 用它估算漏账规模前必须知道的两条口径偏差:
  * 1. **多报**:`KIRO2CLAUDE_ABORT_UPSTREAM_ON_DISCONNECT=true` 时每次客户端断连都
@@ -311,6 +312,26 @@ export function isMeteringLost(
   eventCounts: Record<string, number>,
 ): boolean {
   return kiroMetering === undefined && sawBillableWork(eventCounts);
+}
+
+/**
+ * 终态日志那对 metering 字段的唯一构造点。★ 不变式:两者**必须成对、且读同一份
+ * eventCounts 快照**——只有 `metering_lost` 查不到丢的是哪一笔,只有 `kiro_metering`
+ * 则漏账样本 grep 不出来。这条契约只能靠构造维持,散文维持不住(此前六处手写,补字段
+ * 时漏掉了两条 error 分支)。
+ *
+ * 调用点清单与判据见 `isMeteringLost` 头注释。**这不是「终态日志」的通用结构**:六个
+ * 点的数据源是三种形状(StreamContext / reduced / 局部变量),别据此扩成大而全的
+ * `buildTerminalLogFields`,那只会逼每个调用点写适配。
+ */
+export function buildMeteringLogFields(
+  kiroMetering: KiroMeteringData | undefined,
+  eventCounts: Record<string, number>,
+) {
+  return {
+    kiro_metering: kiroMetering,
+    metering_lost: isMeteringLost(kiroMetering, eventCounts),
+  };
 }
 
 /** A classified mid-stream upstream error awaiting downstream surfacing. */

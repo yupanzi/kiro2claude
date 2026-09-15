@@ -58,6 +58,14 @@ export interface Config {
    */
   toolDescriptionMaxLen: number;
   /**
+   * GPT-5.6 系列(sol/terra/luna)的 context window(token)。默认 1000000。
+   * 网关把上游 contextUsagePercentage 乘以它反推 `usage.input_tokens`,故必须与上游当前
+   * 给该账号的窗口一致;1M 是逐账号渐进放开的,未拿到的账号设回 272000。设错的后果与
+   * 判断口径见踩坑「GPT context window 随上游漂移」。
+   * 由 `KIRO2CLAUDE_GPT_CONTEXT_WINDOW` 配置,启动期经 `initGptContextWindow` 生效一次。
+   */
+  gptContextWindow: number;
+  /**
    * 客户端断连时是否主动 abort 上游请求(而非 drain 到 EOF 如实计费)。默认 false。
    * 实测 Kiro 对客户端 TCP 断会停止生成计费;网关默认 drain 到 EOF 使断连仍全额
    * 计费。开启省 credit,代价是拿不到尾帧 Metering、per-request 计费记账偏低。

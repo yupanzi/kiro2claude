@@ -28,6 +28,7 @@ import {
   toolResultError,
   toolResultSuccess,
 } from '../kiro/model/requests/tool.js';
+import { DEFAULT_GPT_CONTEXT_WINDOW } from '../model/schemas/config-schema.js';
 import { getLogger } from '../shared/logger.js';
 import { mapToolName } from './converter/tool-name-map.js';
 import { ToolCallTextStripper, type ToolTextRegistry } from './tool-call-text.js';
@@ -265,7 +266,11 @@ export function clientModelHasEncryptedReasoning(clientModel: string): boolean {
  * Opus 4.7 and 4.8 also ship with the 1M window (上游 list-models 实测确认).
  * Opus 5 同为 1M context (上游 `--list-models` 实测: context_window_tokens 1000000).
  * Sonnet 5 同为 1M context (Anthropic 官方规格,与前代 Sonnet 4.6 一致).
- * GPT-5.6 系列为 272K context (上游 `--list-models` 实测: context_window_tokens 272000).
+ * GPT-5.6 系列 2026-09-14 起为 1M context(上游 `--list-models` 实测: "1M context
+ * window";此前为 272K),逐账号灰度,故可由 `KIRO2CLAUDE_GPT_CONTEXT_WINDOW` 覆盖。
+ *
+ * ★ 返回值是 `resolveContextUsage` 反推 input_tokens 的**乘数**——上游改窗口不报错、
+ * 只缩放,后果直通计费。数据与判断口径见踩坑「GPT context window 随上游漂移」。
  */
 export function getContextWindowSize(model: string): number {
   const mapped = mapModel(model);
@@ -280,9 +285,16 @@ export function getContextWindowSize(model: string): number {
     return 1_000_000;
   }
   if (mapped === 'gpt-5.6-sol' || mapped === 'gpt-5.6-terra' || mapped === 'gpt-5.6-luna') {
-    return 272_000;
+    return _gptContextWindow;
   }
   return 200_000;
+}
+
+let _gptContextWindow = DEFAULT_GPT_CONTEXT_WINDOW;
+
+/** 初始化 GPT-5.6 context window(启动时调用一次);入参已由 zod 保证是正整数。 */
+export function initGptContextWindow(windowSize: number): void {
+  _gptContextWindow = windowSize;
 }
 
 /**

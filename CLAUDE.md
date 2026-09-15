@@ -68,7 +68,7 @@ openai/                 OpenAI 兼容层(import claude/kiro/shared,不被反向�
 | `KIRO2CLAUDE_*` 环境变量 | `model/schemas/config-schema.ts` + `.env.example` |
 | Plugin 契约 / 怎么写 plugin | `packages/plugin-api/src/types.ts`;`docs/PLUGIN-DEVELOPMENT.md` + `packages/examples/echo-plugin/` |
 | 支持哪些模型 / 加模型要同改哪几处 | `claude/models-catalog.ts` + `mapModel()`;同改清单见 PITFALLS「支持哪些模型」 |
-| 原生 reasoning / context window / effort 映射 | `MODELS_WITH_NATIVE_REASONING`、`getContextWindowSize()`、`mapThinkingToEffort()`(`converter.ts`);OpenAI `reasoning_effort` 见 `openai/converter.ts` |
+| 原生 reasoning / context window / effort 映射 | `MODELS_WITH_NATIVE_REASONING`、`getContextWindowSize()`(GPT 窗口可由 `KIRO2CLAUDE_GPT_CONTEXT_WINDOW` 覆盖)、`mapThinkingToEffort()`(`converter.ts`);OpenAI `reasoning_effort` 见 `openai/converter.ts` |
 | legacy `<thinking>` 怎么解析 | `claude/stream/legacy-thinking-decoder.ts` 头注释;流式 `processLegacyThinkingItems` 与非流式 `non-stream-reduce.ts` 必须同源 |
 | Codex 的工具怎么进来 / freeform 双向 | `openai/responses/converter.ts` `collectTools` + `expandNamespaces`;`openai/freeform-tool.ts`;下行经 `customToolNames` 还原 |
 | OpenAI usage / Responses reasoning | `openai/` 直读 reducer 原始 token(踩坑「OpenAI prompt_tokens」);Claude thinking → `reasoning` item,GPT 加密 reasoning 不产 |
@@ -178,6 +178,7 @@ openai/                 OpenAI 兼容层(import claude/kiro/shared,不被反向�
 ### 多模型 · GPT · OpenAI · Codex
 
 - **GPT 完全相同上游**:唯一差异 `modelId`;`processReasoningContent` 把「见过原生帧」与「有内容可 surface」分开记,合并即错
+- ★ **GPT context window 随上游漂移**:`input_tokens` = 上游百分比 × `getContextWindowSize()`,上游改窗口只缩放不报错;2026-09-14 起 GPT-5.6 为 1M,按 272K 算低报 3.68 倍 → Codex 把上下文养过 Kiro 的 272K 双倍计费线。默认 1M,未拿到 1M 的账号用 `KIRO2CLAUDE_GPT_CONTEXT_WINDOW=272000`;守卫 `test/claude/reasoning-native.test.ts`
 - **OpenAI prompt_tokens**:是输入总量,`openai/` usage 直接读 reducer 原始 token、绕过 `buildClaudeUsagePayload`
 - **Codex 只说 Responses**:编码器红线在 `openai/responses/response-stream.ts` 头注释,改前先跑真实 Codex(`tools/codex/`)
 - ★ **Codex code mode**:工具在 `input[0]` 的 `additional_tools`,判别只看字段在不在;`functions` / `collaboration` namespace 展开与 `namespace` 写回见 `expandNamespaces` 头注释;`agent_message` 三类必转(`convertAgentMessage`);freeform 流式须缓冲到 block 结束。守卫 `test/openai/responses/subagent-wire.test.ts` + `test/static/freeform-tool-contract.test.ts`

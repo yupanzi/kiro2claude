@@ -17,9 +17,11 @@ import {
   clientModelHasEncryptedReasoning,
   convertRequest,
   getContextWindowSize,
+  initGptContextWindow,
   MODELS_WITH_NATIVE_REASONING,
   mapModel,
   mapThinkingToEffort,
+  resolveContextUsage,
   usesNativeReasoning,
 } from '../../src/claude/converter.js';
 import { type SseEvent, StreamContext } from '../../src/claude/stream.js';
@@ -27,6 +29,7 @@ import { buildToolTextRegistry } from '../../src/claude/tool-call-text.js';
 import type { MessagesRequest, Tool } from '../../src/claude/types.js';
 import { eventFromFrame } from '../../src/kiro/model/events/base.js';
 import { parseFrame } from '../../src/kiro/parser/frame.js';
+import { DEFAULT_GPT_CONTEXT_WINDOW } from '../../src/model/schemas/config-schema.js';
 import { HookBus } from '../../src/plugin-host/index.js';
 import {
   buildAssistantResponseFrame,
@@ -269,10 +272,24 @@ describe('usesNativeReasoning: 模型能力探测', () => {
     );
   });
 
-  it('GPT-5.6 走原生 reasoning + 272K context', () => {
+  it('GPT-5.6 走原生 reasoning + 1M context(上游 2026-09-14 起)', () => {
     for (const m of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
       expect(usesNativeReasoning(m)).toBe(true);
-      expect(getContextWindowSize(m)).toBe(272_000);
+      expect(getContextWindowSize(m)).toBe(1_000_000);
+    }
+  });
+
+  it('GPT-5.6 窗口可运行时覆盖(未拿到 1M 的账号设回 272K),只影响 GPT', () => {
+    try {
+      initGptContextWindow(272_000);
+      expect(getContextWindowSize('gpt-5.6-sol')).toBe(272_000);
+      expect(getContextWindowSize('claude-opus-5')).toBe(1_000_000);
+      // 百分比 → token 的乘数必须跟着变:同一个 3.1548% 在 272K 与 1M 下相差 3.68 倍
+      expect(resolveContextUsage('gpt-5.6-sol', 3.1548).inputTokens).toBe(8581);
+      initGptContextWindow(DEFAULT_GPT_CONTEXT_WINDOW);
+      expect(resolveContextUsage('gpt-5.6-sol', 3.1548).inputTokens).toBe(31_548);
+    } finally {
+      initGptContextWindow(DEFAULT_GPT_CONTEXT_WINDOW);
     }
   });
 });

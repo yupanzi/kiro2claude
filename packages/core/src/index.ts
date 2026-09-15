@@ -16,7 +16,7 @@ import {
   type UsageLimitsProvider,
 } from '@kiro2claude/plugin-api';
 import Fastify from 'fastify';
-
+import { initGptContextWindow } from './claude/converter.js';
 import { runStartupAutoCapture } from './kiro/auto-capture.js';
 import { runBootstrapLogin } from './kiro/bootstrap-login.js';
 import { verifyInstalledKiroCliVersion } from './kiro/cli-version.js';
@@ -24,6 +24,7 @@ import { loadCredentialsFromEnv } from './kiro/credentials-loader.js';
 import { KiroProvider } from './kiro/provider.js';
 import { SingleTokenManager } from './kiro/token-manager.js';
 import { loadConfigFromEnv } from './model/config.js';
+import { DEFAULT_GPT_CONTEXT_WINDOW } from './model/schemas/config-schema.js';
 import { CapabilityRegistry, discoverPlugins, HookBus } from './plugin-host/index.js';
 import { registerClaudeRoutes } from './routes/claude.js';
 import { registerHealthRoutes } from './routes/health.js';
@@ -73,6 +74,15 @@ async function main(): Promise<void> {
   } catch (e) {
     logger.error(`加载配置失败: ${(e as Error).message}`);
     process.exit(1);
+  }
+  // GPT-5.6 context window 是 contextUsagePercentage → input_tokens 的乘数,放在最早
+  // 可能点(config 刚就绪)落定,后面每一步都不必再关心它。
+  // 只在偏离默认时出声:默认值下每次启动打一行零信息量,值得报警的是某台机器被覆盖。
+  initGptContextWindow(config.gptContextWindow);
+  if (config.gptContextWindow !== DEFAULT_GPT_CONTEXT_WINDOW) {
+    logger.warn(
+      `GPT-5.6 context window 覆盖为 ${config.gptContextWindow}(默认 ${DEFAULT_GPT_CONTEXT_WINDOW})`,
+    );
   }
 
   // 1.5. 首次启动 bootstrap：SQLite DB 不存在且设置了 KIRO2CLAUDE_LOGIN_START_URL 时，
