@@ -1,3 +1,10 @@
+## [1.6.4](https://github.com/yupanzi/kiro2claude/compare/v1.6.3...v1.6.4) (2026-09-15)
+
+
+### Bug Fixes
+
+* **core:** GPT context window 按上游 1M 计,不再把 token 数低报 3.68 倍 ([3b6c0c1](https://github.com/yupanzi/kiro2claude/commit/3b6c0c1137e8f800d2a8b3a203912274fa97faeb))
+
 ## [1.6.3](https://github.com/yupanzi/kiro2claude/compare/v1.6.2...v1.6.3) (2026-09-11)
 
 
