@@ -203,10 +203,12 @@ function convertInputItem(
     };
   }
 
-  // Only the explicit plaintext summary has a replayable representation. Keep
-  // it as assistant thinking, not a user instruction or a completed action.
-  // Opaque encrypted_content has no Kiro input channel and is never decoded or
-  // substituted for missing plaintext. Summary-less items therefore stay absent.
+  // The plaintext summary is kept as an (unsigned) assistant thinking block so
+  // the Claude-side shape stays faithful; the Kiro converter only replays
+  // *signed* thinking natively (`reasoningContent`) and never stitches thinking
+  // into text, so this block does not reach the wire. Opaque encrypted_content
+  // has no Kiro input channel and is never decoded or substituted for missing
+  // plaintext. Summary-less items therefore stay absent.
   if (item.type === 'reasoning') {
     const summary: string[] = [];
     if (Array.isArray(item.summary)) {

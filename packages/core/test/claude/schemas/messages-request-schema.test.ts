@@ -131,43 +131,34 @@ describe('messagesRequestSchema - system normalization', () => {
   });
 });
 
-describe('messagesRequestSchema - thinking clamp', () => {
-  it('clamps budget_tokens above 24576 to 24576', () => {
-    const result = messagesRequestSchema.safeParse({
+describe('messagesRequestSchema - thinking normalization (adaptive only)', () => {
+  const parse = (thinking: unknown) =>
+    messagesRequestSchema.safeParse({
       model: 'claude-opus-4-6',
       max_tokens: 1024,
       messages: [VALID_MESSAGE],
-      thinking: { type: 'enabled', budget_tokens: 100000 },
+      thinking,
     });
+
+  it('enabled → adaptive, budget_tokens dropped: only type (+ display) survive', () => {
+    const result = parse({ type: 'enabled', budget_tokens: 100000 });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.thinking).toEqual({ type: 'adaptive' });
+  });
+
+  it('keeps adaptive + display as-is', () => {
+    const result = parse({ type: 'adaptive', display: 'omitted', budget_tokens: 5 });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.thinking?.budget_tokens).toBe(24576);
+      expect(result.data.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
     }
   });
 
-  it('preserves budget_tokens under the cap', () => {
-    const result = messagesRequestSchema.safeParse({
-      model: 'claude-opus-4-6',
-      max_tokens: 1024,
-      messages: [VALID_MESSAGE],
-      thinking: { type: 'enabled', budget_tokens: 10000 },
-    });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.thinking?.budget_tokens).toBe(10000);
-    }
-  });
-
-  it('defaults missing budget_tokens to 20000', () => {
-    const result = messagesRequestSchema.safeParse({
-      model: 'claude-opus-4-6',
-      max_tokens: 1024,
-      messages: [VALID_MESSAGE],
-      thinking: { type: 'enabled' },
-    });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.thinking?.budget_tokens).toBe(20000);
+  it('unknown thinking.type / non-object → treated as no thinking', () => {
+    for (const raw of [{ type: 'mega' }, 'enabled', 42, null]) {
+      const result = parse(raw);
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.thinking).toBeUndefined();
     }
   });
 });

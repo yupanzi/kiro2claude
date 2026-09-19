@@ -3,62 +3,34 @@
  *
  * Holds the "thinking override from model name" rule, which the zod schema
  * can't express because it depends on `payload.thinking` being mutable after
- * parse.
+ * parse. Only adaptive thinking exists (budget_tokens unsupported).
  */
 
 import { getLogger } from '../shared/logger.js';
 import type { MessagesRequest } from './types.js';
 
 /**
- * Check model name for a "thinking" suffix and override the thinking config.
+ * Check model name for a "thinking" suffix and turn thinking on.
  *
- * - Opus 4.6 / 4.7 / 4.8 / 5: adaptive type
- * - Other models: enabled type
- * - budget_tokens fixed at 20000 (schema later clamps to 24576 ceiling)
+ * 只有 adaptive 一种语义(`budget_tokens` 不支持):`-thinking` 后缀 =
+ * `thinking:{type:"adaptive"}`,effort 取客户端已给的 `output_config.effort`,没给则 high。
+ * 只对原生 reasoning 模型有效(落到顶层 `additionalModelRequestFields`);非原生模型不做
+ * thinking 控制,后缀对它们是空操作。这里不区分模型,路由在 converter 的 `usesNativeReasoning`。
  *
- * Mutates `payload.thinking` and, for adaptive-capable Opus, `payload.output_config`.
- * This side-effect-on-input is intentional: the downstream converter reads
- * these fields without knowing about the model-name convention.
+ * Mutates `payload.thinking` / `payload.output_config`. This side-effect-on-input is
+ * intentional: the downstream converter reads these fields without knowing about
+ * the model-name convention.
  */
 export function overrideThinkingFromModelName(payload: MessagesRequest): void {
   const modelLower = payload.model.toLowerCase();
   if (!modelLower.includes('thinking')) return;
 
-  // 注意:这是"thinking 类型是否为 adaptive"的判定,与 converter.ts 的
-  // MODELS_WITH_NATIVE_REASONING("是否走原生 reasoning.effort wire 字段")是
-  // 两个不同的事实 —— 4.6 在此为 adaptive,但 *不* 在 native 集合里,故走
-  // <thinking_mode> prompt 注入路径(generateThinkingPrefix 读 output_config.effort)。
-  // 两份版本清单必须随新增 Opus 版本一起更新,否则 thinking 路由会与 effort 处理脱节。
-  const isAdaptiveOpus =
-    modelLower.includes('opus') &&
-    (modelLower.includes('opus-5') ||
-      modelLower.includes('4-6') ||
-      modelLower.includes('4.6') ||
-      modelLower.includes('4-7') ||
-      modelLower.includes('4.7') ||
-      modelLower.includes('4-8') ||
-      modelLower.includes('4.8'));
-
-  // GPT-5.6 系列走原生 reasoning.effort(在 MODELS_WITH_NATIVE_REASONING 内),
-  // adaptive 通道让 `gpt-5.6-sol-thinking` 别名的 effort 经 output_config 传递,
-  // 与 opus-4.7/4.8 一致。(OpenAI 端点直接用 reasoning_effort,不走这条。)
-  const isAdaptiveGpt = modelLower.includes('gpt');
-
-  const isAdaptive = isAdaptiveOpus || isAdaptiveGpt;
-  const thinkingType = isAdaptive ? 'adaptive' : 'enabled';
-
   getLogger().info({
     msg: 'thinking override from model name',
     model: payload.model,
-    thinking_type: thinkingType,
+    thinking_type: 'adaptive',
   });
 
-  payload.thinking = {
-    type: thinkingType,
-    budget_tokens: 20000,
-  };
-
-  if (isAdaptive) {
-    payload.output_config = { effort: 'high' };
-  }
+  payload.thinking = { type: 'adaptive' };
+  payload.output_config ??= { effort: 'high' };
 }

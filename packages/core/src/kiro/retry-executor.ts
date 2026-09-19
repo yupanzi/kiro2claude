@@ -8,18 +8,26 @@
  * HTTP-standard signals we faithfully forward (429 status, Retry-After
  * header, 503 Service Unavailable, etc.).
  *
- * ## The one retry the gateway DOES perform
+ * ## The two retries the gateway DOES perform
  *
- * Bearer token recovery. When upstream returns 401 with a body containing
- * "The bearer token included in the request is invalid", the gateway calls
- * `tokenManager.forceRefreshToken()` and retries the request exactly once.
- * This is the gateway's essential responsibility — the downstream client
- * does not have the refresh token and cannot do this itself.
+ * 1. Bearer token recovery. When upstream returns 401 with a body containing
+ *    "The bearer token included in the request is invalid", the gateway calls
+ *    `tokenManager.forceRefreshToken()` and retries the request exactly once.
+ *    This is the gateway's essential responsibility — the downstream client
+ *    does not have the refresh token and cannot do this itself.
+ * 2. Thinking-signature recovery. When upstream returns 400 with reason
+ *    `THINKING_SIGNATURE_INVALID` (a history `reasoningContent` signature is
+ *    missing / corrupted / minted by another model), the gateway strips every
+ *    `reasoningContent` from the body (`stripReasoningContent`) and retries
+ *    exactly once, as kiro-cli's KAS engine does. The client cannot know which
+ *    signature upstream accepts; the 400 arrives before any stream, so this is
+ *    always pre-commit. Bodies with no reasoningContent are not retried.
  *
  * All other error paths are single-attempt:
  *
  * - 2xx → return the response
  * - 400 → classify body, throw `bad_request` / `context_window_full` / `input_too_long`
+ *         / `thinking_signature_invalid` (after the one strip-retry above)
  * - 401/403 → optional one-shot force-refresh (above), then throw `unauthorized`
  * - 402 + MONTHLY → throw `quota_exhausted`
  * - 429 → throw `rate_limited` with parsed Retry-After
@@ -59,6 +67,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { getLogger } from '../shared/logger.js';
 import type { KiroCredentials } from './model/credentials.js';
+import { stripReasoningContent } from './model/requests/kiro.js';
 import {
   classifyErrorBody,
   isBearerTokenInvalidBody,
@@ -172,6 +181,7 @@ export class RetryExecutor {
   async execute(req: RetryableRequest): Promise<AxiosResponse> {
     const log = getLogger();
     let forceRefreshed = false;
+    let strippedReasoning = false;
     // 一次 execute() = 上游眼中的一次逻辑调用:共用 invocation-id、attempt 递增。
     const invocationId = uuidv4();
     let attempt = 0;
@@ -226,6 +236,22 @@ export class RetryExecutor {
       // quota_exhausted).
       const classified = classifyErrorBody(status, responseBody);
       if (classified) {
+        // 签名恢复(头注释「retry 2」):剥掉全部 reasoningContent 重发一次,同一 invocation
+        // 的下一个 attempt。网关自己触发的重试记 info,不记 error(日志红线)。
+        if (classified.kind === 'thinking_signature_invalid' && !strippedReasoning) {
+          const stripped = stripReasoningContent(req.body);
+          if (stripped !== undefined) {
+            strippedReasoning = true;
+            log.info({
+              msg: 'upstream rejected thinking signature, retrying without reasoningContent',
+              type: req.label,
+              status,
+              duration_ms: Date.now() - attemptStart,
+            });
+            req = { ...req, body: stripped };
+            continue;
+          }
+        }
         throw new ProviderError(classified, responseBody);
       }
 

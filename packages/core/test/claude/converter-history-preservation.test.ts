@@ -89,16 +89,22 @@ describe('assistant continuation retains client history', () => {
       assistant('I will check first.'),
       {
         role: 'assistant',
-        content: [{ type: 'thinking', thinking: 'Inspect the current state.' }],
+        content: [{ type: 'thinking', thinking: 'Inspect the current state.', signature: 'sig-1' }],
       },
       invocation(),
     ];
     const state = convert(messages);
     expect(state.history.map((message) => message.kind)).toEqual(['user', 'assistant']);
     expect(JSON.stringify(state.history)).toContain('I will check first.');
-    expect(JSON.stringify(state.history)).toContain(
-      '<thinking>Inspect the current state.</thinking>',
-    );
+    // 带签名的 thinking 走原生 reasoningContent,不拼成 <thinking> 文本
+    expect(JSON.stringify(state.history)).not.toContain('<thinking>');
+    expect(state.history[1]).toMatchObject({
+      assistantResponseMessage: {
+        reasoningContent: {
+          reasoningText: { text: 'Inspect the current state.', signature: 'sig-1' },
+        },
+      },
+    });
     expect(calls(state)).toEqual([
       { toolUseId: 'call_1', name: 'write_file', input: { literal: '\\u0000' } },
     ]);

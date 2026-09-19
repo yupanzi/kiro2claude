@@ -5,53 +5,21 @@
  * gateway only consumes more quota and delays the rate-limit signal.
  *
  * Adjacent contract: 408 and 5xx are also single-attempt — kiro2claude is a
- * zero-backoff forwarding gateway. The only retry the gateway performs is
- * the 401-bearer-invalid force-refresh path (covered in
- * retry-executor.test.ts).
+ * zero-backoff forwarding gateway. The only retries the gateway performs are
+ * the 401-bearer-invalid force-refresh path (covered in retry-executor.test.ts)
+ * and the 400 THINKING_SIGNATURE_INVALID strip-retry (covered in
+ * retry-executor-thinking-signature.test.ts).
  */
 
-import type { AxiosInstance, AxiosResponse } from 'axios';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { ProviderError } from '../../src/kiro/provider-error.js';
 import { RetryExecutor } from '../../src/kiro/retry-executor.js';
-import type { SingleTokenManager } from '../../src/kiro/token-manager.js';
-
-function makeStubTokenManager(): SingleTokenManager {
-  return {
-    acquireContext: vi.fn(async () => ({
-      credentials: { accessToken: 'stub-token' },
-      token: 'stub-token',
-    })),
-    forceRefreshToken: vi.fn(async () => {}),
-  } as unknown as SingleTokenManager;
-}
-
-function makeStubAxios(response: Partial<AxiosResponse>): {
-  client: AxiosInstance;
-  post: ReturnType<typeof vi.fn>;
-} {
-  const post = vi.fn(async () => ({
-    status: 200,
-    data: '',
-    headers: {},
-    statusText: 'OK',
-    config: {},
-    ...response,
-  }));
-  return { client: { post } as unknown as AxiosInstance, post };
-}
-
-const baseRequest = {
-  label: 'Test',
-  body: 'request-body',
-  buildUrl: () => 'https://upstream.invalid/api',
-  buildHeaders: () => ({}),
-  transformBody: (b: string) => b,
-  axiosConfig: {},
-  readErrorBody: async (r: AxiosResponse) => String(r.data),
-  buildHost: () => 'upstream.invalid',
-};
+import {
+  baseRequest,
+  makeStubAxios,
+  makeStubTokenManager,
+} from '../helpers/retry-executor-stubs.js';
 
 describe('RetryExecutor — 429 fast-path / 408+5xx pass-through', () => {
   it('throws immediately on 429 without retrying', async () => {

@@ -49,7 +49,7 @@ function walk(dir: string, out: string[] = []): string[] {
 interface ClientText {
   role: string;
   index: number;
-  where: 'system' | 'text' | 'tool_result' | 'thinking';
+  where: 'system' | 'text' | 'tool_result' | 'thinking' | 'thinking_unsigned';
   text: string;
   trailingSystem: boolean;
 }
@@ -78,9 +78,16 @@ function collectClientTexts(req: Raw): ClientText[] {
     for (const b of m.content) {
       if (!b || typeof b !== 'object') continue;
       if (b.type === 'text') pushText(out, { ...base, where: 'text', text: b.text });
-      else if (b.type === 'thinking')
-        pushText(out, { ...base, where: 'thinking', text: b.thinking });
-      else if (b.type === 'tool_result') {
+      else if (b.type === 'thinking') {
+        // 带签名的 thinking 走原生 reasoningContent(文本仍在 wire 上);无签名的按红线**丢弃**
+        // (上游要求签名必填,且不拼成 <thinking> 文本)——单独计数并反向核对。
+        const signed = typeof b.signature === 'string' && b.signature.length > 0;
+        pushText(out, {
+          ...base,
+          where: signed ? 'thinking' : 'thinking_unsigned',
+          text: b.thinking,
+        });
+      } else if (b.type === 'tool_result') {
         if (typeof b.content === 'string') {
           pushText(out, { ...base, where: 'tool_result', text: b.content });
         } else if (Array.isArray(b.content)) {
@@ -123,6 +130,8 @@ const totals = {
   clientTexts: 0,
   lost: 0,
   lostOnlyWithRescue: 0,
+  unsignedThinkingDropped: 0,
+  unsignedThinkingLeaked: 0,
   trailingSystem: 0,
   trailingSystemNotInCurrent: 0,
   midSystem: 0,
@@ -186,6 +195,14 @@ for (const file of walk(root)) {
     totals.clientTexts += texts.length;
     let lossyRescueOff: string | undefined;
     for (const t of texts) {
+      if (t.where === 'thinking_unsigned') {
+        totals.unsignedThinkingDropped++;
+        if (wire.includes(t.text)) {
+          totals.unsignedThinkingLeaked++;
+          example('unsignedThinkingLeaked', { where, index: t.index, head: t.text.slice(0, 100) });
+        }
+        continue;
+      }
       if (!wire.includes(t.text)) {
         lossyRescueOff ??= wireStrings(convert(payload, false).conversationState).join(' ');
         if (lossyRescueOff.includes(t.text)) {

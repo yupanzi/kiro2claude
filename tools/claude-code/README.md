@@ -161,7 +161,7 @@ cat /etc/cc-version    # build 时落地的实际版本号
 | `01-ping` | 非流式 JSON 输出 | `.result` 含 PONG + `.session_id` 非空 + `.total_cost_usd` 数值 + `.usage.input_tokens > 0` |
 | `02-stream` | `stream-json` 流式 SSE | 至少 1 行 `type=stream_event` + 至少 1 行 `text_delta` + 末行 `type=result` |
 | `03-tool-use` | 工具调用（挂载 workspace + `--allowedTools Read`） | CC 真实通过 Read 工具读到 `/workspace/secret.txt` 并把内容返回 |
-| `04-models` | 多模型矩阵（reasoning native + 旧路径） | 对 `opus-4.7` / `opus-4.6` / `sonnet-4.6` 各跑一次 ping，保证 `.usage.input_tokens` 不掉 |
+| `04-models` | 多模型矩阵（原生 reasoning + 非原生） | 对 `opus-4.7` / `opus-4.6` / `sonnet-4.6` 各跑一次 ping，保证 `.usage.input_tokens` 不掉 |
 
 ### 生命周期清理
 

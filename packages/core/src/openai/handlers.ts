@@ -14,12 +14,12 @@ import {
   type ConversionResult,
   clientModelHasEncryptedReasoning,
   convertRequest,
+  toKiroRequest,
 } from '../claude/converter.js';
 import { captureEmptyRequest, type MessageHandlerResult } from '../claude/empty-capture.js';
 import type { PostMessagesDeps } from '../claude/handlers.js';
 import { buildToolTextRegistry } from '../claude/tool-call-text.js';
 import { isThinkingEnabled } from '../claude/types.js';
-import type { KiroRequest } from '../kiro/model/requests/kiro.js';
 import { serializeKiroRequest } from '../kiro/model/requests/kiro.js';
 import { getLogger } from '../shared/logger.js';
 import { getRequestContext } from '../shared/request-context.js';
@@ -108,7 +108,7 @@ export function createPostChatCompletions(deps: PostMessagesDeps) {
       throw e;
     }
 
-    const kiroRequest: KiroRequest = { conversationState: conversionResult.conversationState };
+    const kiroRequest = toKiroRequest(conversionResult);
 
     let requestBody: string;
     try {

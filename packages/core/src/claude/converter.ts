@@ -12,6 +12,7 @@ import type {
   EffortLevel,
   KiroImage,
   Message as KiroMessage,
+  ReasoningContent,
   UserInputMessage,
   UserInputMessageContext,
 } from '../kiro/model/requests/conversation.js';
@@ -22,6 +23,7 @@ import {
   createUserInputMessage,
   createUserMessage,
 } from '../kiro/model/requests/conversation.js';
+import type { AdditionalModelRequestFields, KiroRequest } from '../kiro/model/requests/kiro.js';
 import type { Tool as KiroTool, ToolResult, ToolUseEntry } from '../kiro/model/requests/tool.js';
 import {
   createToolUseEntry,
@@ -33,7 +35,13 @@ import { getLogger } from '../shared/logger.js';
 import { mapToolName } from './converter/tool-name-map.js';
 import { ToolCallTextStripper, type ToolTextRegistry } from './tool-call-text.js';
 
-import type { Message as ClaudeMessage, ContentBlock, MessagesRequest, Tool } from './types.js';
+import type {
+  Message as ClaudeMessage,
+  ContentBlock,
+  MessagesRequest,
+  Thinking,
+  Tool,
+} from './types.js';
 
 // ============================================================================
 // Constants
@@ -171,74 +179,94 @@ export function mapModel(model: string): string | undefined {
 }
 
 // ============================================================================
-// Native reasoning support (kiro-cli 2.6.0+)
+// Native reasoning support
 // ============================================================================
 
 /**
- * Mapped Kiro modelId 的集合，这些 model 在 kiro 后端原生支持
- * `userInputMessage.reasoning.effort` wire 字段。其它 model 走
- * `<thinking_mode>` prompt 注入路径（fallback）。
+ * 走原生 reasoning 的 mapped modelId:请求顶层 `additionalModelRequestFields`
+ * (`buildAdditionalModelRequestFields`)+ 响应 `reasoningContentEvent` + history
+ * `reasoningContent`。其它 model 不做 thinking 控制、用上游默认。
  *
- * 实测：4.7 完全响应 effort（max → low reasoning chunk 数 3.4× 变化）；
- * 4.8 effort 暂不分档但 reasoning 默认开启；
- * 4.6 / sonnet / haiku / 4.5 完全不支持（加 reasoning 字段被静默忽略）。
+ * 依据是上游 `ListAvailableModels` 逐模型的 `additionalModelRequestFieldsSchema` 与直打验证:
+ *   - opus-5 / 4.7 / 4.8:回摘要 reasoning 帧 + signature;
+ *   - sonnet-5:回 signature 帧(文本可能为空),计费随 effort 变;
+ *   - sonnet-4.6:schema 无 xhigh,加字段后回明文 reasoning + signature,默认不思考;
+ *   - opus-4.6:发字段只涨计费、既无 reasoning 帧也无 signature,没有可回传的东西,不入集合;
+ *   - 4.5 及以下 / haiku:无 schema。
  *
- * GPT-5.6 系列同样走原生 `reasoning.effort`（kiro-cli settings 的
- * `chat.modelDefaults` 为 gpt-5.6-sol 存了 reasoning.effort，真实请求确认生效）。
- * 但 GPT 的 reasoning 内容是**加密的**：上游用同名 `reasoningContentEvent` 回
- * `{redactedContent}`（无 text/signature），无内容可 surface——见 stream.ts
- * `processReasoningContent` 的 redacted 守卫。放进本集合只为触发请求侧 effort
- * 注入 + 跳过 `<thinking>` prompt 前缀，与响应侧是否有可用 thinking 无关。
+ * GPT-5.6 走 `additionalModelRequestFields.reasoning.effort`;其 reasoning 内容加密,上游用同名
+ * `reasoningContentEvent` 回 `{redactedContent}`,无内容可 surface——见 stream.ts
+ * `processReasoningContent` 的 redacted 守卫。入集合只为触发请求侧 effort 注入。
  */
 export const MODELS_WITH_NATIVE_REASONING: ReadonlySet<string> = new Set([
   'claude-opus-5',
+  'claude-sonnet-5',
   'claude-opus-4.7',
   'claude-opus-4.8',
+  'claude-sonnet-4.6',
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
 ]);
 
+/** 原生集合里 `output_config.effort` 没有 xhigh 的模型(上游 schema),降到 high。opus-4.6 同样没有但不在原生集合,不列。 */
+const MODELS_WITHOUT_XHIGH: ReadonlySet<string> = new Set(['claude-sonnet-4.6']);
+
+/** 「是不是 GPT 家族」的唯一判定(入参是 mapped modelId):决定 wire 形态、context window 与加密 reasoning 路径。 */
+export function isGptModelId(mappedModelId: string): boolean {
+  return mappedModelId.startsWith('gpt');
+}
+
 /**
- * 把 Anthropic Extended Thinking 的 `thinking` + `output_config` 映射成
- * kiro-cli 的 `reasoning.effort` 等级。
- *
- * 双通道：
- *   - `type === 'adaptive'`: 直接同步 `output_config.effort`（缺省 'high'）。
- *     语义最清晰——下游想精确控制 effort 等级就用这条。
- *   - `type === 'enabled'`: 按 `budget_tokens` 阈值映射。下游用 Anthropic
- *     原始 wire format 时走这条。阈值参考 Anthropic budget_tokens 常用值
- *     1024-32768 等分。
- *   - 其它: 返回 undefined（不传 reasoning 字段，走 baseline）。
+ * `thinking` + `output_config` → effort:`adaptive` 取 `output_config.effort`(缺省或未知取值 →
+ * high);`disabled` / 未提 → undefined。`enabled` 已在 `normalizeThinking` 归一,`budget_tokens`
+ * 不参与。
  */
-export function mapThinkingToEffort(
-  thinking: { type: string; budget_tokens?: number } | undefined,
+export function resolveEffort(
+  thinking: Thinking | undefined,
   outputConfig: { effort?: string } | undefined,
 ): EffortLevel | undefined {
-  if (!thinking) return undefined;
-  if (thinking.type === 'adaptive') {
-    const effort = outputConfig?.effort ?? 'high';
-    if (isEffortLevel(effort)) return effort;
-    return 'high';
-  }
-  if (thinking.type === 'enabled') {
-    const bt = thinking.budget_tokens ?? 20000;
-    if (bt < 2048) return 'low';
-    if (bt < 8192) return 'medium';
-    if (bt < 16384) return 'high';
-    if (bt < 32768) return 'xhigh';
-    return 'max';
-  }
-  return undefined;
+  if (thinking?.type !== 'adaptive') return undefined;
+  const effort = outputConfig?.effort ?? 'high';
+  return isEffortLevel(effort) ? effort : 'high';
 }
 
 function isEffortLevel(s: string): s is EffortLevel {
   return s === 'low' || s === 'medium' || s === 'high' || s === 'xhigh' || s === 'max';
 }
 
-/** model 是否走原生 reasoning 路径（wire 字段 `reasoning.effort`） */
+/** model 是否走原生 reasoning 路径(请求顶层 `additionalModelRequestFields`) */
 export function usesNativeReasoning(mappedModelId: string): boolean {
   return MODELS_WITH_NATIVE_REASONING.has(mappedModelId);
+}
+
+/**
+ * `thinking` + `output_config` → 请求顶层 `additionalModelRequestFields`(effort 唯一生效的位置,
+ * 形状见 `requests/kiro.ts`):
+ *   - 非原生模型 / 未提 `thinking` → undefined(不发,沿用上游默认);
+ *   - `disabled` → Claude `{thinking:{type:"disabled"}}` / GPT `{reasoning:{effort:"none"}}`;
+ *   - `adaptive` → Claude `{thinking:{type:"adaptive", display?}, output_config:{effort}}` /
+ *     GPT `{reasoning:{effort}}`;sonnet-4.6 无 xhigh → 降 high。
+ */
+export function buildAdditionalModelRequestFields(
+  req: Pick<MessagesRequest, 'thinking' | 'output_config'>,
+  mappedModelId: string,
+): AdditionalModelRequestFields | undefined {
+  if (!usesNativeReasoning(mappedModelId)) return undefined;
+  const thinking = req.thinking;
+  if (!thinking) return undefined;
+  const isGpt = isGptModelId(mappedModelId);
+  if (thinking.type === 'disabled') {
+    return isGpt ? { reasoning: { effort: 'none' } } : { thinking: { type: 'disabled' } };
+  }
+  const effort = resolveEffort(thinking, req.output_config);
+  if (!effort) return undefined;
+  if (isGpt) return { reasoning: { effort } };
+  const clamped = effort === 'xhigh' && MODELS_WITHOUT_XHIGH.has(mappedModelId) ? 'high' : effort;
+  return {
+    thinking: { type: 'adaptive', ...(thinking.display ? { display: thinking.display } : {}) },
+    output_config: { effort: clamped },
+  };
 }
 
 /**
@@ -256,7 +284,8 @@ export function usesNativeReasoning(mappedModelId: string): boolean {
  * 所以绝不能把 Claude 原生模型纳入此判定。未知模型 → false(convertRequest 已先拒)。
  */
 export function clientModelHasEncryptedReasoning(clientModel: string): boolean {
-  return mapModel(clientModel)?.startsWith('gpt') ?? false;
+  const mapped = mapModel(clientModel);
+  return mapped !== undefined && isGptModelId(mapped);
 }
 
 /**
@@ -284,7 +313,7 @@ export function getContextWindowSize(model: string): number {
   ) {
     return 1_000_000;
   }
-  if (mapped === 'gpt-5.6-sol' || mapped === 'gpt-5.6-terra' || mapped === 'gpt-5.6-luna') {
+  if (mapped !== undefined && isGptModelId(mapped)) {
     return _gptContextWindow;
   }
   return 200_000;
@@ -322,6 +351,20 @@ export interface ConversionResult {
   conversationState: ConversationState;
   /** Tool name mapping (short name -> original name) */
   toolNameMap: Map<string, string>;
+  /** 请求顶层的 thinking / effort 字段;非原生模型或客户端未提 thinking 时不发。 */
+  additionalModelRequestFields?: AdditionalModelRequestFields;
+}
+
+/**
+ * 三个协议 handler(Claude / Chat / Responses)共用的 wire 装配:conversationState +
+ * 顶层 additionalModelRequestFields。集中在这里,加顶层字段时不用改三处。
+ */
+export function toKiroRequest(result: ConversionResult): KiroRequest {
+  // undefined 由 serializeKiroRequest 的 JSON.stringify 自然省略,wire 上不会多出键。
+  return {
+    conversationState: result.conversationState,
+    additionalModelRequestFields: result.additionalModelRequestFields,
+  };
 }
 
 export interface ConvertRequestOptions {
@@ -1131,46 +1174,25 @@ function collectHistoryToolNames(history: KiroMessage[]): Set<string> {
 }
 
 // ============================================================================
-// Thinking prefix generation
-// ============================================================================
-
-function generateThinkingPrefix(req: MessagesRequest): string | undefined {
-  if (req.thinking) {
-    if (req.thinking.type === 'enabled') {
-      return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${req.thinking.budget_tokens}</max_thinking_length>`;
-    }
-    if (req.thinking.type === 'adaptive') {
-      const effort = req.output_config?.effort ?? 'high';
-      return `<thinking_mode>adaptive</thinking_mode><thinking_effort>${effort}</thinking_effort>`;
-    }
-  }
-  return undefined;
-}
-
-/**
- * True when `content` already carries a complete `<thinking_mode>…</thinking_mode>`
- * (or `<max_thinking_length>…</max_thinking_length>`) block, i.e. the shape
- * `generateThinkingPrefix` itself emits. A bare mention of the tag name in prose
- * (a system prompt saying "never emit <thinking_mode> tags") is not a block and
- * must not switch the prefix off.
- */
-function hasThinkingTags(content: string): boolean {
-  return /<thinking_mode>[^<]*<\/thinking_mode>|<max_thinking_length>[^<]*<\/max_thinking_length>/.test(
-    content,
-  );
-}
-
-// ============================================================================
 // Assistant message conversion
 // ============================================================================
 
+/**
+ * Claude assistant 消息 → Kiro `assistantResponseMessage`。
+ *
+ * ★ thinking 不拼成 `<thinking>` 文本:带签名的 `thinking` 块与 `redacted_thinking` 块走原生
+ * `reasoningContent`(形态与红线见 `requests/conversation.ts`),`content` 只放可见文本。一条
+ * Kiro 消息一个 reasoning 槽位,多块取最后一块(同 kiro-cli KAS)。无签名的 thinking 丢弃——
+ * 上游要求签名必填,拼成文本对模型只是普通文字。守卫 `test/static/no-thinking-tag-stitching.test.ts`。
+ */
 function convertAssistantMessage(
   msg: ClaudeMessage,
   toolNameMap: Map<string, string>,
 ): KiroMessage {
-  let thinkingContent = '';
   let textContent = '';
   const toolUses: ToolUseEntry[] = [];
+  let reasoningContent: ReasoningContent | undefined;
+  let unsignedThinkingBlocks = 0;
 
   if (typeof msg.content === 'string') {
     textContent = msg.content;
@@ -1181,8 +1203,17 @@ function convertAssistantMessage(
 
       switch (block.type) {
         case 'thinking':
-          if (block.thinking) {
-            thinkingContent += block.thinking;
+          if (typeof block.signature === 'string' && block.signature.length > 0) {
+            reasoningContent = {
+              reasoningText: { text: block.thinking ?? '', signature: block.signature },
+            };
+          } else {
+            unsignedThinkingBlocks += 1;
+          }
+          break;
+        case 'redacted_thinking':
+          if (typeof block.data === 'string' && block.data.length > 0) {
+            reasoningContent = { redactedContent: block.data };
           }
           break;
         case 'text':
@@ -1203,24 +1234,17 @@ function convertAssistantMessage(
     }
   }
 
-  // Combine thinking and text content
-  // Format: <thinking>thinking_content</thinking>\n\ntext_content
-  // Note: Kiro API requires content field to be non-empty; when only tool_use, use placeholder
-  let finalContent: string;
-  if (thinkingContent) {
-    if (textContent) {
-      finalContent = `<thinking>${thinkingContent}</thinking>\n\n${textContent}`;
-    } else {
-      finalContent = `<thinking>${thinkingContent}</thinking>`;
-    }
-  } else if (!textContent && toolUses.length > 0) {
-    finalContent = ' ';
-  } else {
-    finalContent = textContent || ' ';
+  if (unsignedThinkingBlocks > 0) {
+    getLogger().debug({
+      msg: 'unsigned thinking blocks dropped from history',
+      dropped_count: unsignedThinkingBlocks,
+    });
   }
 
-  const assistant = createAssistantMessage(finalContent);
+  // Kiro API requires content to be non-empty; only-tool_use / empty → single-space placeholder.
+  const assistant = createAssistantMessage(textContent || ' ');
   attachToolUses(assistant, toolUses);
+  if (reasoningContent) assistant.reasoningContent = reasoningContent;
 
   return {
     kind: 'assistant',
@@ -1239,6 +1263,8 @@ function mergeAssistantMessages(
 
   const allToolUses: ToolUseEntry[] = [];
   const contentParts: string[] = [];
+  // 一条 Kiro 消息只有一个 reasoning 槽位:合并时取最后一条带 reasoning 的(同 KAS findLast)。
+  let reasoningContent: ReasoningContent | undefined;
 
   for (const msg of messages) {
     const converted = convertAssistantMessage(msg, toolNameMap);
@@ -1250,6 +1276,7 @@ function mergeAssistantMessages(
     if (am.toolUses) {
       allToolUses.push(...am.toolUses);
     }
+    if (am.reasoningContent) reasoningContent = am.reasoningContent;
   }
 
   // Kiro 要求 content 非空。无文本内容时一律用单空格占位——不论是「只有
@@ -1259,6 +1286,7 @@ function mergeAssistantMessages(
 
   const assistant = createAssistantMessage(content);
   attachToolUses(assistant, allToolUses);
+  if (reasoningContent) assistant.reasoningContent = reasoningContent;
 
   return {
     kind: 'assistant',
@@ -1331,46 +1359,26 @@ function mergeUserMessages(
 
 /**
  * Compose everything the gateway wants the model to read ahead of the client's
- * conversation: the client's `system` text, the legacy `<thinking_mode>` prefix
- * for models without native reasoning, and the identity directive when enabled.
- * Returns undefined when there is nothing to inject.
+ * conversation: the client's `system` text and the identity directive when
+ * enabled. Returns undefined when there is nothing to inject.
+ *
+ * 不注入任何 thinking 控制前缀(见 `MODELS_WITH_NATIVE_REASONING` 头注释)。
  *
  * The existence check is on the joined text, not on `req.system.length`: clients
  * send `system: [{text: ''}]`, which must behave exactly like "no system"; blank
  * blocks are dropped before joining so they cannot leave stray newlines either.
- * `firstUserText` is the client text the prefix will be joined to (see
- * `foldSystemIntoFirstUserMessage`): the thinking prefix is skipped when either
- * the system text or that target already carries the tags, so a client shipping
- * its own `<thinking_mode>` block never gets a second one right next to it.
  */
-function buildSystemPrefix(
-  req: MessagesRequest,
-  modelId: string,
-  identityOverride: boolean,
-  firstUserText: string,
-): string | undefined {
-  // Native-reasoning models carry thinking on the wire field
-  // `userInputMessage.reasoning.effort`; the prompt prefix is only the fallback
-  // for the others(踩坑「原生 reasoning 路径互斥」).
-  const thinkingPrefix = usesNativeReasoning(modelId) ? undefined : generateThinkingPrefix(req);
+function buildSystemPrefix(req: MessagesRequest, identityOverride: boolean): string | undefined {
   const systemContent =
     req.system
       ?.map((s) => s.text)
       .filter((t) => t.trim().length > 0)
       .join('\n') ?? '';
-  const alreadyTagged = hasThinkingTags(systemContent) || hasThinkingTags(firstUserText);
 
   if (systemContent) {
-    const content = identityOverride
-      ? `${systemContent}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}`
-      : systemContent;
-    return thinkingPrefix && !alreadyTagged ? `${thinkingPrefix}\n${content}` : content;
+    return identityOverride ? `${systemContent}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}` : systemContent;
   }
-
-  const parts: string[] = [];
-  if (thinkingPrefix && !alreadyTagged) parts.push(thinkingPrefix);
-  if (identityOverride) parts.push(IDENTITY_OVERRIDE_DIRECTIVE);
-  return parts.length > 0 ? parts.join('\n\n') : undefined;
+  return identityOverride ? IDENTITY_OVERRIDE_DIRECTIVE : undefined;
 }
 
 /**
@@ -1905,19 +1913,10 @@ export function convertRequest(
   // 消息级 images[],归属全靠位置(见 canonicalizeToolResultOrder 头注释)。
   messages = canonicalizeToolResultOrder(messages);
 
-  // 2.8. Compose the request-level system text (+ legacy thinking prefix +
-  // identity directive). Kiro has no system field and no working structured
-  // context slot, so it is joined onto the first user Kiro message at step 12
-  // (see foldSystemIntoFirstUserMessage). The first user message's own text is
-  // passed so the thinking prefix is not doubled when the client already
-  // carries the tags there.
-  const firstUser = messages.find((m) => m.role === 'user');
-  const systemPrefix = buildSystemPrefix(
-    req,
-    modelId,
-    identityOverride,
-    firstUser ? systemMessageText(firstUser.content) : '',
-  );
+  // 2.8. Compose the request-level system text (+ identity directive). Kiro has
+  // no system field and no working structured context slot, so it is joined onto
+  // the first user Kiro message at step 12 (see foldSystemIntoFirstUserMessage).
+  const systemPrefix = buildSystemPrefix(req, identityOverride);
 
   // 3. Generate conversation ID and agent continuation ID
   // typeof 守卫:metadata 是宽松类型,客户端可能传非字符串 user_id;直接传给
@@ -2048,20 +2047,16 @@ export function convertRequest(
     origin: bodyOrigin,
   };
 
-  // 12b. 原生 reasoning 注入：仅对 4.7/4.8 等支持的 model 生效。
-  // 双通道映射在 mapThinkingToEffort 里。其它 model 走 buildSystemPrefix 的
-  // prompt 注入路径，保持现有 fallback。
-  if (usesNativeReasoning(modelId)) {
-    const effort = mapThinkingToEffort(req.thinking, req.output_config);
-    if (effort) {
-      userInput.reasoning = { effort };
-      getLogger().debug({
-        msg: 'native reasoning effort injected',
-        model: modelId,
-        thinking_type: req.thinking?.type,
-        effort,
-      });
-    }
+  // 12b. 原生 reasoning / effort 走**请求顶层** additionalModelRequestFields(唯一生效
+  // 位置,见 requests/kiro.ts 头注释);非原生模型不注入任何 thinking 控制。
+  const additionalModelRequestFields = buildAdditionalModelRequestFields(req, modelId);
+  if (additionalModelRequestFields) {
+    getLogger().debug({
+      msg: 'additional model request fields',
+      model: modelId,
+      thinking_type: req.thinking?.type,
+      fields: additionalModelRequestFields,
+    });
   }
 
   const currentMessage: CurrentMessage = {
@@ -2103,5 +2098,6 @@ export function convertRequest(
   return {
     conversationState,
     toolNameMap,
+    additionalModelRequestFields,
   };
 }

@@ -1,15 +1,15 @@
 /**
- * 契约测试：kiro-cli 2.6.0+ 原生 reasoning 路径（`userInputMessage.reasoning.effort`
- * 请求字段 + `reasoningContentEvent` 响应事件 + `signature_delta` SSE delta）。
+ * 契约测试：原生 reasoning 路径（请求顶层 `additionalModelRequestFields` 字段 +
+ * `reasoningContentEvent` 响应事件 + `signature_delta` SSE delta）。
  *
  * 四层覆盖：
  *   - parser  (`src/kiro/model/events/base.ts`)
  *   - stream  (`src/claude/stream.ts` 的 `StreamContext.processReasoningContent`)
- *   - convert (`src/claude/converter.ts` 的 `mapThinkingToEffort` + body 注入)
+ *   - convert (`src/claude/converter.ts` 的 `resolveEffort` / `buildAdditionalModelRequestFields`)
  *   - 端到端：parser → stream 完整 SSE 序列断言
  *
- * 现有的 `<thinking>` 标签提取测试（`test/claude/stream.test.ts`）不受影响——
- * 旧路径对 4.6 / sonnet / haiku 等不支持原生 reasoning 的 model 仍生效。
+ * 响应侧 `<thinking>` 标签提取(`test/claude/stream.test.ts`)只对非原生模型(opus-4.6 及
+ * 以下、haiku)保留;请求侧没有任何前缀注入。
  */
 
 import { describe, expect, it } from 'vitest';
@@ -20,14 +20,16 @@ import {
   initGptContextWindow,
   MODELS_WITH_NATIVE_REASONING,
   mapModel,
-  mapThinkingToEffort,
   resolveContextUsage,
+  resolveEffort,
+  toKiroRequest,
   usesNativeReasoning,
 } from '../../src/claude/converter.js';
 import { type SseEvent, StreamContext } from '../../src/claude/stream.js';
 import { buildToolTextRegistry } from '../../src/claude/tool-call-text.js';
-import type { MessagesRequest, Tool } from '../../src/claude/types.js';
+import { type MessagesRequest, normalizeThinking, type Tool } from '../../src/claude/types.js';
 import { eventFromFrame } from '../../src/kiro/model/events/base.js';
+import { serializeKiroRequest } from '../../src/kiro/model/requests/kiro.js';
 import { parseFrame } from '../../src/kiro/parser/frame.js';
 import { DEFAULT_GPT_CONTEXT_WINDOW } from '../../src/model/schemas/config-schema.js';
 import { HookBus } from '../../src/plugin-host/index.js';
@@ -197,62 +199,50 @@ describe('stream: GPT redacted reasoning', () => {
 });
 
 // ============================================================================
-// converter: thinking → reasoning.effort 双通道映射
+// converter: thinking → effort(只有 adaptive 一种语义)
 // ============================================================================
 
-describe('mapThinkingToEffort: 双通道映射', () => {
+describe('resolveEffort: 只有 adaptive 一种语义', () => {
   it('adaptive + output_config.effort 直接同步', () => {
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'low' })).toBe('low');
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'medium' })).toBe('medium');
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'high' })).toBe('high');
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'xhigh' })).toBe('xhigh');
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'max' })).toBe('max');
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      expect(resolveEffort({ type: 'adaptive' }, { effort: e })).toBe(e);
+    }
   });
 
-  it('adaptive 无 effort 落到默认 high', () => {
-    expect(mapThinkingToEffort({ type: 'adaptive' }, undefined)).toBe('high');
-    expect(mapThinkingToEffort({ type: 'adaptive' }, {})).toBe('high');
+  it('adaptive 无 effort / 未知 effort 落到默认 high', () => {
+    expect(resolveEffort({ type: 'adaptive' }, undefined)).toBe('high');
+    expect(resolveEffort({ type: 'adaptive' }, {})).toBe('high');
+    expect(resolveEffort({ type: 'adaptive' }, { effort: 'mega' })).toBe('high');
   });
 
-  it('adaptive + 未知 effort 取默认 high (forwards-compat)', () => {
-    expect(mapThinkingToEffort({ type: 'adaptive' }, { effort: 'mega' })).toBe('high');
+  it('客户端的 enabled 在入口归一成 adaptive(budget_tokens 丢弃),下游只见 adaptive', () => {
+    expect(normalizeThinking({ type: 'enabled', budget_tokens: 100000 })).toEqual({
+      type: 'adaptive',
+    });
+    expect(resolveEffort(normalizeThinking({ type: 'enabled' }), { effort: 'low' })).toBe('low');
+    expect(resolveEffort(normalizeThinking({ type: 'enabled' }), undefined)).toBe('high');
   });
 
-  it('enabled + budget_tokens 按阈值映射', () => {
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 1024 }, undefined)).toBe('low');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 2047 }, undefined)).toBe('low');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 2048 }, undefined)).toBe('medium');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 8191 }, undefined)).toBe('medium');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 8192 }, undefined)).toBe('high');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 16383 }, undefined)).toBe('high');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 16384 }, undefined)).toBe('xhigh');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 32767 }, undefined)).toBe('xhigh');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 32768 }, undefined)).toBe('max');
-    expect(mapThinkingToEffort({ type: 'enabled', budget_tokens: 65536 }, undefined)).toBe('max');
-  });
-
-  it('enabled 缺 budget_tokens 取默认 20000 → high', () => {
-    expect(mapThinkingToEffort({ type: 'enabled' }, undefined)).toBe('xhigh');
-  });
-
-  it('disabled / 未识别 type 返回 undefined', () => {
-    expect(mapThinkingToEffort({ type: 'disabled' }, undefined)).toBeUndefined();
-    expect(mapThinkingToEffort({ type: 'unknown' }, undefined)).toBeUndefined();
-    expect(mapThinkingToEffort(undefined, undefined)).toBeUndefined();
+  it('disabled / 未提 → undefined', () => {
+    expect(resolveEffort({ type: 'disabled' }, { effort: 'max' })).toBeUndefined();
+    expect(resolveEffort(undefined, undefined)).toBeUndefined();
   });
 });
 
 describe('usesNativeReasoning: 模型能力探测', () => {
-  it('4.7 / 4.8 / 5 走原生', () => {
+  it('4.7 / 4.8 / 5 / sonnet-5 / sonnet-4.6 走原生', () => {
     expect(usesNativeReasoning('claude-opus-4.7')).toBe(true);
     expect(usesNativeReasoning('claude-opus-4.8')).toBe(true);
     expect(usesNativeReasoning('claude-opus-5')).toBe(true);
+    expect(usesNativeReasoning('claude-sonnet-5')).toBe(true);
+    expect(usesNativeReasoning('claude-sonnet-4.6')).toBe(true);
   });
 
-  it('4.6 / sonnet / haiku / 4.5 走 fallback prompt 路径', () => {
+  it('opus-4.6 / 4.5 / sonnet-4.5 / haiku 非原生:不做 thinking 控制', () => {
+    // opus-4.6:上游 schema 有 thinking,但发了字段既无 reasoning 帧也无 signature,没有可回传的
+    // 东西,不入集合。其余无 schema。
     expect(usesNativeReasoning('claude-opus-4.6')).toBe(false);
     expect(usesNativeReasoning('claude-opus-4.5')).toBe(false);
-    expect(usesNativeReasoning('claude-sonnet-4.6')).toBe(false);
     expect(usesNativeReasoning('claude-sonnet-4.5')).toBe(false);
     expect(usesNativeReasoning('claude-haiku-4.5')).toBe(false);
   });
@@ -262,9 +252,12 @@ describe('usesNativeReasoning: 模型能力探测', () => {
       [
         'claude-opus-4.7',
         'claude-opus-4.8',
-        // Opus 5 比照 4.7/4.8 走原生 reasoning.effort（上游 modelId claude-opus-5，明文 thinking）
+        // Opus 5 比照 4.7/4.8 走原生（上游 modelId claude-opus-5，摘要 thinking + signature）
         'claude-opus-5',
-        // GPT-5.6 系列同走原生 reasoning.effort（reasoning 内容加密不可 surface）
+        // 2026-09-19 抓包:schema 同 opus-5;sonnet-4.6 加字段后回明文 reasoning + signature
+        'claude-sonnet-5',
+        'claude-sonnet-4.6',
+        // GPT-5.6 系列走 additionalModelRequestFields.reasoning（内容加密不可 surface）
         'gpt-5.6-sol',
         'gpt-5.6-terra',
         'gpt-5.6-luna',
@@ -320,113 +313,129 @@ describe('clientModelHasEncryptedReasoning: 仅 GPT(加密 reasoning)命中', ()
 // converter: wire body 注入
 // ============================================================================
 
-describe('convertRequest: reasoning.effort 注入', () => {
-  it('4.7 + adaptive + effort=max → currentMessage.userInputMessage.reasoning.effort=max', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-7',
-      thinking: { type: 'adaptive', budget_tokens: 20000 },
+describe('convertRequest: 顶层 additionalModelRequestFields(effort 唯一生效位置)', () => {
+  const uim = (r: ReturnType<typeof convertRequest>) =>
+    r.conversationState.currentMessage.userInputMessage as unknown as Record<string, unknown>;
+  const adaptive = (effort?: string) => ({
+    thinking: { type: 'adaptive' as const },
+    ...(effort ? { output_config: { effort } } : {}),
+  });
+
+  it('4.7 + adaptive + effort=max → {thinking:adaptive, output_config.effort:max};userInputMessage 不带 reasoning', () => {
+    const req = baseMessagesRequest({ model: 'claude-opus-4-7', ...adaptive('max') });
+    const result = convertRequest(req);
+    expect(result.additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
       output_config: { effort: 'max' },
     });
-    const result = convertRequest(req);
-    const uim = result.conversationState.currentMessage.userInputMessage;
-    expect(uim.reasoning).toEqual({ effort: 'max' });
+    expect(uim(result).reasoning).toBeUndefined();
     expect(mapModel(req.model)).toBe('claude-opus-4.7');
   });
 
-  it('4.7 + enabled + budget_tokens=4096 → reasoning.effort=medium', () => {
-    const req = baseMessagesRequest({
+  it('4.7 + 客户端 enabled(入口归一为 adaptive)→ 上 wire 是 adaptive,effort 取 output_config 或默认 high', () => {
+    const noEffort = baseMessagesRequest({
       model: 'claude-opus-4-7',
-      thinking: { type: 'enabled', budget_tokens: 4096 },
+      thinking: normalizeThinking({ type: 'enabled', budget_tokens: 4096 }),
     });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toEqual({
-      effort: 'medium',
-    });
-  });
-
-  it('4.8 + adaptive → reasoning.effort 注入', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-8',
-      thinking: { type: 'adaptive', budget_tokens: 20000 },
+    expect(convertRequest(noEffort).additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
       output_config: { effort: 'high' },
     });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toEqual({
-      effort: 'high',
+    const withEffort = baseMessagesRequest({
+      model: 'claude-opus-4-7',
+      thinking: normalizeThinking({ type: 'enabled' }),
+      output_config: { effort: 'low' },
+    });
+    expect(convertRequest(withEffort).additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'low' },
     });
   });
 
-  it('5 + adaptive → reasoning.effort 注入（上游 claude-opus-5，无小数点）', () => {
+  it('4.8 / 5 + adaptive → 同形态(上游 modelId claude-opus-5,无小数点)', () => {
+    for (const model of ['claude-opus-4-8', 'claude-opus-5']) {
+      expect(
+        convertRequest(baseMessagesRequest({ model, ...adaptive('high') }))
+          .additionalModelRequestFields,
+      ).toEqual({ thinking: { type: 'adaptive' }, output_config: { effort: 'high' } });
+    }
+    expect(mapModel('claude-opus-5')).toBe('claude-opus-5');
+  });
+
+  it('5 + adaptive + display:omitted → thinking.display 原样透传(Claude Code 发这个)', () => {
     const req = baseMessagesRequest({
       model: 'claude-opus-5',
-      thinking: { type: 'adaptive', budget_tokens: 20000 },
+      thinking: { type: 'adaptive', display: 'omitted' },
       output_config: { effort: 'high' },
     });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toEqual({
-      effort: 'high',
+    expect(convertRequest(req).additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive', display: 'omitted' },
+      output_config: { effort: 'high' },
     });
-    expect(mapModel(req.model)).toBe('claude-opus-5');
   });
 
-  it('4.6 + thinking → 不注入 reasoning 字段（走旧 prompt 注入路径）', () => {
+  it('sonnet-4.6 + xhigh → 降为 high(上游 schema 无 xhigh);其它等级原样', () => {
+    const at = (effort: string) =>
+      convertRequest(baseMessagesRequest({ model: 'claude-sonnet-4-6', ...adaptive(effort) }))
+        .additionalModelRequestFields;
+    expect(at('xhigh')).toEqual({
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
+    });
+    expect(at('max')).toEqual({ thinking: { type: 'adaptive' }, output_config: { effort: 'max' } });
+  });
+
+  it('gpt-5.6-sol + adaptive + max → {reasoning:{effort:max}};disabled → effort none', () => {
+    const on = baseMessagesRequest({ model: 'gpt-5.6-sol', ...adaptive('max') });
+    expect(convertRequest(on).additionalModelRequestFields).toEqual({
+      reasoning: { effort: 'max' },
+    });
+    const off = baseMessagesRequest({ model: 'gpt-5.6-sol', thinking: { type: 'disabled' } });
+    expect(convertRequest(off).additionalModelRequestFields).toEqual({
+      reasoning: { effort: 'none' },
+    });
+  });
+
+  it('4.7 不传 thinking → 不发顶层字段(沿用上游默认,行为不变)', () => {
+    const result = convertRequest(baseMessagesRequest({ model: 'claude-opus-4-7' }));
+    expect(result.additionalModelRequestFields).toBeUndefined();
+    expect(uim(result).reasoning).toBeUndefined();
+  });
+
+  it('4.7 + thinking.type=disabled → {thinking:{type:disabled}}(真关,不是不发)', () => {
+    const req = baseMessagesRequest({ model: 'claude-opus-4-7', thinking: { type: 'disabled' } });
+    expect(convertRequest(req).additionalModelRequestFields).toEqual({
+      thinking: { type: 'disabled' },
+    });
+  });
+
+  it('toKiroRequest + serializeKiroRequest:字段落在 wire 顶层,与 conversationState 平级', () => {
+    const req = baseMessagesRequest({ model: 'claude-opus-5', ...adaptive('low') });
+    const wire = JSON.parse(serializeKiroRequest(toKiroRequest(convertRequest(req))));
+    expect(Object.keys(wire).sort()).toEqual(['additionalModelRequestFields', 'conversationState']);
+    expect(wire.additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'low' },
+    });
+    // 非原生模型 / 未提 thinking:顶层不多出一个 undefined 键
+    const plain = JSON.parse(
+      serializeKiroRequest(
+        toKiroRequest(convertRequest(baseMessagesRequest({ model: 'claude-opus-4-6' }))),
+      ),
+    );
+    expect(Object.keys(plain)).toEqual(['conversationState']);
+  });
+
+  it('4.6 + thinking → 不注入任何前缀、不发顶层字段(旧模型用上游默认)', () => {
     const req = baseMessagesRequest({
       model: 'claude-opus-4-6',
-      thinking: { type: 'enabled', budget_tokens: 16000 },
-    });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toBeUndefined();
-  });
-
-  it('4.7 不传 thinking → 不注入 reasoning 字段', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-7',
-    });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toBeUndefined();
-  });
-
-  it('4.7 + thinking.type=disabled → 不注入 reasoning', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-7',
-      thinking: { type: 'disabled', budget_tokens: 0 },
-    });
-    const result = convertRequest(req);
-    expect(result.conversationState.currentMessage.userInputMessage.reasoning).toBeUndefined();
-  });
-
-  it('4.7 + thinking → 不注入 <thinking_mode> prompt 前缀（避免双重处理）', () => {
-    // 前缀(若有)折在首条 user 消息 = 单轮请求的 currentMessage;history 为空,扫 history
-    // 会让断言空转。两个分支都查:无 system(前缀单独成段)与有 system(前缀接在 system 前)。
-    for (const system of [undefined, [{ type: 'text', text: 'Be brief.' }]]) {
-      const req = baseMessagesRequest({
-        model: 'claude-opus-4-7',
-        thinking: { type: 'enabled', budget_tokens: 8000 },
-        system,
-        messages: [{ role: 'user', content: 'compute 1+1' }],
-      });
-      const result = convertRequest(req);
-      expect(result.conversationState.history).toHaveLength(0);
-      const content = result.conversationState.currentMessage.userInputMessage.content;
-      expect(content).not.toMatch(/<thinking_mode>/);
-      expect(content).not.toMatch(/<max_thinking_length>/);
-      expect(content.endsWith('compute 1+1')).toBe(true);
-    }
-  });
-
-  it('4.6 + thinking → 旧路径仍注入 <thinking_mode> prompt 前缀', () => {
-    const req = baseMessagesRequest({
-      model: 'claude-opus-4-6',
-      thinking: { type: 'enabled', budget_tokens: 8000 },
+      ...adaptive('max'),
       messages: [{ role: 'user', content: 'compute 1+1' }],
     });
     const result = convertRequest(req);
-    // 单轮请求:注入的前缀折在首条 user 消息 = currentMessage 的开头(history 为空,
-    // 网关不再造 system 假对话轮次)。
     expect(result.conversationState.history).toHaveLength(0);
-    expect(result.conversationState.currentMessage.userInputMessage.content).toMatch(
-      /^<thinking_mode>enabled<\/thinking_mode>/,
-    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe('compute 1+1');
+    expect(result.additionalModelRequestFields).toBeUndefined();
   });
 });
 

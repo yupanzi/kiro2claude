@@ -22,19 +22,18 @@
  *
  * ## Single source of truth for normalization
  *
- * `preprocessSystem` and `clampBudgetTokens` are imported from `types.ts`
- * so the schema and the existing hand-rolled code path produce identical
- * `system` and `thinking` shapes. The hand-rolled spread call in handlers
- * can be removed once this schema is wired in.
+ * `preprocessSystem` and `normalizeThinking` are imported from `types.ts`
+ * so the schema and every consumer see identical `system` and `thinking`
+ * shapes (`thinking` keeps only `type` + `display`; `budget_tokens` is dropped —
+ * only adaptive semantics are supported).
  */
 
 import { z } from 'zod';
 import {
   type CountTokensRequest,
-  clampBudgetTokens,
   type MessagesRequest,
+  normalizeThinking,
   preprocessSystem,
-  type Thinking,
 } from '../types.js';
 
 // ============================================================================
@@ -79,7 +78,7 @@ export const messagesRequestSchema = z
       system: preprocessSystem(raw.system),
       tools: raw.tools as MessagesRequest['tools'],
       tool_choice: raw.tool_choice,
-      thinking: clampBudgetTokens(raw.thinking as Thinking | undefined),
+      thinking: normalizeThinking(raw.thinking),
       output_config: raw.output_config as MessagesRequest['output_config'],
       metadata: raw.metadata as MessagesRequest['metadata'],
     };

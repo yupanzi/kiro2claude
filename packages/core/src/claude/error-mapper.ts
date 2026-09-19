@@ -75,6 +75,16 @@ export function classifyProviderError(err: unknown): ClassifiedProviderError {
           message:
             'Service quota exhausted. Please try again later or contact the service administrator.',
         };
+      case 'thinking_signature_invalid':
+        // Only reachable after the executor's one strip-retry also failed (or the
+        // body carried no reasoningContent to strip). Neutral wording, no upstream body.
+        log.warn({ msg: 'upstream rejected thinking signature', status: err.kind.status });
+        return {
+          status: 400,
+          errorType: 'invalid_request_error',
+          message:
+            'Invalid thinking signature in conversation history. Resend thinking blocks exactly as returned, or omit them.',
+        };
       case 'bad_request':
         log.warn({ msg: 'upstream: bad request', status: err.kind.status, body: err.body });
         // Do NOT forward `err.body` here — the upstream body can carry

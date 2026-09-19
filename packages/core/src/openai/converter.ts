@@ -12,7 +12,7 @@
  *   - tool 消息 → user 消息带 tool_result 块(tool_call_id → tool_use_id)。
  *   - tools[].function → {name,description,input_schema}。tool_choice='none' → 丢 tools。
  *   - reasoning_effort(minimal→low,其余透传) → thinking(adaptive)+output_config.effort
- *     → 经 mapThinkingToEffort 出 reasoning.effort。缺省不注入。
+ *     → 经 resolveEffort 出 effort(顶层 additionalModelRequestFields)。缺省不注入。
  */
 
 import type {
@@ -52,16 +52,14 @@ export function mapReasoningEffort(effort: string | undefined): string | undefin
 /**
  * Kiro effort 等级 → MessagesRequest 的 reasoning 注入(adaptive thinking +
  * output_config.effort)。effort 缺省 → 两者皆 undefined(走 baseline)。
- * Chat 与 Responses 两端共用。注:adaptive 路径的 effort **完全**由
- * output_config.effort 决定;budget_tokens 只在 type:'enabled' 分支被
- * mapThinkingToEffort 读取,故此处 20000 是占位值(adaptive 下不参与 effort 计算)。
+ * Chat 与 Responses 两端共用;effort **完全**由 output_config.effort 决定。
  */
 export function buildReasoningConfig(
   effort: string | undefined,
 ): Pick<MessagesRequest, 'thinking' | 'output_config'> {
   if (!effort) return { thinking: undefined, output_config: undefined };
   return {
-    thinking: { type: 'adaptive', budget_tokens: 20000 },
+    thinking: { type: 'adaptive' },
     output_config: { effort },
   };
 }

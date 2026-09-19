@@ -5,17 +5,12 @@
  * the production gateway. No account/token/header objects enter the report.
  */
 import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
 import type { AxiosResponse } from 'axios';
-import { loadCredentialsFromEnv } from '../../src/kiro/credentials-loader.js';
 import { type Event, eventFromFrame } from '../../src/kiro/model/events/base.js';
 import { MAX_MESSAGE_SIZE, parseFrame } from '../../src/kiro/parser/frame.js';
-import { KiroProvider } from '../../src/kiro/provider.js';
-import { ProviderError } from '../../src/kiro/provider-error.js';
-import { SingleTokenManager } from '../../src/kiro/token-manager.js';
-import { loadConfigFromEnv } from '../../src/model/config.js';
-import { logger } from '../../src/shared/logger.js';
+import type { KiroProvider } from '../../src/kiro/provider.js';
 import { buildExceptionFrame } from '../helpers/event-stream.js';
+import { createRealUpstream } from './_real-provider.js';
 
 type Obj = Record<string, any>;
 export type LiveProvider = Pick<KiroProvider, 'callApiStream' | 'callApi' | 'callMcp'>;
@@ -45,25 +40,7 @@ type FaultKind = (typeof plan)[number]['kind'];
 let realProvider: KiroProvider | undefined;
 
 function getRealProvider(): KiroProvider {
-  if (realProvider) return realProvider;
-  try {
-    process.loadEnvFile(fileURLToPath(new URL('../../../../.env', import.meta.url)));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  // These loaders are synchronous: silence their credential-source diagnostics
-  // without suppressing any other asynchronous request's logging.
-  const level = logger.level;
-  try {
-    logger.level = 'silent';
-    const config = loadConfigFromEnv();
-    const loaded = loadCredentialsFromEnv();
-    realProvider = new KiroProvider(
-      new SingleTokenManager(config, loaded.credentials, loaded.source),
-    );
-  } finally {
-    logger.level = level;
-  }
+  realProvider ??= createRealUpstream().provider;
   return realProvider;
 }
 

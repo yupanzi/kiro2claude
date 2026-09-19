@@ -31,21 +31,14 @@ export interface UserInputMessage {
   modelId: string;
   images: KiroImage[];
   origin?: string;
-  /**
-   * kiro-cli 2.6.0+ 原生 reasoning 配置（仅 currentMessage 上设置）。
-   * 等价于 kiro-cli `--effort <level>` flag，让上游决定 thinking 强度。
-   * 仅对支持 native reasoning 的 model（4.7/4.8）有效，其它 model 上忽略。
-   */
-  reasoning?: ReasoningConfig;
 }
 
-/** Kiro 原生 reasoning effort 等级（与 kiro-cli `--effort` 取值一一对应） */
+/**
+ * Kiro 原生 reasoning effort 等级(与 kiro-cli `--effort` 取值一致)。生效位置是请求顶层
+ * `additionalModelRequestFields`(见 `requests/kiro.ts`);`UserInputMessage` 上没有 reasoning
+ * 字段,上游不认。
+ */
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-
-/** kiro-cli wire format: `userInputMessage.reasoning` 字段 */
-export interface ReasoningConfig {
-  effort: EffortLevel;
-}
 
 // 工厂只铺结构占位：`content`、`modelId`、`images`、空 `userInputMessageContext`。
 // 语义字段（`origin`、`envState`）全部由 converter 层在每次请求处理时注入——
@@ -121,21 +114,30 @@ export function createUserMessage(content: string, modelId: string): UserMessage
   };
 }
 
+/**
+ * history 里 assistant 上一轮推理的 wire 形态,与 Anthropic 的 `thinking` / `redacted_thinking`
+ * 块一一对应:Claude `{reasoningText:{text, signature}}`——signature 必填且须有效,否则上游
+ * 400 `THINKING_SIGNATURE_INVALID`;GPT `{redactedContent}`。不拼成 `<thinking>` 文本混进
+ * `content`。签名失效由 `RetryExecutor` 剥掉重发一次(`stripReasoningContent`)。
+ */
+export type ReasoningContent =
+  | { reasoningText: { text: string; signature: string } }
+  | { redactedContent: string };
+
 /** 助手消息（历史记录中使用） */
 export interface AssistantMessage {
   content: string;
   toolUses?: ToolUseEntry[];
+  /** 上一轮推理的原生回传,形态与红线见 {@link ReasoningContent}。 */
+  reasoningContent?: ReasoningContent;
   /**
-   * 客户端生成的 UUID v4。kiro-cli 2.21.1 实测：**只在带 `toolUses` 的那条** assistant
-   * 消息上出现；用伪造的 event-stream 驱动、流里没有该字段时它照样生成，可见是本地产的
-   * 而非上游回传。用途看着是遥测关联（与 `SendTelemetryEvent` 的
-   * `chatAddMessageEvent.messageId` 同名），网关不发遥测、功能上不依赖它——补它只为
-   * 伪装画像不漏字段。由 `attachToolUses` 统一设置。
+   * 客户端生成的 UUID v4。kiro-cli 实测只在带 `toolUses` 的 assistant 消息上出现(新版也见于只有
+   * `reasoningContent` 的那条),流里没有该字段它照样生成,是本地产的。用途看着是遥测关联,网关
+   * 不发遥测、功能上不依赖它——补它只为伪装画像不漏字段。本项目只在带 toolUses 时补
+   * (`attachToolUses`),上游两种都收。
    *
-   * ★ **每条消息一个,不是每次请求一个**。2.21.1 探针实测(伪造 event-stream 驱动 246 轮
-   * 工具往返):同一条 assistant 消息的 messageId 在**全部 246 个**请求里恒为同一个值
-   * ——kiro-cli 收到消息时铸一次、随历史持久化。故本项目也必须**确定性派生**,见
-   * `deriveMessageId`。
+   * ★ 每条消息一个,不是每次请求一个:kiro-cli 收到消息时铸一次、随历史持久化,同一条消息的
+   * messageId 在后续所有请求里恒定。故本项目必须确定性派生,见 `deriveMessageId`。
    */
   messageId?: string;
 }

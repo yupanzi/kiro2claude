@@ -11,7 +11,6 @@
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
-import type { KiroRequest } from '../kiro/model/requests/kiro.js';
 import { serializeKiroRequest } from '../kiro/model/requests/kiro.js';
 import type { KiroProvider } from '../kiro/provider.js';
 import type { HookBus } from '../plugin-host/index.js';
@@ -23,6 +22,7 @@ import {
   type ConversionResult,
   clientModelHasEncryptedReasoning,
   convertRequest,
+  toKiroRequest,
 } from './converter.js';
 import { captureEmptyRequest, type MessageHandlerResult } from './empty-capture.js';
 import { mapConversionError } from './error-mapper.js';
@@ -79,8 +79,8 @@ export function createPostMessages(deps: PostMessagesDeps) {
     const log = getLogger();
 
     // Runtime-validate the request body via zod. The schema transform also
-    // normalizes `system` (string → [{text}]) and clamps `thinking.budget_tokens`,
-    // replacing the old `preprocessSystem` / `clampBudgetTokens` spread.
+    // normalizes `system` (string → [{text}]) and `thinking` (type + display only;
+    // budget_tokens is not supported and dropped).
     const parseResult = messagesRequestSchema.safeParse(request.body);
     if (!parseResult.success) {
       const errorMessage = formatRequestError(parseResult.error);
@@ -147,9 +147,7 @@ export function createPostMessages(deps: PostMessagesDeps) {
     }
 
     // Build Kiro request
-    const kiroRequest: KiroRequest = {
-      conversationState: conversionResult.conversationState,
-    };
+    const kiroRequest = toKiroRequest(conversionResult);
 
     let requestBody: string;
     try {

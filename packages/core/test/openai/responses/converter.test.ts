@@ -127,7 +127,7 @@ describe('convertResponsesRequest', () => {
     );
     expect(r.tools).toEqual([{ name: 'f', description: 'd', input_schema: { type: 'object' } }]);
     expect(r.output_config).toEqual({ effort: 'high' });
-    expect(r.thinking).toEqual({ type: 'adaptive', budget_tokens: 20000 });
+    expect(r.thinking).toEqual({ type: 'adaptive' });
   });
 
   it('input_image data URI → image 块', () => {

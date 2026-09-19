@@ -5,6 +5,9 @@
 | 脚本 | 用途 |
 |---|---|
 | `_harness.mjs` | 所有脚本共用:env / 发请求 / 解 SSE / 号段校验 / **两套协议不变量** / 汇总退出码。新脚本从这里拿,别各写一份缩水的不变量集 |
+| `kiro-cli-capture-proxy.mjs` 💰 | 转发型录制代理:kiro-cli(V2 三个 endpoint setting / V3 KAS `--endpoint`)→ 本机端口 → 真实上游,请求脱敏、响应原始字节 + 解码帧落盘;看上游怎么回、下一轮 history 怎么回传 |
+| `reasoning-roundtrip-live.mjs` 💰 | 走网关的原生 reasoning 验收:签名回传 / 坏签名剥离重试 / `display: omitted` / effort 计费 / GPT·sonnet-4.6 / 流式不变量;改 thinking·effort 相关 converter **必跑** |
+| `reasoning-wire-probe.ts` 💰 | 直打上游:effort 放法 × thinking disabled/omitted × 顶层 systemPrompt × history `reasoningContent` 正常/坏签名/无签名 × `KiroRuntimeService` target;`K2C_PROBE_ONLY` 挑场景、`K2C_PROBE_PROMPT` 换题 |
 | `kiro-cli-probe.ts` | 反向驱动真实 kiro-cli:伪造 event-stream 让它执行工具、注入错误码看重试策略、`PROBE_STREAM_SHAPE=text-eof` 看它对无尾帧 EOF 的处理 |
 | `protocol-integrity.mjs` / `backpressure-integrity.mjs` / `concurrency-integrity.mjs` | 流式完整性三件套:确定性序列 + 协议不变量(block start/stop 配对、`message_delta` 恰一次、Responses `sequence_number` 无洞、done 回填 == delta 累积)/ 慢客户端背压下终结段是否完整 / 并发号段隔离(混入外区间数字即串扰) |
 | `opus5-effort-matrix.mjs` 💰 / `gpt-tool-matrix.mjs` 💰 | 手工点验矩阵:Opus 5 走 Messages(effort × tools/images/search);GPT 工具往返(effort × 协议 × 流/非流,可选图片)。不重试,失败原样留在报告里(`K2C_REPORT_DIR`) |

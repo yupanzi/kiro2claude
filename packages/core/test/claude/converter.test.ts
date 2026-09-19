@@ -894,7 +894,7 @@ describe('convertRequest - system text folds into the first user message', () =>
   // user 文本进模型。契约:前置到**首条** user 消息正文,不造任何 assistant 轮次(旧实现的
   // `user: system / assistant: "I will follow these instructions."` 假对话对已移除,见
   // test/static/no-fabricated-turns.test.ts)。baseRequest 的 claude-sonnet-4 非原生 reasoning,
-  // 未开 thinking 时无 `<thinking_mode>` 前缀,故可以整串 toBe 精确钉形态。
+  // 网关不注入任何 thinking 前缀,故可以整串 toBe 精确钉形态。
   const SYSTEM = 'You are a helpful coding assistant.';
   const withSystem = (messages: MessagesRequest['messages']) =>
     convertRequest(baseRequest({ system: [{ type: 'text', text: SYSTEM }], messages }));
@@ -1177,111 +1177,59 @@ describe('convertRequest - identity override', () => {
     }
   });
 
-  it('identityOverride: true + legacy thinking: prefix, then system, then directive, then user text', () => {
+  it('identityOverride: true + thinking on a non-native model: no prefix, system, directive, user text', () => {
     const result = convertRequest(
       baseRequest({
         system: [{ type: 'text', text: SYSTEM }],
         messages: [{ role: 'user', content: 'hello' }],
-        thinking: { type: 'enabled', budget_tokens: 8000 },
+        thinking: { type: 'adaptive' },
       }),
       { identityOverride: true },
     );
     expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
-      `<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>\n${SYSTEM}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}\n\nhello`,
+      `${SYSTEM}\n\n${IDENTITY_OVERRIDE_DIRECTIVE}\n\nhello`,
     );
   });
 });
 
-describe('convertRequest - thinking prefix injection', () => {
-  // 请求侧 `<thinking_mode>` 注入的回归覆盖(与身份覆写正交,这里只钉 thinking)。
-  // baseRequest 的 claude-sonnet-4 非原生 reasoning,故 thinking 走 prompt 前缀注入路径。
-  const thinking = { type: 'enabled' as const, budget_tokens: 8000 };
-  const TAG =
-    '<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>';
+describe('convertRequest - non-native models get no thinking control at all', () => {
+  // baseRequest 的 claude-sonnet-4 非原生 reasoning:thinking / effort 对它无效(不发字段、
+  // 不注入提示词前缀),请求原样上送、走上游默认。
+  const thinking = { type: 'adaptive' as const };
 
-  it('thinking enabled (no system): prefix heads the first user message', () => {
+  it('thinking (no system): user text is sent untouched, no prefix, no top-level fields', () => {
     const result = convertRequest(
       baseRequest({ messages: [{ role: 'user', content: 'hello' }], thinking }),
     );
     expect(result.conversationState.history).toHaveLength(0);
-    expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
-      `${TAG}\n\nhello`,
-    );
+    expect(result.conversationState.currentMessage.userInputMessage.content).toBe('hello');
+    expect(result.additionalModelRequestFields).toBeUndefined();
   });
 
-  it('thinking enabled + system: prefix, newline, system, then the user text', () => {
+  it('thinking + system: system, then the user text — nothing else', () => {
     const result = convertRequest(
       baseRequest({
         system: [{ type: 'text', text: 'Be brief.' }],
         messages: [{ role: 'user', content: 'hello' }],
         thinking,
+        output_config: { effort: 'max' },
       }),
     );
     expect(result.conversationState.currentMessage.userInputMessage.content).toBe(
-      `${TAG}\nBe brief.\n\nhello`,
+      'Be brief.\n\nhello',
     );
+    expect(JSON.stringify(result)).not.toContain('<thinking_mode>');
   });
 
-  it('empty system (text: "") + thinking: byte-identical to no-system + thinking', () => {
-    // 回归:存在判断基于拼接后的 systemContent 真值而非 req.system 数组长度。
-    const withEmptySystem = convertRequest(
-      baseRequest({
-        system: [{ type: 'text', text: '' }],
-        messages: [{ role: 'user', content: 'hi' }],
-        thinking,
-      }),
-    );
-    const withNoSystem = convertRequest(
-      baseRequest({ messages: [{ role: 'user', content: 'hi' }], thinking }),
-    );
-    expect(withEmptySystem.conversationState.currentMessage).toEqual(
-      withNoSystem.conversationState.currentMessage,
-    );
-    expect(withNoSystem.conversationState.currentMessage.userInputMessage.content).toBe(
-      `${TAG}\n\nhi`,
-    );
-  });
-
-  it('client system already carrying thinking tags is not doubled', () => {
-    const result = convertRequest(
-      baseRequest({
-        system: [{ type: 'text', text: '<thinking_mode>enabled</thinking_mode> Be brief.' }],
-        messages: [{ role: 'user', content: 'hello' }],
-        thinking,
-      }),
-    );
-    const content = result.conversationState.currentMessage.userInputMessage.content;
-    expect(content.split('<thinking_mode>').length - 1).toBe(1);
-  });
-
-  it('first user text already carrying a thinking block is not doubled (no system)', () => {
-    // The prefix is joined to the first user message, so that message is the text
-    // that can already carry the block; the dedup must look there, not only at
-    // the request system text.
-    const tagged =
-      '<thinking_mode>enabled</thinking_mode><max_thinking_length>8000</max_thinking_length>\nhello';
+  it('client text that itself contains <thinking_mode> passes through verbatim', () => {
+    const tagged = '<thinking_mode>enabled</thinking_mode>\nhello';
     const result = convertRequest(
       baseRequest({ messages: [{ role: 'user', content: tagged }], thinking }),
     );
     expect(result.conversationState.currentMessage.userInputMessage.content).toBe(tagged);
   });
 
-  it('a system prompt that merely mentions <thinking_mode> in prose keeps the prefix', () => {
-    // Only a complete tag block counts as "already tagged"; a bare mention is not
-    // one, otherwise extended thinking would silently switch off with no log.
-    const result = convertRequest(
-      baseRequest({
-        system: [{ type: 'text', text: 'Never emit literal <thinking_mode> tags in replies.' }],
-        messages: [{ role: 'user', content: 'hello' }],
-        thinking,
-      }),
-    );
-    expect(result.conversationState.currentMessage.userInputMessage.content).toMatch(
-      /^<thinking_mode>enabled<\/thinking_mode>/,
-    );
-  });
-
-  it('native-reasoning model: no prompt prefix, effort rides the wire field instead', () => {
+  it('native-reasoning model: effort rides the top-level wire field', () => {
     const result = convertRequest(
       baseRequest({
         model: 'claude-opus-5',
@@ -1291,7 +1239,11 @@ describe('convertRequest - thinking prefix injection', () => {
     );
     const current = result.conversationState.currentMessage.userInputMessage;
     expect(current.content).toBe('hello');
-    expect(current.reasoning).toBeDefined();
+    expect((current as unknown as Record<string, unknown>).reasoning).toBeUndefined();
+    expect(result.additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
+    });
   });
 });
 

@@ -19,6 +19,9 @@
  * - `bad_request`      — generic 400 that doesn't match a more specific kind
  * - `context_window_full` — 400 with CONTENT_LENGTH_EXCEEDS_THRESHOLD
  * - `input_too_long`   — 400 with "Input is too long"
+ * - `thinking_signature_invalid` — 400 with reason THINKING_SIGNATURE_INVALID (a history
+ *                        `reasoningContent` signature is missing / corrupted / from another
+ *                        model); the executor strips reasoningContent and retries once.
  * - `unauthorized`     — 401/403, optionally flagged as bearer invalidation
  * - `rate_limited`     — 429 specifically; carries optional retryAfterSeconds
  *                        from upstream Retry-After header. Distinguished from
@@ -38,6 +41,7 @@ export type ProviderErrorKind =
   | { kind: 'bad_request'; status: number }
   | { kind: 'context_window_full'; status: number }
   | { kind: 'input_too_long'; status: number }
+  | { kind: 'thinking_signature_invalid'; status: number }
   | { kind: 'unauthorized'; status: number; bearerInvalid: boolean }
   | { kind: 'rate_limited'; status: 429; retryAfterSeconds?: number }
   | {
@@ -72,6 +76,8 @@ function defaultMessage(kind: ProviderErrorKind, body: string): string {
       return `Kiro API: context window full (HTTP ${kind.status}): ${truncate(body)}`;
     case 'input_too_long':
       return `Kiro API: input too long (HTTP ${kind.status}): ${truncate(body)}`;
+    case 'thinking_signature_invalid':
+      return `Kiro API: thinking signature invalid (HTTP ${kind.status}): ${truncate(body)}`;
     case 'unauthorized':
       return `Kiro API unauthorized (HTTP ${kind.status}, bearerInvalid=${kind.bearerInvalid}): ${truncate(body)}`;
     case 'rate_limited':
@@ -116,7 +122,13 @@ export function classifyErrorBody(
 ):
   | Extract<
       ProviderErrorKind,
-      { kind: 'context_window_full' | 'input_too_long' | 'quota_exhausted' }
+      {
+        kind:
+          | 'context_window_full'
+          | 'input_too_long'
+          | 'quota_exhausted'
+          | 'thinking_signature_invalid';
+      }
     >
   | undefined {
   if (status === 402 && isMonthlyRequestLimitBody(body)) {
@@ -127,6 +139,10 @@ export function classifyErrorBody(
   }
   if (body.includes('Input is too long')) {
     return { kind: 'input_too_long', status };
+  }
+  // 上游 reason 字段与 Anthropic 同名,message 形如「Invalid `signature` in `thinking` block」。
+  if (body.includes('THINKING_SIGNATURE_INVALID')) {
+    return { kind: 'thinking_signature_invalid', status };
   }
   return undefined;
 }

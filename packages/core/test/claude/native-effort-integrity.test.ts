@@ -26,9 +26,17 @@ describe.each(protocols)('%s native effort and reasoning failure boundaries', (p
   }) => {
     const callApiStream = vi.fn(async (requestBody: string) => {
       // Assert the converter's actual outgoing fields, not the request label.
-      const userInput = JSON.parse(requestBody).conversationState.currentMessage.userInputMessage;
+      const wire = JSON.parse(requestBody);
+      const userInput = wire.conversationState.currentMessage.userInputMessage;
       expect(userInput.modelId).toBe(model);
-      expect(userInput.reasoning).toEqual({ effort });
+      // effort 唯一生效的位置是请求顶层 additionalModelRequestFields(证据见 PITFALLS
+      // 「原生 reasoning / effort / system 的 wire 真相」),三个协议入口都必须落到这里。
+      expect(userInput.reasoning).toBeUndefined();
+      expect(wire.additionalModelRequestFields).toEqual(
+        model === 'claude-opus-5'
+          ? { thinking: { type: 'adaptive' }, output_config: { effort } }
+          : { reasoning: { effort } },
+      );
       expect(requestBody).not.toContain('<thinking_mode>');
       const data = (async function* () {
         // Claude reasoning commits visible thinking; GPT reasoning remains

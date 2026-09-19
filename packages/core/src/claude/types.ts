@@ -31,19 +31,23 @@ export interface ModelsResponse {
 
 // === Messages endpoint types ===
 
-/** Maximum thinking budget tokens */
-const MAX_BUDGET_TOKENS = 24576;
-
-/** Thinking configuration */
+/**
+ * Thinking 配置,只有 adaptive 语义:effort 由 `output_config.effort` 决定(缺省 high);客户端的
+ * `enabled` 在 `normalizeThinking` 归一成 `adaptive`,`budget_tokens` 丢弃(Kiro wire 没有预算
+ * 字段)。`type` 只有两个值,下游不必各自判断。
+ */
 export interface Thinking {
-  type: 'enabled' | 'disabled' | 'adaptive';
-  budget_tokens: number;
+  type: 'adaptive' | 'disabled';
+  /**
+   * Anthropic `thinking.display`(Claude Code 2.1.278 起发 `omitted`):`omitted` = 不回
+   * 思考文本、只回可回传的签名。上游 Kiro 的模型 schema 有同名同值字段,原样透传。
+   */
+  display?: 'summarized' | 'omitted';
 }
 
-/** Check if thinking is enabled (enabled or adaptive) */
+/** Check if thinking is on (`enabled` was already normalized to `adaptive` at the edge). */
 export function isThinkingEnabled(thinking: Thinking | undefined): boolean {
-  if (!thinking) return false;
-  return thinking.type === 'enabled' || thinking.type === 'adaptive';
+  return thinking?.type === 'adaptive';
 }
 
 /** OutputConfig configuration */
@@ -98,15 +102,19 @@ export function preprocessSystem(raw: unknown): SystemMessage[] | undefined {
 }
 
 /**
- * Clamp budget_tokens to MAX_BUDGET_TOKENS, defaulting to 20000 if absent.
+ * 把客户端的 `thinking` 收窄成网关认的形状:`enabled` / `adaptive` → `adaptive`,`disabled` 原样,
+ * 其它视为未提;只留 `display`,丢掉其它字段(含 `budget_tokens`)。
  */
-export function clampBudgetTokens(thinking: Thinking | undefined): Thinking | undefined {
-  if (!thinking) return undefined;
-  const budgetTokens = thinking.budget_tokens ?? 20000;
-  return {
-    ...thinking,
-    budget_tokens: Math.min(budgetTokens, MAX_BUDGET_TOKENS),
-  };
+export function normalizeThinking(raw: unknown): Thinking | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const { type, display } = raw as { type?: unknown; display?: unknown };
+  let normalized: Thinking['type'];
+  if (type === 'enabled' || type === 'adaptive') normalized = 'adaptive';
+  else if (type === 'disabled') normalized = 'disabled';
+  else return undefined;
+  const out: Thinking = { type: normalized };
+  if (display === 'summarized' || display === 'omitted') out.display = display;
+  return out;
 }
 
 /** Message */
@@ -154,6 +162,10 @@ export interface ContentBlock {
   type: string;
   text?: string;
   thinking?: string;
+  /** `thinking` 块的签名——上游据此校验并还原上一轮推理;没有它的 thinking 块不上 wire。 */
+  signature?: string;
+  /** `redacted_thinking` 块的加密 blob(base64)。 */
+  data?: string;
   tool_use_id?: string;
   content?: unknown;
   name?: string;

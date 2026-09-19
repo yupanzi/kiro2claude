@@ -6,7 +6,7 @@
  *   - 本文件用 claude-opus-4.7 / 4.8 走原生路径（wire 字段 + reasoningContentEvent）
  *
  * 覆盖矩阵（每个 case 真发上游一次，消耗真实 token quota）：
- *   - 非流式: adaptive + 5 个 effort 等级、enabled + budget_tokens 阈值、baseline
+ *   - 非流式: adaptive + 5 个 effort 等级、enabled(视同 adaptive)、baseline
  *   - 流式: SSE 序列含 thinking_delta + signature_delta
  *   - tool_use 组合: reasoning block 必须出现在 tool_use 之前
  *   - 4.8 model: 验证原生路径同样工作
@@ -166,7 +166,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'max' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -206,7 +206,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'low' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -225,11 +225,11 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
   );
 
   // --------------------------------------------------------------------------
-  // C. 非流式 + 4.7 + enabled + budget_tokens=16384
-  //    验证：budget_tokens 阈值映射成 effort=xhigh，仍走原生路径
+  // C. 非流式 + 4.7 + enabled(视同 adaptive,budget_tokens 已不支持)
+  //    验证:enabled 仍走原生路径,effort 取默认 high
   // --------------------------------------------------------------------------
   it(
-    'C. 4.7 + enabled + budget_tokens → thinking block (budget_tokens path)',
+    'C. 4.7 + enabled(视同 adaptive)→ thinking block',
     async () => {
       const res = await app.inject({
         method: 'POST',
@@ -238,7 +238,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
-          thinking: { type: 'enabled', budget_tokens: 16384 },
+          thinking: { type: 'enabled' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
       });
@@ -295,7 +295,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-8',
           max_tokens: 1500,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -327,7 +327,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -402,7 +402,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           tools: [calcTool],
           messages: [
@@ -456,7 +456,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
   //    实事求是验证: 4.7 自决跳过 reasoning 时，我们的代码不能：
   //      - 产生空的 thinking content block
   //      - 错误地挂上 signature 字段
-  //    同时仍要正确传递 reasoning.effort 字段给上游让 model 自己决定。
+  //    同时仍要正确传递顶层 additionalModelRequestFields 给上游让 model 自己决定。
   //
   //    G 验证"reasoning 出现时不变量"，K 验证"reasoning 不出现时不变量"。
   //    两案合起来覆盖非流式 + 流式状态机所有分支。
@@ -471,7 +471,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-7',
           max_tokens: 500,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'max' },
           // 实测 4.7 对极简算术高概率跳过 reasoning
           messages: [{ role: 'user', content: 'In one sentence: what is 1+1?' }],
@@ -516,7 +516,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-4-6',
           max_tokens: 2000,
-          thinking: { type: 'enabled', budget_tokens: 4000 },
+          thinking: { type: 'adaptive' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
       });
@@ -554,7 +554,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
           model: 'claude-opus-4-8',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -587,7 +587,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
   );
 
   // --------------------------------------------------------------------------
-  // J. 流式 + 4.7 + enabled + budget_tokens=16384
+  // J. 流式 + 4.7 + enabled(视同 adaptive)
   //    验证：enabled 通道在流式下也正确——双通道映射成 effort + 状态机健壮性。
   //
   //    与 G 类似，承认 e2e 不能假设上游必发 reasoning（4.7 自决高概率跳过）。
@@ -597,7 +597,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
   //    与 F 互补：F 验 adaptive 通道，J 验 enabled 通道；不变量集相同。
   // --------------------------------------------------------------------------
   it(
-    'J. 4.7 + enabled + budget_tokens + stream → enabled channel works, stream sound',
+    'J. 4.7 + enabled + stream → adaptive channel works, stream sound',
     async () => {
       const res = await app.inject({
         method: 'POST',
@@ -607,7 +607,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
           model: 'claude-opus-4-7',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'enabled', budget_tokens: 16384 },
+          thinking: { type: 'enabled' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
       });
@@ -637,9 +637,9 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
   // --------------------------------------------------------------------------
   // L. 非流式 + Opus 5 + adaptive + effort=high
   //    验证：opus-5（上游 modelId claude-opus-5，**无小数点**）比照 4.7/4.8 走
-  //    原生 reasoning 路径 —— 上游接受 reasoning.effort wire 字段、回明文 thinking
+  //    原生 reasoning 路径 —— 上游接受顶层 additionalModelRequestFields、回明文 thinking
   //    + signature。若上游不响应该字段（opus-5 非 native），因 opus-5 已在
-  //    MODELS_WITH_NATIVE_REASONING、`<thinking_mode>` prompt 被跳过 → 完全无
+  //    MODELS_WITH_NATIVE_REASONING、非原生模型又没有任何前缀 → 完全无
   //    thinking，thinkingBlock 断言会失败 —— 即回退非-native 的信号。
   // --------------------------------------------------------------------------
   it(
@@ -652,7 +652,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
         payload: {
           model: 'claude-opus-5',
           max_tokens: 1500,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },
@@ -687,7 +687,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro-cli 2.6.0+ native reasoning', () => {
           model: 'claude-opus-5',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'adaptive', budget_tokens: 20000 },
+          thinking: { type: 'adaptive' },
           output_config: { effort: 'high' },
           messages: [{ role: 'user', content: REASONING_PROMPT }],
         },

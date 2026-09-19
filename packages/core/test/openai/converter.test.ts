@@ -180,7 +180,7 @@ describe('convertOpenAiRequest: tools / tool_choice', () => {
 describe('convertOpenAiRequest: reasoning_effort → thinking/output_config', () => {
   it('minimal → low', () => {
     const r = convertOpenAiRequest(base({ reasoning_effort: 'minimal' }));
-    expect(r.thinking).toEqual({ type: 'adaptive', budget_tokens: 20000 });
+    expect(r.thinking).toEqual({ type: 'adaptive' });
     expect(r.output_config).toEqual({ effort: 'low' });
   });
 

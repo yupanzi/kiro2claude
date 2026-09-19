@@ -13,7 +13,7 @@
 ## 亮点
 
 - **双协议、三端点**——`/claude/v1`(Messages)+ `/openai/v1`(Chat Completions & Responses)。一套凭据同时喂 Anthropic 和 OpenAI 生态,不用起两个服务。
-- **模型全,reasoning 原生**——Claude 全系 + GPT-5.6(Sol / Terra / Luna)。Extended Thinking、`reasoning_effort` 直接映射 Kiro 原生 reasoning,不靠 prompt 硬凑。
+- **模型全,reasoning 原生**——Claude 全系 + GPT-5.6(Sol / Terra / Luna)。Extended Thinking(adaptive)与 `reasoning_effort` 直接映射 Kiro 原生 reasoning,不靠 prompt 硬凑。
 - **真客户端跑通,不只是"兼容 SDK"**——Claude Code、Codex CLI 的对话 + 工具调用端到端实测过(harness 在 [`tools/`](./tools/))。
 - **替你抠上游的坑**——工具调用文本救援、空流自动重试、`/api/*` 去插件字段镜像:把 Kiro 的偶发毛病在网关层吸收掉,客户端无感。
 - **插件化,全 MIT**——计量、credit 反演都是插件,经 [`@kiro2claude/plugin-api`](./packages/plugin-api/) 契约接入;写自己的插件不用碰 core。
@@ -134,6 +134,8 @@ pnpm workspace,Node ≥ 22 / TypeScript / ES Modules。husky pre-commit 强制 `
 - **continuation 文案偶发进正文**:请求以 assistant 结尾时(prefill 或上轮中断的续接),Kiro 只接受 user 作为当前消息,网关把该 assistant 内容留在历史并追加一句续写指令。实测 7 次里 2 次模型把指令句尾复述进可见输出。相比修复前(prefill 场景 3/3 破损)是净改进,但不到 100%,也不是字节级 prefill。
 - **客户端省略的历史无法还原**:上轮的 thinking、被自动压缩掉的内容不再随请求发来时,网关没有跨请求存储,不擅自复活。Claude Code 自动压缩(实测约第 50 个请求触发)保留主线任务与未完成项,但会丢部分 API 签名、返回结构、错误码拼写等细节。
 - **GPT 加密 reasoning 不可见**:上游只给加密 blob,没有可重放的输入字段,网关不伪装成明文。
+- **旧模型不做 thinking 控制**:opus-4.6 及以下、haiku 没有原生 reasoning,网关不注入提示词也不发字段,`thinking` / `-thinking` 后缀对它们无效,走上游默认。
+- **无签名的历史 thinking 不回传**:thinking 块要带上游给的 `signature` 才走原生 `reasoningContent`;无签名的(旧模型文本解码、Codex reasoning summary)丢弃,不拼成文本;签名失效时网关剥掉全部历史推理重发一次。
 - **多张图片只能靠位置归属**:Kiro wire 只有消息级 `images[]`,tool_result 里放图上游静默丢弃、正文是纯字符串,所以「这张图属于哪个工具调用」在 wire 上表达不了。网关做了三件事:tool_result 按 tool_use 顺序规范化、tool_result 内占位符带序号、消息里 ≥2 张 tool_result 图时在正文前置一行 `[Attached images, in order: image k = …]` 图例。2026-09-09 真实上游实测:6 个并行 Read 各回一张图,无图例时两个模型 4/4 错位,有图例 4/4 全对;Docker 里真实 Claude Code / Codex 读 4–6 张不同数字图能正确对应文件。仍不可控的是模型自己的判断:GPT-5.6 对两张字节相同的图稳定答「1 张」(token 计数证明两张都送到了),以及对低分辨率点阵数字偶发误读一位。真实复跑:`packages/core/test/manual/multi-image-attribution-probe.mjs`(API)与 `multi-image-cli-probe.mjs`(Docker 真 CLI,计费)。
 - **错误前已输出的文字留在客户端历史**:上游中途报错时,之前已流出的正文客户端已经收到并保存;保留原文不等于它经过验证。
 - **Claude Code 2.1.263 的 Unicode 转义改写(客户端侧)**:工具参数里字面的 `\u0000` / `\u000a` JSON 转义序列会被 CLI 还原成真实 NUL / LF,导致 Bash 参数校验失败、Write 写坏源码。绕过网关直连 Anthropic 同样复现,整块 / 7 字符 / 逐字符 / `\u005c` 等价编码四种分片方式无一幸免。网关不做双重转义、不改写工具命令。零上游复现:`packages/core/test/manual/claude-unicode-input-probe.mjs`。

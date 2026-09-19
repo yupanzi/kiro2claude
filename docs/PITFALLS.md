@@ -6,13 +6,15 @@
 
 ### 注入文本
 
-Kiro `conversationState` 只有 user/assistant,`userInputMessageContext.additionalContext`(Smithy 模型里唯一像上下文通道的结构化字段)上游 200 但**静默丢弃**(2026-09-10 直连实测:塞进去的秘密码模型答 UNKNOWN、指令被无视、input token 不变)。所以 system 文本 = `buildSystemPrefix`(客户端 system + 旧模型 `<thinking_mode>` 前缀 + 可选身份指令)→ `foldSystemIntoFirstUserMessage` 在 **Kiro 消息层**拼到首条 user 消息最前(首轮 = currentMessage,之后 = history 首条 user;图例之后拼,字符串 / 块数组 content 字节一致);后续 user 轮次(含纯 tool_result)原文不动;末尾 user 连串整体 = 当前轮(Anthropic 语义),history 必以 assistant 收尾。
+Kiro `conversationState` 只有 user/assistant,`userInputMessageContext.additionalContext`(Smithy 模型里唯一像上下文通道的结构化字段)上游 200 但**静默丢弃**(2026-09-10 直连实测:塞进去的秘密码模型答 UNKNOWN、指令被无视、input token 不变)。所以 system 文本 = `buildSystemPrefix`(客户端 system + 可选身份指令,不含任何 thinking 前缀)→ `foldSystemIntoFirstUserMessage` 在 **Kiro 消息层**拼到首条 user 消息最前(首轮 = currentMessage,之后 = history 首条 user;图例之后拼,字符串 / 块数组 content 字节一致);后续 user 轮次(含纯 tool_result)原文不动;末尾 user 连串整体 = 当前轮(Anthropic 语义),history 必以 assistant 收尾。
 
 **已移除**的两个合成轮次:开场 `user: system / assistant: "I will follow these instructions."`(抄 kiro-cli 的形态)与末尾补 `assistant: "OK"`。前者会被模型当真实历史逐字引用(零注入基线答 NONE),后者让同一段对话在下一轮被 `mergeUserMessages` 合并、形态随轮次漂移。长上下文 + 真实工具执行的 A/B 证明两者零收益,数据在 `foldSystemIntoFirstUserMessage` / `buildHistory` 头注释。**身份覆写与注入方式无关地不可靠**(user 级权重压不过上游系统提示)→ `KIRO2CLAUDE_IDENTITY_OVERRIDE` 默认关,数据在 `IDENTITY_OVERRIDE_DIRECTIVE` 头注释。
 
 **中途插入的内容**(2026-09-11 专项):录得的 5923 条真实 Claude Code 请求里 2023 条含 `role:system` 消息,**永远紧跟一条 user 之后**(中途 3730 条是字符串、收尾 176 条是文本块数组;内容是权限模式指令 / 「文件已在磁盘上变更」/ `<total_tokens>`)。只走 `foldSystemMessages` 折进相邻 user 轮,重放全部零丢失、收尾的落 currentMessage、中途的落对应 history user;7 种形态(收尾 / 中途 system、tool_result 后排队的用户文本、ESC 打断工具 / 文本、首条 reminder、assistant 起手)真实上游 nonce 7/7 回,**assistant 起手的 history 上游接受**(Kiro 不要求 user 起手)。顺手修掉三处同根问题:① system 前缀改在 Kiro 消息层拼——此前折进 ClaudeMessage,字符串 content 得 `SYS\n\nx` 而块数组只得 `SYS\nx`(CC / Codex 发的都是块数组),≥2 图时图例会排到 system 前面,`<thinking_mode>` 去重也只看 system 不看折叠目标;② 非 user/assistant/system 的 role 由静默丢弃改为 **400 `InvalidRole`**——静默丢就是丢用户内容,还会让 2.5 步的 continuation 文案融进用户自己的末条消息;③ OpenAI Chat / Responses 只把**开头**那段 system/developer 提升成 system,对话开始后出现的原位保留为 `role:system`(此前一律提到开头,「从现在起…」类中途指令读起来像开场规则)。复跑 `test/manual/replay-content-preservation.ts`(免费)/ `inserted-content-live.mjs`(计费)。
 
 查 wire 字段名看 `aws/amazon-q-developer-cli` 的 Smithy 客户端类型,别对 kiro-cli 二进制 `strings`(连 `toolResults` 都搜不到)。
+
+Smithy 新命名空间 `com.amazon.kiro.runtimeservice` 有顶层 `systemPrompt` 字段,但两个 target 直打都 400 `REQUEST_BODY_INVALID`,服务端未开;证据与 KAS 的做法见「原生 reasoning / effort / system 的 wire 真相」。
 
 **2026-09-11 真实 Docker CLI 验收**(CC 2.1.263 / Codex 0.153.4):`tools/claude-code/test.sh` 8/8;CC 三阶段真实编码 107 次调用三段验收全过;Codex 三阶段 35 次调用全过;AskUserQuestion、WebSearch、WebFetch、`/simplify`、`/code-review` 全过;合成探针 CC 10 场景 / Codex 11 / 空响应 9+9 / subagent 生命周期 8 与 09-07 基线逐项一致;CC 六图 2/2 全对,Codex 六图归属抖动经受控 A/B 证明是模型侧既有问题(改前 0/3、改后 3/5,图片轮 wire 逐字节相同)。复跑要点:长会话阶段超时放到 60 分钟(opus-5 extend 约 47 次调用,上游慢时 20/30 分钟窗口的超时不是转换层问题);headless 验 AskUserQuestion 走 `--permission-prompt-tool stdio` 的 `can_use_tool` 控制消息;CC headless 的 init 工具清单本身不含 Glob / Grep / TodoWrite,网关照收全转发,别当网关问题。
 
@@ -143,7 +145,7 @@ GPT 侧 `(input, visibleOut, credits)` 欠定——Kiro 不传导 GPT 缓存折�
 
 ### kiro-cli 自己怎么处理 5xx / 429 / 400
 
-2.21.1 实测(`kiro-cli-probe.ts` 注入状态码):**500/502/503 → 共 9 次**(SDK 内层 attempt 1→2→3,带抖动退避 ~150–1800ms;应用层外层再来 3 轮,间隔 ~2.1s→4.6s);**429 → 3 次**,不走内层重试(attempt 恒为 1),间隔**严格等于 `Retry-After`**(实测 7007/7009ms);**400 → 不重试**。网关**一次都不重试**、原样透传(架构决策见 `retry-executor.ts` 头注释 + 「跨模型对照」)——即 kiro-cli 有 9 次机会而网关只有 1 次,瞬时 5xx 上二者体感差距全在于此。
+2.21.1 实测(`kiro-cli-probe.ts` 注入状态码):**500/502/503 → 共 9 次**(SDK 内层 attempt 1→2→3,带抖动退避 ~150–1800ms;应用层外层再来 3 轮,间隔 ~2.1s→4.6s);**429 → 3 次**,不走内层重试(attempt 恒为 1),间隔**严格等于 `Retry-After`**(实测 7007/7009ms);**400 → 不重试**。网关对瞬时故障**一次都不重试**、原样透传(架构决策见 `retry-executor.ts` 头注释 + 「跨模型对照」)——即 kiro-cli 有 9 次机会而网关只有 1 次,瞬时 5xx 上二者体感差距全在于此。仅有的两个语义重试各一次:401 换 token、400 `THINKING_SIGNATURE_INVALID` 剥掉 `reasoningContent`(见「原生 reasoning / effort / system 的 wire 真相」)。
 
 ### 重试头的三个调用点
 
@@ -155,7 +157,7 @@ GPT 侧 `(input, visibleOut, credits)` 欠定——Kiro 不传导 GPT 缓存折�
 
 ### 工具调用往返与图片的 wire 形态
 
-2.21.1 实测:assistant 侧 `{messageId, content, toolUses:[{toolUseId,name,input}]}`(`input` 是**对象**;`messageId` 是**客户端生成的 UUID v4**,且只在带 toolUses 的那条上出现 → 唯一设置点 `attachToolUses`,见 `model/requests/conversation.ts`)。user 侧 `toolResults:[{toolUseId, content:[{text}|{json}], status:"success"|"error"}]`。`status` 表示**工具本身是否执行成功**,不是业务结果——`exit 42` 仍是 `success`。与本项目的两处已知差异(`isError` 我们多发、`{json}` 通道我们不产)及各自的不动理由,全在 `ToolResult` 头注释(`model/requests/tool.ts`)。图片经 tool_result 回传时(`fs_read` 的 `Image` mode)**提升到 message-level `images: [{format:'png', source:{bytes:<base64>}}]`**,`toolResults[].content` 原位只留占位文本 `"See images data supplied"`;项目的提升逻辑一致,仅占位文案不同(`[image attached to this message]`),实测两者上游都收。`toolResults[].content` 塞 `{image}` 上游 200 但静默丢弃(2026-09-09 直连实测),wire 没有结构化图片通道。
+2.21.1 实测:assistant 侧 `{messageId, content, toolUses:[{toolUseId,name,input}]}`(`input` 是**对象**;`messageId` 是**客户端生成的 UUID v4**,且只在带 toolUses 的那条上出现(也见于只有 `reasoningContent` 的那条) → 唯一设置点 `attachToolUses`,见 `model/requests/conversation.ts`)。user 侧 `toolResults:[{toolUseId, content:[{text}|{json}], status:"success"|"error"}]`。`status` 表示**工具本身是否执行成功**,不是业务结果——`exit 42` 仍是 `success`。与本项目的两处已知差异(`isError` 我们多发、`{json}` 通道我们不产)及各自的不动理由,全在 `ToolResult` 头注释(`model/requests/tool.ts`)。图片经 tool_result 回传时(`fs_read` 的 `Image` mode)**提升到 message-level `images: [{format:'png', source:{bytes:<base64>}}]`**,`toolResults[].content` 原位只留占位文本 `"See images data supplied"`;项目的提升逻辑一致,仅占位文案不同(`[image attached to this message]`),实测两者上游都收。`toolResults[].content` 塞 `{image}` 上游 200 但静默丢弃(2026-09-09 直连实测),wire 没有结构化图片通道。
 
 ### Responses 的字节量约为 Claude 的 10×
 
@@ -165,6 +167,30 @@ GPT 侧 `(input, visibleOut, credits)` 欠定——Kiro 不传导 GPT 缓存折�
 
 先看网关日志有没有 `upstream truncated tool_use (no isComplete frame)`——它只说明上游截断过,**不再意味着客户端会收到残缺调用**:未完成的调用已被缓冲在网关内、从不上 wire。故若仍报 `JSON parse failed`,那是**新**问题(参数在网关侧就该解析失败并报协议错误),别当成同一条。其余两支在客户端侧:`ZOD_VALIDATION`(超 `questions≤4`/`options≤4`/`header≤12` 或违反「问题文本与同题内 option label 须唯一」的跨字段 refine,后两条 JSON Schema 里表达不出、模型看不到)、`PERMISSION_UPDATED_INPUT`。
 
+### 原生 reasoning / effort / system 的 wire 真相
+
+证据来自录真实 kiro-cli 2.22.1 两个引擎(V2 Rust 默认引擎;V3 = `--v3`,`@kiro/agent` KAS 子进程,target 换成 `KiroRuntimeService.GenerateAssistantResponse`、同 host、`origin=AI_EDITOR`、顶层多 `agentMode`)与用网关 provider 直打网关 target。复跑:`test/manual/reasoning-wire-probe.ts`(直打)、`kiro-cli-capture-proxy.mjs`(录 kiro-cli)、`reasoning-roundtrip-live.mjs`(走网关验收)。
+
+**wire 事实**:
+
+- history 里的 thinking 有原生字段:`assistantResponseMessage.reasoningContent = {reasoningText:{text,signature}}`(GPT `{redactedContent}`),不拼 `<thinking>` 文本。signature 缺失或改坏 → 400 `THINKING_SIGNATURE_INVALID`。KAS 的对策:无签名不发、换模型不发、收到该错剥掉全部 `reasoningContent` 重发一次。
+- effort 只在顶层 `additionalModelRequestFields` 生效,形状由 `ListAvailableModels` 的 `additionalModelRequestFieldsSchema` 逐模型给出:Claude = `{thinking:{type:adaptive|disabled, display?:summarized|omitted}, output_config:{effort}, max_tokens}`(4.6 系无 xhigh);GPT = `{reasoning:{effort}}`(含 none)。写在 `userInputMessage.reasoning` 的 effort 上游不认(计费不随档位变)。`thinking.type: disabled` 真关;`display: omitted` 只回 signature 帧。Claude Code 发的就是 adaptive + omitted。
+- 回包 reasoning 是摘要:文本长度不随 effort 变,credits 才是 effort 生效的判据;末尾单独一帧只有 `{signature}`。
+- 顶层 `systemPrompt` 两个 target 都 400(只有 `com.amazon.kiro.runtimeservice` 命名空间有它,KAS 受 feature flag 控制也没发)——system 仍无 wire 通道,折进首条 user(见「注入文本」)。KAS 自己用的是本项目已移除的开场假轮次。
+- 逐模型能力:opus-5 / 4.7 / 4.8 回摘要 reasoning + signature,opus-5 是唯一默认就思考的;sonnet-5 回 signature 帧、计费随 effort 变;sonnet-4.6 加字段后回明文 reasoning + signature,默认不思考;opus-4.6 发字段只涨计费、无帧无签名;4.5 及以下 / haiku 无 schema。非原生模型只认 `<thinking_mode>enabled</thinking_mode><max_thinking_length>N</max_thinking_length>` 前缀,收到 adaptive 形态或没有前缀都把推理写进正文——本项目不注入任何前缀,仅作记录。
+- 其它:`ListAvailableModels` 带 `tokenLimits` / `promptCaching` / `refusalFallbackModels`;`kiro-cli --effort` 与 `/effort` 在非交互和 legacy UI 下都不上 wire;V2 里只有 reasoning 的 assistant 也带 `messageId`;KAS 发 `toolUses: []` 上游照收;抓 V3 wire 用 `KIRO_KAS_SERVER_PATH` 指向先 `process.argv.push('--endpoint=…')` 再 import `acp-server.js` 的包装脚本(非交互路径不读 `KIRO_KAS_ENDPOINT`)。
+- Claude Code 2.1.278 headless 验收全过;请求含 `thinking.display`、`context_management` 与新 beta 头,均透传;启动时多一个 `HEAD /claude/api/hello`,网关 404 它照跑。
+
+**本项目的做法**(真相源 `claude/converter.ts`、`claude/types.ts`、`kiro/retry-executor.ts`):
+
+- thinking 只有 adaptive 一种语义:`normalizeThinking` 把 `enabled` 归一成 `adaptive`、丢掉 `budget_tokens`;`resolveEffort` 只看 `output_config.effort`(缺省 high)。
+- 原生模型(`MODELS_WITH_NATIVE_REASONING`)由 `buildAdditionalModelRequestFields` 生成顶层字段,`toKiroRequest` 装配、三个 handler 共用;`display` 透传;sonnet-4.6 的 xhigh 降 high;`max_tokens` 不发(传了会让小 max_tokens 的客户端在思考阶段被截断);客户端没提 thinking 就不发字段。
+- 非原生模型不做任何 thinking 控制:不发字段、不注入前缀,`-thinking` 后缀是空操作;响应侧 legacy `<thinking>` 解码器保留。
+- history:只把带签名的 `thinking` 块放进 `reasoningContent`(`redacted_thinking` → `redactedContent`),无签名的丢弃,content 只放可见文本,绝不拼 `<thinking>`;一条 Kiro 消息一个槽位,多块取最后一块。
+- 签名失效:`RetryExecutor` 收到 `THINKING_SIGNATURE_INVALID` 剥掉全部 `reasoningContent` 重发一次(info 级),再失败才 400。
+
+**验收**(`reasoning-roundtrip-live.mjs`):签名原样回传无重试;改坏签名恰好一次剥离重试后成功;omitted 回传成功;effort max 计费高于 low;GPT / sonnet-4.6 正常;流式含 `thinking_delta` + `signature_delta` 且过协议不变量。录得请求重放可见文本零丢失、无签名 thinking 全部丢弃且零泄漏;Claude Code harness 全过。守卫:`test/static/no-thinking-tag-stitching.test.ts`、`test/claude/converter-reasoning-content.test.ts`、`test/claude/native-effort-integrity.test.ts`、`test/kiro/retry-executor-thinking-signature.test.ts`。
+
 ### 支持哪些模型 / 加模型要同改的地方
 
-`claude/models-catalog.ts` + `mapModel()`。**加 GPT 变体六处同改**:mapModel / MODELS_WITH_NATIVE_REASONING / getContextWindowSize / claude+openai catalog / plugin-derived `isGptModel`(跨包复制的变体 token sol·terra·luna·codex);**加 Opus 5 同改**:mapModel / MODELS_WITH_NATIVE_REASONING / getContextWindowSize / claude catalog / request-validator `isAdaptiveOpus` / plugin-derived price+threshold——上游 modelId `claude-opus-5` **无小数点**,判别子须避 `4-5`;openai catalog 自动继承。
+`claude/models-catalog.ts` + `mapModel()`。**加 GPT 变体六处同改**:mapModel / MODELS_WITH_NATIVE_REASONING / getContextWindowSize / claude+openai catalog / plugin-derived `isGptModel`(跨包复制的变体 token sol·terra·luna·codex);**加 Claude 模型同改**(原生集合现含 sonnet-5 / sonnet-4.6):mapModel / MODELS_WITH_NATIVE_REASONING / `MODELS_WITHOUT_XHIGH`(上游 schema 无 xhigh 的才列)/ getContextWindowSize / claude catalog / plugin-derived price+threshold——上游 modelId `claude-opus-5` **无小数点**,判别子须避 `4-5`;openai catalog 自动继承。

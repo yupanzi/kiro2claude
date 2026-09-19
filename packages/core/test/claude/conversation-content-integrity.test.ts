@@ -98,7 +98,7 @@ describe('conversation replay content boundaries', () => {
     expect(upstream).toContain('UNIQUE_TOOL_RESULT_NOT_AVAILABLE_ELSEWHERE');
   });
 
-  it('Claude thinking text survives replay as legacy text, but its signature does not', () => {
+  it('Claude signed thinking replays as native reasoningContent (text + signature), never as legacy text', () => {
     const upstream = JSON.stringify(
       convertRequest(
         request([
@@ -115,12 +115,38 @@ describe('conversation replay content boundaries', () => {
         options,
       ),
     );
-    expect(upstream).toContain('<thinking>THOUGHT_CANARY</thinking>');
+    expect(upstream).toContain(
+      '"reasoningContent":{"reasoningText":{"text":"THOUGHT_CANARY","signature":"SIGNATURE_CANARY"}}',
+    );
     expect(upstream).toContain('VISIBLE_CANARY');
-    expect(upstream).not.toContain('SIGNATURE_CANARY');
+    expect(upstream).not.toContain('<thinking>');
   });
 
-  it('Responses preserves plaintext reasoning summaries without pretending to decrypt opaque content', () => {
+  it('Claude unsigned thinking is dropped from replay rather than stitched into text', () => {
+    // 上游要求 reasoningText.signature 必填(缺失 → 400 THINKING_SIGNATURE_INVALID),而拼成
+    // 文本对模型只是普通文字;两者都不是「回传推理」,所以无签名的不上 wire。
+    const upstream = JSON.stringify(
+      convertRequest(
+        request([
+          { role: 'user', content: 'Question.' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'THOUGHT_CANARY' },
+              { type: 'text', text: 'VISIBLE_CANARY' },
+            ],
+          },
+          { role: 'user', content: 'Continue.' },
+        ]),
+        options,
+      ),
+    );
+    expect(upstream).toContain('VISIBLE_CANARY');
+    expect(upstream).not.toContain('THOUGHT_CANARY');
+    expect(upstream).not.toContain('reasoningContent');
+  });
+
+  it('Responses reasoning items never reach the wire: summaries are unsigned, opaque content has no channel', () => {
     const converted = convertResponsesRequest({
       model: 'claude-opus-4-6',
       input: [
@@ -137,8 +163,9 @@ describe('conversation replay content boundaries', () => {
     });
     const upstream = JSON.stringify(convertRequest(converted.payload, options));
     expect(upstream).toContain('VISIBLE_CANARY');
-    expect(upstream).toContain('PLAINTEXT_REASONING_CANARY');
+    expect(upstream).not.toContain('PLAINTEXT_REASONING_CANARY');
     expect(upstream).not.toContain('ENCRYPTED_REASONING_CANARY');
+    expect(upstream).not.toContain('<thinking>');
   });
 });
 

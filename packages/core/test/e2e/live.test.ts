@@ -1231,11 +1231,9 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
   // --------------------------------------------------------------------------
   // 14. Extended thinking — non-stream
   //
-  //     `thinking: {type:"enabled"}` is the Claude Code default for 4.x+.
-  //     converter.ts:513 prepends `<thinking_mode>enabled</thinking_mode>`
-  //     `<max_thinking_length>N</max_thinking_length>` onto the system
-  //     prompt so the upstream model knows to produce thinking-wrapped
-  //     output; `reduceKiroResponse` then runs the raw
+  //     thinking only takes effect on native-reasoning models (top-level
+  //     additionalModelRequestFields); non-native models get upstream defaults
+  //     (no `<thinking_mode>` prefix since 2026-09-20). `reduceKiroResponse` runs the raw
   //     `<thinking>...</thinking>\n\ntext` payload through
   //     `LegacyThinkingDecoder` — the same grammar the streaming path uses —
   //     to split it into separate `content[]` blocks.
@@ -1255,7 +1253,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
         payload: {
           model: 'claude-opus-5',
           max_tokens: 2000,
-          thinking: { type: 'enabled', budget_tokens: 4000 },
+          thinking: { type: 'adaptive' },
           messages: [
             {
               role: 'user',
@@ -1333,7 +1331,7 @@ describe.skipIf(!HAS_ENV)('live E2E: kiro2claude end-to-end', () => {
           model: 'claude-opus-5',
           max_tokens: 2000,
           stream: true,
-          thinking: { type: 'enabled', budget_tokens: 4000 },
+          thinking: { type: 'adaptive' },
           tools: [calcTool],
           messages: [
             {

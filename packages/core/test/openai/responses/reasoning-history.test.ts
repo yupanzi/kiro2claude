@@ -27,9 +27,14 @@ describe('Responses plaintext reasoning history', () => {
       content: [{ type: 'thinking', thinking: `${first}\n\n${second}` }],
     });
     const state = convertRequest(request, { identityOverride: false }).conversationState;
-    expect(state.history[1]).toMatchObject({
-      assistantResponseMessage: { content: `<thinking>${first}\n\n${second}</thinking>` },
+    // 摘要没有签名:Kiro 侧只原生回传带签名的 thinking(reasoningContent),从不拼成
+    // `<thinking>` 文本,所以这条 assistant 上 wire 只剩占位 content。
+    expect(state.history[1]).toEqual({
+      kind: 'assistant',
+      assistantResponseMessage: { content: ' ' },
     });
+    expect(JSON.stringify(state)).not.toContain('<thinking>');
+    expect(JSON.stringify(state)).not.toContain('Check the existing state.');
     expect(state.currentMessage.userInputMessage.content).toBe(ASSISTANT_CONTINUATION_TEXT);
     expect(JSON.stringify(state)).not.toContain('opaque-secret-sentinel');
     expect(state.currentMessage.userInputMessage.userInputMessageContext.toolResults).toEqual([]);
@@ -56,10 +61,12 @@ describe('Responses plaintext reasoning history', () => {
     expect(state.history.map((message) => message.kind)).toEqual(['user', 'assistant']);
     expect(state.history[1]).toMatchObject({
       assistantResponseMessage: {
-        content: '<thinking>Check before modifying.</thinking>\n\nReading now.',
+        content: 'Reading now.',
         toolUses: [{ toolUseId: 'read_1', name: 'read_file', input: { path: 'a.txt' } }],
       },
     });
+    expect(JSON.stringify(state.history[1])).not.toContain('Check before modifying.');
+    expect(JSON.stringify(state.history[1])).not.toContain('reasoningContent');
     expect(state.currentMessage.userInputMessage.userInputMessageContext.toolResults).toEqual([
       {
         toolUseId: 'read_1',
@@ -99,9 +106,11 @@ describe('Responses plaintext reasoning history', () => {
     const request = convert(input);
     const state = convertRequest(request, { identityOverride: false }).conversationState;
     expect(state.currentMessage.userInputMessage.content).toBe('Second task.');
-    expect(state.history[1]).toMatchObject({
-      assistantResponseMessage: { content: '<thinking>A prior observation.</thinking>' },
+    expect(state.history[1]).toEqual({
+      kind: 'assistant',
+      assistantResponseMessage: { content: ' ' },
     });
+    expect(JSON.stringify(state)).not.toContain('A prior observation.');
     expect(input).toEqual(before);
   });
 });
