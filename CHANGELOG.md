@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/yupanzi/kiro2claude/compare/v1.6.4...v1.7.0) (2026-09-19)
+
+
+### Features
+
+* **core:** thinking / effort 改走上游原生字段,历史推理按签名回传 ([2144534](https://github.com/yupanzi/kiro2claude/commit/2144534cfbc315dff3c7c59133c37a65627830b0))
+
 ## [1.6.4](https://github.com/yupanzi/kiro2claude/compare/v1.6.3...v1.6.4) (2026-09-15)
 
 
